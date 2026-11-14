@@ -1,44 +1,9 @@
-"""Execution module for Double Diamond cycle.
+"""Execution module — deprecated.
 
-This module implements Phase 2 of the Ouroboros workflow:
-- Double Diamond pattern: Discover → Define → Design → Deliver
-- Recursive AC decomposition
-- Phase transition management
-- SubAgent isolation for child AC execution (Story 3.4)
+Historical execution strategies (double_diamond, decomposition, atomicity)
+were removed after confirming no live callers. The execution engine now
+lives in ouroboros.orchestrator and ouroboros.mcp.tools.
+
+See tests/unit/orchestrator/test_decomposition_live_path.py for the
+architecture guard that prevents resurrection of the dead modules.
 """
-
-from ouroboros.execution.double_diamond import (
-    CycleResult,
-    DoubleDiamond,
-    ExecutionError,
-    Phase,
-    PhaseContext,
-    PhaseResult,
-)
-from ouroboros.execution.subagent import (
-    SubAgentError,
-    ValidationError,
-    create_subagent_completed_event,
-    create_subagent_failed_event,
-    create_subagent_started_event,
-    create_subagent_validated_event,
-    validate_child_result,
-)
-
-__all__ = [
-    # Double Diamond
-    "CycleResult",
-    "DoubleDiamond",
-    "ExecutionError",
-    "Phase",
-    "PhaseContext",
-    "PhaseResult",
-    # SubAgent Isolation
-    "SubAgentError",
-    "ValidationError",
-    "create_subagent_completed_event",
-    "create_subagent_failed_event",
-    "create_subagent_started_event",
-    "create_subagent_validated_event",
-    "validate_child_result",
-]

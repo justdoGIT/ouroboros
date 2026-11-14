@@ -6,24 +6,64 @@ Contains handlers for drift measurement, evaluation, and lateral thinking tools:
 - LateralThinkHandler: Generates alternative thinking approaches via personas.
 """
 
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError as PydanticValidationError
 import structlog
 import yaml
 
-from ouroboros.config import get_semantic_model
-from ouroboros.core.errors import ValidationError
-from ouroboros.core.seed import Seed
+from ouroboros.config import (
+    get_auto_evolve_enabled,
+    get_llm_backend_for_role,
+    get_llm_model_for_role,
+)
+from ouroboros.core.errors import ConfigError, ProviderError, ValidationError
+from ouroboros.core.project_paths import resolve_path_against_base, resolve_seed_project_path
+from ouroboros.core.seed import AcceptanceCriterionSpec, Seed, ac_text
 from ouroboros.core.types import Result
-from ouroboros.mcp.errors import MCPServerError, MCPToolError
-from ouroboros.mcp.tools.bridge_mixin import BridgeAwareMixin
+from ouroboros.evaluation.models import (
+    AcceptanceState,
+    CheckResult,
+    MechanicalDisposition,
+    MechanicalResult,
+    aggregate_acceptance_state,
+    derive_acceptance_state,
+)
+from ouroboros.mcp.errors import MCPAuthError, MCPServerError, MCPTimeoutError, MCPToolError
+from ouroboros.mcp.job_manager import JobLinks, JobManager
+from ouroboros.mcp.telemetry_boundary import (
+    record_direct_evaluation_outcome,
+)
+from ouroboros.mcp.tools import background as background_jobs
+from ouroboros.mcp.tools.evaluation_package_evidence import (
+    evidence_for_criteria,
+    recorded_checks_by_position,
+)
+from ouroboros.mcp.tools.evaluation_stage1_report import (
+    format_stage1_result,
+    serialize_stage1_result,
+)
+from ouroboros.mcp.tools.fanout_handler import (  # noqa: F401
+    FetchArtifactHandler,
+    SubmitFanoutResultsHandler,
+)
+from ouroboros.mcp.tools.job_observer import (
+    append_job_observer_inline_handoff,
+    build_job_observer_contract,
+)
+
+# Re-export: LateralThinkHandler moved to its own module (#1797 ratchet);
+# definitions.py and tests import it from here.
+from ouroboros.mcp.tools.lateral_think_handler import (  # noqa: E402,F401
+    LateralThinkHandler,
+)
 from ouroboros.mcp.tools.subagent import (
+    DELEGATED_TO_SUBAGENT,
     build_evaluate_subagent,
-    build_subagent_result,
-    emit_subagent_dispatched_event,
+    dispatch_plugin_terminal,
     should_dispatch_via_plugin,
 )
 from ouroboros.mcp.types import (
@@ -49,6 +89,181 @@ from ouroboros.persistence.event_store import EventStore
 from ouroboros.providers import create_llm_adapter
 
 log = structlog.get_logger(__name__)
+
+# Unverified is not a rejection: no executed check ran, so model review could
+# only be attached as feedback. Rendering it as REJECTED would misstate that.
+_ACCEPTANCE_LABELS: dict[AcceptanceState, str] = {
+    AcceptanceState.APPROVED: "APPROVED",
+    AcceptanceState.REJECTED: "REJECTED",
+    AcceptanceState.UNVERIFIED: "NOT APPROVED (unverified: no executed verification evidence)",
+}
+
+
+def _direct_evaluation_failure_reason(error: object) -> str | None:
+    """Map only trusted exception types to the telemetry reason vocabulary."""
+    if isinstance(error, (ConfigError,)):
+        return "config"
+    if isinstance(error, (ValidationError, PydanticValidationError)):
+        return "validation"
+    if isinstance(error, (MCPAuthError,)):
+        return "auth"
+    if isinstance(error, (MCPTimeoutError, TimeoutError)):
+        return "timeout"
+    if isinstance(error, ProviderError):
+        return "model"
+    return None
+
+
+def _failure_reason_details(error: object) -> dict[str, str]:
+    """Carry the branch reason code for the background evaluate job runner.
+
+    The direct ``ouroboros_evaluate`` path already records this code on
+    ``workflow_outcome``; the job path only sees the ``Result.err``, so the
+    same closed code rides in ``MCPToolError.failure_meta`` (never rendered,
+    never sent) for ``mcp.tools.background.job_work_error`` to lift into
+    ``result_meta``.
+    """
+    reason = _direct_evaluation_failure_reason(error)
+    return {"failure_reason_code": reason} if reason else {}
+
+
+if TYPE_CHECKING:
+    from ouroboros.mcp.tools.ralph_handlers import StartRalphHandler
+    from ouroboros.mcp.tools.seed_handoff import SeedHandoffRegistry
+
+
+def _seed_acceptance_criteria(seed: Seed) -> tuple[str, ...]:
+    return tuple(
+        stripped
+        for criterion in seed.acceptance_criteria
+        if (stripped := ac_text(criterion).strip())
+    )
+
+
+def _seed_ac_spec_map(seed: Seed | None) -> dict[str, AcceptanceCriterionSpec]:
+    """Map each AC description to its structured spec (PR-H).
+
+    Since PR-F, ``Seed.acceptance_criteria`` holds ``AcceptanceCriterionSpec``
+    objects.  Evaluation flows AC text (descriptions) around as bare strings,
+    so we key specs by their trimmed ``description`` to reattach the declared
+    success contract when building each ``EvaluationContext``.  Only specs
+    that actually carry a contract are included — bare-description ACs map to
+    nothing and the evaluator judges the AC text alone (today's behavior).
+    """
+    if seed is None:
+        return {}
+    spec_map: dict[str, AcceptanceCriterionSpec] = {}
+    for criterion in seed.acceptance_criteria:
+        if not isinstance(criterion, AcceptanceCriterionSpec):
+            continue
+        if not criterion.has_success_contract:
+            continue
+        key = criterion.description.strip()
+        if key:
+            spec_map.setdefault(key, criterion)
+    return spec_map
+
+
+async def _default_brownfield_project_dir() -> Path | None:
+    """Return the registered default brownfield project directory, if any."""
+    from ouroboros.persistence.brownfield import BrownfieldStore
+
+    store = BrownfieldStore()
+    try:
+        await store.initialize()
+        default_repo = await store.get_default()
+    except Exception as exc:  # noqa: BLE001 - fallback discovery must be best-effort
+        log.warning("mcp.tool.evaluate.brownfield_default_lookup_failed", error=str(exc))
+        return None
+    finally:
+        await store.close()
+
+    if default_repo is None or not default_repo.path:
+        return None
+
+    resolved = Path(default_repo.path).expanduser().resolve()
+    if not resolved.is_dir():
+        log.warning(
+            "mcp.tool.evaluate.brownfield_default_unusable",
+            path=str(resolved),
+        )
+        return None
+    return resolved
+
+
+def _seed_project_dir(seed: Seed | None, *, stable_base: Path) -> Path | None:
+    """Resolve a contained project directory encoded in seed metadata/context."""
+    resolution = resolve_seed_project_path(seed, stable_base=stable_base)
+    if resolution.path is None:
+        return None
+
+    resolved = resolution.path
+    if resolved.is_file():
+        return resolved.parent
+    if resolved.exists() and not resolved.is_dir():
+        return None
+    return resolved
+
+
+async def _resolve_evaluate_working_dir(
+    explicit_working_dir: str | None,
+    seed: Seed | None,
+) -> Path:
+    """Resolve the project root that gates Stage 1 and Stage 2 evaluation.
+
+    Precedence is explicit tool argument, registered brownfield default,
+    seed-declared project directory, then the MCP server cwd. The last
+    fallback preserves the historical behavior, but only after project-aware
+    sources have been exhausted.
+    """
+    stable_base = Path.cwd().resolve()
+    if explicit_working_dir:
+        resolved = resolve_path_against_base(explicit_working_dir, stable_base=stable_base)
+        if resolved is not None:
+            return resolved
+
+    brownfield_default = await _default_brownfield_project_dir()
+    if brownfield_default is not None:
+        if brownfield_default.is_dir():
+            return brownfield_default.resolve()
+        log.warning(
+            "mcp.tool.evaluate.brownfield_default_unusable",
+            path=str(brownfield_default),
+        )
+
+    seed_dir = _seed_project_dir(seed, stable_base=stable_base)
+    if seed_dir is not None:
+        return seed_dir
+
+    return stable_base
+
+
+async def _resolve_executor_backend(store: EventStore | None, session_id: str) -> str | None:
+    """Best-effort: which runtime backend executed this session (PR-X X2).
+
+    Read from the ``execution.session.completed`` / ``.started`` lifecycle events,
+    whose payload carries ``runtime_backend`` per node. Lets formal evaluation
+    keep the executor's own vendor out of the reviewer jury. Any failure returns
+    ``None`` — evaluation then behaves exactly as before.
+    """
+    if store is None or not session_id:
+        return None
+    try:
+        for event_type in (
+            "execution.session.completed",
+            "execution.session.started",
+        ):
+            events = await store.query_session_related_events(
+                session_id, event_type=event_type, limit=50
+            )
+            for event in events:
+                data = event.data if isinstance(event.data, dict) else {}
+                backend = data.get("runtime_backend")
+                if isinstance(backend, str) and backend.strip():
+                    return backend.strip()
+    except Exception:
+        return None
+    return None
 
 
 def _evaluation_allowed_tools(runtime_backend: str | None) -> list[str]:
@@ -189,7 +404,7 @@ class MeasureDriftHandler:
         try:
             # Calculate drift using real DriftMeasurement
             measurement = DriftMeasurement()
-            metrics = measurement.measure(
+            metrics = await measurement.measure_async(
                 current_output=current_output,
                 constraint_violations=[str(v) for v in constraint_violations_raw],
                 current_concepts=[str(c) for c in current_concepts_raw],
@@ -335,7 +550,8 @@ class EvaluateHandler:
                     type=ToolInputType.STRING,
                     description=(
                         "Project root used to resolve Stage 1 mechanical verification "
-                        "commands. Commands are read from .ouroboros/mechanical.toml; "
+                        "commands and Stage 2 source-file visibility. Commands are "
+                        "read from .ouroboros/mechanical.toml; "
                         "when the file is missing, the evaluator makes one AI detect "
                         "call that inspects manifests (package.json, pyproject.toml, "
                         "Cargo.toml, Makefile, ...) and authors the toml. Stage 1 "
@@ -349,17 +565,28 @@ class EvaluateHandler:
     async def handle(
         self,
         arguments: dict[str, Any],
+        *,
+        emit_terminal_telemetry: bool = True,
     ) -> Result[MCPToolResult, MCPServerError]:
         """Handle an evaluation request.
 
         Args:
             arguments: Tool arguments including session_id, artifact, and optional seed_content.
+            emit_terminal_telemetry: Whether this call owns the direct-evaluation
+                telemetry boundary. True (default) for genuine top-level direct
+                calls — the MCP adapter dispatching ``ouroboros_evaluate``, or
+                ``ChecklistVerifyHandler`` delegating in multi-AC mode (neither
+                is observed by JobManager). False when the caller is itself
+                job-backed (``run_evaluation_job`` behind ``StartEvaluateHandler``),
+                since ``JobTelemetryBoundary`` already emits a deduplicated
+                (``$insert_id``-keyed) terminal outcome for that job — this
+                handler is a shared instance reused across both call shapes
+                (see ``definitions.py``), so the decision must be made by the
+                caller at each call, not baked into the instance.
 
         Returns:
             Result containing evaluation results or error.
         """
-        from pathlib import Path
-
         from ouroboros.evaluation import (
             EvaluationContext,
             EvaluationPipeline,
@@ -376,6 +603,7 @@ class EvaluateHandler:
                 MCPToolError(
                     "session_id is required",
                     tool_name="ouroboros_evaluate",
+                    failure_meta={"failure_reason_code": "validation"},
                 )
             )
 
@@ -385,6 +613,7 @@ class EvaluateHandler:
                 MCPToolError(
                     "artifact is required",
                     tool_name="ouroboros_evaluate",
+                    failure_meta={"failure_reason_code": "validation"},
                 )
             )
 
@@ -411,6 +640,27 @@ class EvaluateHandler:
         if not acceptance_criteria and acceptance_criterion and str(acceptance_criterion).strip():
             acceptance_criteria = (str(acceptance_criterion).strip(),)
 
+        # Parse seed before dispatch so working_dir fallback is available for
+        # both plugin/subagent and in-process evaluation paths.
+        goal = ""
+        constraints: tuple[str, ...] = ()
+        seed_id = session_id  # fallback
+        seed: Seed | None = None
+
+        if seed_content:
+            try:
+                seed_dict = yaml.safe_load(seed_content)
+                seed = Seed.from_dict(seed_dict)
+                goal = seed.goal
+                constraints = tuple(seed.constraints)
+                seed_id = seed.metadata.seed_id
+                if not acceptance_criteria:
+                    acceptance_criteria = _seed_acceptance_criteria(seed)
+            except (yaml.YAMLError, ValidationError, PydanticValidationError) as e:
+                # Seed failed to parse — leave seed as None; spec map stays empty.
+                log.warning("mcp.tool.evaluate.seed_parse_warning", error=str(e))
+                # Continue without seed data - not fatal
+
         log.info(
             "mcp.tool.evaluate",
             session_id=session_id,
@@ -419,29 +669,41 @@ class EvaluateHandler:
             trigger_consensus=trigger_consensus,
         )
 
-        # --- Subagent dispatch: gate on runtime + opencode_mode ---
+        working_dir = await _resolve_evaluate_working_dir(arguments.get("working_dir"), seed)
+
+        if len(acceptance_criteria) > 1:
+            ac_for_payload: str | None = "\n".join(
+                f"{i + 1}. {ac}" for i, ac in enumerate(acceptance_criteria)
+            )
+        elif acceptance_criteria:
+            ac_for_payload = acceptance_criteria[0]
+        else:
+            ac_for_payload = None
+        from ouroboros.mcp.tools.evaluation_job import worker_safe_evaluation_inputs
+
+        worker_inputs = worker_safe_evaluation_inputs(seed_content, ac_for_payload, artifact)
         payload = build_evaluate_subagent(
             session_id=session_id,
-            artifact=artifact,
+            artifact=worker_inputs.artifact,
             artifact_type=artifact_type,
-            seed_content=seed_content,
-            acceptance_criterion=acceptance_criterion,
-            working_dir=arguments.get("working_dir"),
+            seed_content=worker_inputs.seed_content,
+            acceptance_criterion=worker_inputs.acceptance_criterion,
+            working_dir=str(working_dir),
             trigger_consensus=trigger_consensus,
         )
-        if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
-            await emit_subagent_dispatched_event(
+        if (
+            should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode)
+            and arguments.get("_force_in_process") is not True
+        ):
+            # Preserve public response shape (#442): session_id + status are
+            # part of the documented contract for ouroboros_evaluate.
+            return await dispatch_plugin_terminal(
                 self.event_store,
                 session_id=session_id,
                 payload=payload,
-            )
-            # Preserve public response shape (#442): session_id + status are
-            # part of the documented contract for ouroboros_evaluate.
-            return build_subagent_result(
-                payload,
                 response_shape={
                     "session_id": session_id,
-                    "status": "delegated_to_subagent",
+                    "status": DELEGATED_TO_SUBAGENT,
                     "dispatch_mode": "plugin",
                     "artifact_type": artifact_type,
                     "trigger_consensus": trigger_consensus,
@@ -454,22 +716,6 @@ class EvaluateHandler:
         owns_event_store = False
 
         try:
-            # Extract goal/constraints from seed if provided
-            goal = ""
-            constraints: tuple[str, ...] = ()
-            seed_id = session_id  # fallback
-
-            if seed_content:
-                try:
-                    seed_dict = yaml.safe_load(seed_content)
-                    seed = Seed.from_dict(seed_dict)
-                    goal = seed.goal
-                    constraints = tuple(seed.constraints)
-                    seed_id = seed.metadata.seed_id
-                except (yaml.YAMLError, ValidationError, PydanticValidationError) as e:
-                    log.warning("mcp.tool.evaluate.seed_parse_warning", error=str(e))
-                    # Continue without seed data - not fatal
-
             # Try to enrich from session repository if event_store available
             if not goal:
                 if store is None:
@@ -485,6 +731,34 @@ class EvaluateHandler:
                 except Exception:
                     pass  # Best-effort enrichment
 
+            # PR-X X2: resolve which runtime backend executed this session so
+            # consensus can keep that vendor out of the reviewer jury. Best-effort
+            # — None leaves today's behavior untouched.
+            executor_backend = await _resolve_executor_backend(store, session_id)
+
+            # The controller already ran the frozen check package for this run;
+            # its recorded per-criterion decision is Stage 1 evidence for that
+            # criterion (evaluation_package_evidence). No decision, no evidence.
+            by_position: tuple[tuple[CheckResult, ...], ...] = ()
+            if seed is not None:
+                if store is None:
+                    store = EventStore()
+                    owns_event_store = True
+                try:
+                    await store.initialize()
+                    by_position = await recorded_checks_by_position(store, session_id, seed)
+                except Exception as exc:  # noqa: BLE001 — a read failure is no evidence
+                    log.warning(
+                        "mcp.tool.evaluate.recorded_decision_unreadable",
+                        session_id=session_id,
+                        error=str(exc),
+                    )
+            recorded_checks = (
+                evidence_for_criteria(acceptance_criteria, seed, by_position)
+                if seed is not None
+                else tuple(() for _ in acceptance_criteria)
+            )
+
             # Derive current_ac from the unified acceptance_criteria tuple.
             # The tuple already incorporates both the plural and singular params,
             # so we only need to index or fall back to a default.
@@ -494,42 +768,56 @@ class EvaluateHandler:
                 else "Verify execution output meets requirements"
             )
 
+            # Reattach declared success contracts (PR-H): map AC text back to
+            # its structured spec so Stage 2 grades against verify_command /
+            # expected_artifacts / output_assertion, not the bare wording.
+            ac_spec_map = _seed_ac_spec_map(seed)
+
             # Evaluation reads multiple spec files (one Read call per AC).
             # Use a dedicated adapter with a higher turn budget — the shared
             # MCP adapter is max_turns=1 (tuned for interview/seed single-shot).
+            backend = get_llm_backend_for_role(
+                "semantic_evaluation",
+                explicit_backend=self.llm_backend,
+            )
             llm_adapter = create_llm_adapter(
-                backend=self.llm_backend,
-                allowed_tools=_evaluation_allowed_tools(self.llm_backend),
+                backend=backend,
+                allowed_tools=_evaluation_allowed_tools(backend),
                 max_turns=20,
             )
-            working_dir_str = arguments.get("working_dir")
-            working_dir = Path(working_dir_str).resolve() if working_dir_str else Path.cwd()
             log.info(
                 "mcp.tool.evaluate.started",
                 session_id=session_id,
                 artifact_type=artifact_type,
                 working_dir=str(working_dir),
-                llm_backend=self.llm_backend,
+                llm_backend=backend,
                 adapter_type=type(llm_adapter).__name__,
             )
 
             # Collect file-based artifacts for richer semantic evaluation.
             # working_dir is used as the project root for artifact resolution.
             #
-            # Write the artifact text to a file in working_dir so the
-            # ArtifactCollector can pick it up naturally during its scan
-            # instead of inlining the full text (potentially 50KB+) into
-            # the evaluation prompt.
-            from ouroboros.evaluation.artifact_collector import ArtifactCollector
+            # The artifact text (potentially 50KB+) is kept as a file under the
+            # data dir, never in working_dir, and joins the collected files so
+            # the prompt does not inline it.
+            from ouroboros.core.owner_only import write_owner_only
+            from ouroboros.evaluation.artifact_collector import (
+                ArtifactCollector,
+                eval_artifact_path,
+                with_artifact_file,
+            )
 
-            artifact_file = working_dir / ".ouroboros_eval_artifact.md"
+            artifact_file = eval_artifact_path(working_dir)
             try:
-                artifact_file.write_text(artifact, encoding="utf-8")
+                artifact_file.parent.mkdir(parents=True, exist_ok=True)
+                write_owner_only(artifact_file, artifact)
             except OSError:
                 pass  # Non-critical — evaluator falls back to text_summary
 
             try:
-                artifact_bundle = ArtifactCollector().collect(artifact, str(working_dir))
+                artifact_bundle = with_artifact_file(
+                    ArtifactCollector().collect(artifact, str(working_dir)), artifact_file, artifact
+                )
             except Exception as exc:
                 log.warning(
                     "mcp.tool.evaluate.artifact_collection_failed",
@@ -539,16 +827,17 @@ class EvaluateHandler:
                 artifact_bundle = None
 
             # Stage 1 trusts .ouroboros/mechanical.toml only. When the file is
-            # absent we run the AI detector once to author it — silent
-            # best-effort, so a failed detect simply leaves Stage 1 empty and
-            # the pipeline falls through to Stage 2 instead of phantom-failing
-            # on hardcoded preset guesses.
+            # absent we run the AI detector once to author it (best-effort).
+            # A failed detect leaves Stage 1 with no configured check, which
+            # is not executed evidence: the pipeline still runs the advisory
+            # Stage 2 review, and the result is reported as unverified rather
+            # than phantom-failing on hardcoded preset guesses.
             if not has_mechanical_toml(working_dir):
                 try:
                     await ensure_mechanical_toml(
                         working_dir,
                         llm_adapter,
-                        backend=self.llm_backend,
+                        backend=backend,
                     )
                 except Exception as exc:  # noqa: BLE001 — detector must never break eval
                     log.warning(
@@ -559,7 +848,9 @@ class EvaluateHandler:
             mechanical_config = build_mechanical_config(working_dir)
             config = PipelineConfig(
                 mechanical=mechanical_config,
-                semantic=SemanticConfig(model=get_semantic_model(self.llm_backend)),
+                semantic=SemanticConfig(
+                    model=get_llm_model_for_role("semantic_evaluation", backend=backend)
+                ),
             )
             pipeline = EvaluationPipeline(llm_adapter, config)
 
@@ -581,18 +872,25 @@ class EvaluateHandler:
                     artifact_bundle=artifact_bundle,
                     pipeline=pipeline,
                     working_dir=working_dir,
+                    executor_backend=executor_backend,
+                    ac_spec_map=ac_spec_map,
+                    emit_terminal_telemetry=emit_terminal_telemetry,
+                    recorded_checks=recorded_checks,
                 )
 
             context = EvaluationContext(
                 execution_id=session_id,
                 seed_id=seed_id,
                 current_ac=current_ac,
+                current_ac_spec=ac_spec_map.get(current_ac),
                 artifact=artifact,
                 artifact_type=artifact_type,
                 goal=goal,
                 constraints=constraints,
                 trigger_consensus=trigger_consensus,
                 artifact_bundle=artifact_bundle,
+                executor_backend=executor_backend,
+                recorded_checks=recorded_checks[0] if acceptance_criteria else (),
             )
             result = await pipeline.evaluate(context)
 
@@ -606,13 +904,20 @@ class EvaluateHandler:
                     "mcp.tool.evaluate.pipeline_failed",
                     session_id=session_id,
                     working_dir=str(working_dir),
-                    llm_backend=self.llm_backend,
+                    llm_backend=backend,
                     error=rendered_error,
                 )
+                if emit_terminal_telemetry:
+                    record_direct_evaluation_outcome(
+                        final_approved=None,
+                        failed=True,
+                        failure_reason_code=_direct_evaluation_failure_reason(result.error),
+                    )
                 return Result.err(
                     MCPToolError(
                         f"Evaluation failed: {rendered_error}",
                         tool_name="ouroboros_evaluate",
+                        failure_meta=_failure_reason_details(result.error),
                     )
                 )
 
@@ -620,7 +925,10 @@ class EvaluateHandler:
 
             # Detect code changes when Stage 1 fails (presentation concern)
             code_changes: bool | None = None
-            if eval_result.stage1_result and not eval_result.stage1_result.passed:
+            if (
+                eval_result.stage1_result
+                and eval_result.stage1_result.disposition is MechanicalDisposition.EXECUTED_FAIL
+            ):
                 code_changes = await self._has_code_changes(working_dir)
 
             # Build result text
@@ -630,6 +938,9 @@ class EvaluateHandler:
             meta = {
                 "session_id": session_id,
                 "final_approved": eval_result.final_approved,
+                "acceptance_state": eval_result.acceptance_state.value,
+                "executed_evidence": eval_result.has_executed_evidence,
+                "failure_reason": eval_result.failure_reason,
                 "highest_stage": eval_result.highest_stage_completed,
                 "stage1_passed": eval_result.stage1_result.passed
                 if eval_result.stage1_result
@@ -643,9 +954,14 @@ class EvaluateHandler:
                 "stage3_approved": eval_result.stage3_result.approved
                 if eval_result.stage3_result
                 else None,
+                "stage3_reviewer_independence": eval_result.stage3_result.reviewer_independence
+                if eval_result.stage3_result
+                else None,
                 "code_changes_detected": code_changes,
             }
 
+            if emit_terminal_telemetry:
+                record_direct_evaluation_outcome(final_approved=eval_result.final_approved)
             return Result.ok(
                 MCPToolResult(
                     content=(MCPContentItem(type=ContentType.TEXT, text=result_text),),
@@ -653,22 +969,54 @@ class EvaluateHandler:
                     meta=meta,
                 )
             )
-        except (ValueError, RuntimeError) as e:
+        except ConfigError as e:
             # Configuration/bootstrap errors (unsupported backend, missing
             # provider install) — actionable by the user, safe to surface.
             log.warning("mcp.tool.evaluate.config_error", error=str(e))
+            if emit_terminal_telemetry:
+                record_direct_evaluation_outcome(
+                    final_approved=None,
+                    failed=True,
+                    failure_reason_code="config",
+                )
             return Result.err(
                 MCPToolError(
                     f"Evaluation setup failed: {e}",
                     tool_name="ouroboros_evaluate",
+                    failure_meta={"failure_reason_code": "config"},
                 )
             )
-        except Exception:
+        except (ValueError, RuntimeError) as e:
+            # Preserve the historical setup-facing response for these factory
+            # failures, but do not infer ``config`` from a generic built-in
+            # exception. Only a typed ConfigError earns that telemetry reason.
+            log.warning("mcp.tool.evaluate.setup_error", error=str(e))
+            if emit_terminal_telemetry:
+                record_direct_evaluation_outcome(
+                    final_approved=None,
+                    failed=True,
+                    failure_reason_code=_direct_evaluation_failure_reason(e),
+                )
+            return Result.err(
+                MCPToolError(
+                    f"Evaluation setup failed: {e}",
+                    tool_name="ouroboros_evaluate",
+                    failure_meta=_failure_reason_details(e),
+                )
+            )
+        except Exception as exc:
             log.exception("mcp.tool.evaluate.error")
+            if emit_terminal_telemetry:
+                record_direct_evaluation_outcome(
+                    final_approved=None,
+                    failed=True,
+                    failure_reason_code=_direct_evaluation_failure_reason(exc),
+                )
             return Result.err(
                 MCPToolError(
                     "Evaluation failed due to an internal error. Check server logs for details.",
                     tool_name="ouroboros_evaluate",
+                    failure_meta=_failure_reason_details(exc),
                 )
             )
         finally:
@@ -689,6 +1037,10 @@ class EvaluateHandler:
         artifact_bundle: object | None,
         pipeline: object,  # EvaluationPipeline — typed as object to avoid import cycle
         working_dir: Path,
+        executor_backend: str | None = None,
+        ac_spec_map: dict[str, AcceptanceCriterionSpec] | None = None,
+        emit_terminal_telemetry: bool = True,
+        recorded_checks: tuple[tuple[CheckResult, ...], ...] = (),
     ) -> Result[MCPToolResult, MCPServerError]:
         """Evaluate each AC individually and return an aggregated checklist (#366).
 
@@ -704,7 +1056,6 @@ class EvaluateHandler:
 
         Single-AC callers never reach this path — see ``handle()``.
         """
-        import asyncio
 
         from ouroboros.evaluation import EvaluationContext
         from ouroboros.evaluation.checklist import (
@@ -712,6 +1063,10 @@ class EvaluateHandler:
             build_run_feedback,
             format_checklist,
         )
+
+        spec_map = ac_spec_map or {}
+        # Each criterion's own recorded evidence, by position.
+        recorded = recorded_checks or tuple(() for _ in acceptance_criteria)
 
         log.info(
             "mcp.tool.evaluate.multi_ac_started",
@@ -724,17 +1079,26 @@ class EvaluateHandler:
             execution_id=session_id,
             seed_id=seed_id,
             current_ac=acceptance_criteria[0],
+            current_ac_spec=spec_map.get(acceptance_criteria[0]),
             artifact=artifact,
             artifact_type=artifact_type,
             goal=goal,
             constraints=constraints,
             trigger_consensus=trigger_consensus,
             artifact_bundle=artifact_bundle,
+            executor_backend=executor_backend,
+            recorded_checks=recorded[0],
         )
         first_result = await pipeline.evaluate(first_context)  # type: ignore[attr-defined]
         if first_result.is_err:
             err = first_result.error
             rendered = err.format_details() if hasattr(err, "format_details") else str(err)
+            if emit_terminal_telemetry:
+                record_direct_evaluation_outcome(
+                    final_approved=None,
+                    failed=True,
+                    failure_reason_code=_direct_evaluation_failure_reason(err),
+                )
             return Result.err(
                 MCPToolError(
                     f"Evaluation failed: {rendered}",
@@ -742,21 +1106,26 @@ class EvaluateHandler:
                 )
             )
 
-        # Extract Stage 1 result to share with remaining ACs.
-        shared_stage1 = first_result.value.stage1_result
+        # Share the project command checks only; each AC adds its own
+        # recorded check package evidence (``recorded_checks``).
+        first_stage1 = first_result.value.stage1_result
+        shared_stage1 = first_stage1.command_checks() if first_stage1 is not None else None
 
         # --- Stage 2+: parallelize remaining ACs (Stage 1 injected) ---
-        async def _run_one(ac_text: str) -> Result[object, object]:
+        async def _run_one(index: int, ac_text: str) -> Result[object, object]:
             context = EvaluationContext(
                 execution_id=session_id,
                 seed_id=seed_id,
                 current_ac=ac_text,
+                current_ac_spec=spec_map.get(ac_text),
                 artifact=artifact,
                 artifact_type=artifact_type,
                 goal=goal,
                 constraints=constraints,
                 trigger_consensus=trigger_consensus,
                 artifact_bundle=artifact_bundle,
+                executor_backend=executor_backend,
+                recorded_checks=recorded[index],
             )
             return await pipeline.evaluate(  # type: ignore[attr-defined]
                 context,
@@ -764,7 +1133,7 @@ class EvaluateHandler:
             )
 
         remaining_gathered = await asyncio.gather(
-            *(_run_one(ac) for ac in acceptance_criteria[1:]),
+            *(_run_one(index, ac) for index, ac in enumerate(acceptance_criteria) if index),
             return_exceptions=True,
         )
         gathered = (first_result, *remaining_gathered)
@@ -777,6 +1146,12 @@ class EvaluateHandler:
                     "mcp.tool.evaluate.multi_ac_exception",
                     session_id=session_id,
                 )
+                if emit_terminal_telemetry:
+                    record_direct_evaluation_outcome(
+                        final_approved=None,
+                        failed=True,
+                        failure_reason_code=_direct_evaluation_failure_reason(entry),
+                    )
                 return Result.err(
                     MCPToolError(
                         f"Evaluation failed during multi-AC run: {entry}",
@@ -791,6 +1166,12 @@ class EvaluateHandler:
                     session_id=session_id,
                     error=rendered,
                 )
+                if emit_terminal_telemetry:
+                    record_direct_evaluation_outcome(
+                        final_approved=None,
+                        failed=True,
+                        failure_reason_code=_direct_evaluation_failure_reason(err),
+                    )
                 return Result.err(
                     MCPToolError(
                         f"Evaluation failed: {rendered}",
@@ -801,12 +1182,32 @@ class EvaluateHandler:
         eval_results = tuple(entry.value for entry in gathered)  # type: ignore[union-attr]
         checklist = aggregate_results(acceptance_criteria, eval_results)
         feedback = build_run_feedback(checklist)
+        # The checklist is one aggregate evaluation, so its trustworthy stage
+        # is the highest stage completed by every AC pipeline, not an invented
+        # constant or the best stage reached by only one AC. EvaluationSummary
+        # uses this value as a quality axis in frugality comparisons.
+        highest_stage = min(max(1, result.highest_stage_completed) for result in eval_results)
 
         code_changes: bool | None = None
-        if any(r.stage1_result and not r.stage1_result.passed for r in eval_results):
+        if any(
+            r.stage1_result and r.stage1_result.disposition is MechanicalDisposition.EXECUTED_FAIL
+            for r in eval_results
+        ):
             code_changes = await self._has_code_changes(working_dir)
 
-        text_parts = [format_checklist(checklist)]
+        # The run's Stage 1: the shared command checks plus every criterion's
+        # recorded check package evidence, decided by the one classifier.
+        run_recorded = tuple(check for checks in recorded for check in checks)
+        run_stage1 = shared_stage1
+        if run_recorded:
+            run_stage1 = (shared_stage1 or MechanicalResult(passed=True, checks=())).with_recorded(
+                run_recorded
+            )
+
+        text_parts = [
+            *format_stage1_result(run_stage1, include_exit_status=True),
+            format_checklist(checklist),
+        ]
         if code_changes is False:
             text_parts.append("\nNote: no code changes detected in the working tree.")
         result_text = "\n".join(text_parts)
@@ -814,6 +1215,16 @@ class EvaluateHandler:
         meta = {
             "session_id": session_id,
             "final_approved": checklist.all_passed,
+            "acceptance_state": aggregate_acceptance_state(
+                [
+                    derive_acceptance_state(
+                        final_approved=r.final_approved, stage1_result=r.stage1_result
+                    )
+                    for r in eval_results
+                ]
+            ).value,
+            "executed_evidence": bool(run_stage1 and run_stage1.has_executed_evidence),
+            "highest_stage": highest_stage,
             "multi_ac": True,
             "ac_count": checklist.total,
             "passed_count": checklist.passed_count,
@@ -831,6 +1242,7 @@ class EvaluateHandler:
             ],
             "run_feedback": list(feedback),
             "code_changes_detected": code_changes,
+            "stage1_result": serialize_stage1_result(run_stage1),
         }
 
         log.info(
@@ -841,6 +1253,8 @@ class EvaluateHandler:
             all_passed=checklist.all_passed,
         )
 
+        if emit_terminal_telemetry:
+            record_direct_evaluation_outcome(final_approved=checklist.all_passed)
         return Result.ok(
             MCPToolResult(
                 content=(MCPContentItem(type=ContentType.TEXT, text=result_text),),
@@ -886,26 +1300,13 @@ class EvaluateHandler:
             "Evaluation Results",
             "=" * 60,
             f"Execution ID: {result.execution_id}",
-            f"Final Approval: {'APPROVED' if result.final_approved else 'REJECTED'}",
+            f"Final Approval: {_ACCEPTANCE_LABELS[result.acceptance_state]}",
             f"Highest Stage Completed: {result.highest_stage_completed}",
             "",
         ]
 
         # Stage 1 results
-        if result.stage1_result:
-            s1 = result.stage1_result
-            lines.extend(
-                [
-                    "Stage 1: Mechanical Verification",
-                    "-" * 40,
-                    f"Status: {'PASSED' if s1.passed else 'FAILED'}",
-                    f"Coverage: {s1.coverage_score:.1%}" if s1.coverage_score else "Coverage: N/A",
-                ]
-            )
-            for check in s1.checks:
-                status = "PASS" if check.passed else "FAIL"
-                lines.append(f"  [{status}] {check.check_type}: {check.message}")
-            lines.append("")
+        lines.extend(format_stage1_result(result.stage1_result))
 
         # Stage 2 results
         if result.stage2_result:
@@ -950,6 +1351,9 @@ class EvaluateHandler:
                     f"Approving: {s3.approving_votes}",
                 ]
             )
+            reviewer_independence = getattr(s3, "reviewer_independence", None)
+            if reviewer_independence:
+                lines.append(f"Reviewer Independence: {reviewer_independence}")
             for vote in s3.votes:
                 decision = "APPROVE" if vote.approved else "REJECT"
                 lines.append(f"  [{decision}] {vote.model} (confidence: {vote.confidence:.2f})")
@@ -969,7 +1373,10 @@ class EvaluateHandler:
                 ]
             )
             # Contextual annotation for Stage 1 failures
-            stage1_failed = result.stage1_result and not result.stage1_result.passed
+            stage1_failed = (
+                result.stage1_result is not None
+                and result.stage1_result.disposition is MechanicalDisposition.EXECUTED_FAIL
+            )
             if stage1_failed and code_changes is True:
                 lines.extend(
                     [
@@ -1120,7 +1527,7 @@ class ChecklistVerifyHandler:
             )
 
         acceptance_criteria = tuple(
-            text.strip() for text in seed.acceptance_criteria if text and text.strip()
+            text for criterion in seed.acceptance_criteria if (text := ac_text(criterion).strip())
         )
         if not acceptance_criteria:
             return Result.err(
@@ -1151,6 +1558,11 @@ class ChecklistVerifyHandler:
             ac_count=len(acceptance_criteria),
         )
 
+        # ouroboros_checklist_verify is itself a genuine top-level direct MCP
+        # tool (no "Start" job-backed variant, no JobManager wraps it), so the
+        # nested EvaluateHandler call keeps emit_terminal_telemetry at its
+        # default True — nothing else will emit a workflow_outcome for this
+        # invocation.
         result = await evaluator.handle(evaluate_args)
 
         if result.is_err:
@@ -1184,112 +1596,96 @@ class ChecklistVerifyHandler:
 
 
 @dataclass
-class LateralThinkHandler(BridgeAwareMixin):
-    """Handler for the lateral_think tool.
+class StartEvaluateHandler:
+    """Start an evaluation asynchronously and return a job ID immediately.
 
-    Generates alternative thinking approaches using lateral thinking personas
-    to break through stagnation in problem-solving.
+    The three-stage evaluation pipeline (mechanical + semantic + optional
+    consensus) routinely runs longer than an MCP client's default tool-call
+    timeout (Claude Code's MCP layer caps tool calls at ~120s). This handler
+    wraps :class:`EvaluateHandler` in a :class:`JobManager`-backed background
+    job so the caller gets a ``job_id`` immediately and polls for the verdict
+    via ``ouroboros_job_status`` / ``ouroboros_job_wait`` /
+    ``ouroboros_job_result``.
 
-    Inherits :class:`BridgeAwareMixin` (#475) so the composition root's
-    loop-injection populates ``mcp_manager`` and ``mcp_tool_prefix``
-    automatically when an MCP bridge is configured. The bridge fields
-    are not consumed by this PR — a follow-up slice forwards them into
-    the lateral-think dispatch path so dynamic external MCP servers
-    reach the unstuck pipeline.
-
-    The multi-persona fan-out path emits a ``_subagents`` envelope that is
-    consumed by the OpenCode bridge plugin. It is gated on
-    ``should_dispatch_via_plugin(agent_runtime_backend, opencode_mode)`` —
-    identical to the other subagent-emitting handlers — so that subprocess
-    mode (or non-OpenCode runtimes) falls back to an inline multi-persona
-    text response instead of emitting an envelope nobody will consume.
-
-    Attributes:
-        agent_runtime_backend: Configured runtime (e.g. ``"opencode"``).
-        opencode_mode: Configured ``orchestrator.opencode_mode`` value
-            (``"plugin"`` or ``"subprocess"``). ``None`` falls through as
-            non-plugin (safe default — see ``should_dispatch_via_plugin``).
+    Plugin mode (OpenCode subagent dispatch) is terminal when automatic
+    evolution is disabled, mirroring :class:`StartExecuteSeedHandler` and
+    :class:`StartEvolveStepHandler`: the envelope is emitted directly and no
+    background job is enqueued. With automatic evolution enabled the parent
+    must observe the verdict, so evaluation stays parent-owned and pollable.
     """
 
+    evaluate_handler: EvaluateHandler | None = field(default=None, repr=False)
+    event_store: EventStore | None = field(default=None, repr=False)
+    job_manager: JobManager | None = field(default=None, repr=False)
+    llm_backend: str | None = field(default=None, repr=False)
     agent_runtime_backend: str | None = field(default=None, repr=False)
     opencode_mode: str | None = field(default=None, repr=False)
+    start_ralph_handler: "StartRalphHandler | None" = field(default=None, repr=False)
+    seed_handoff_registry: "SeedHandoffRegistry | None" = field(default=None, repr=False)
+    deadline_seconds: float = 1800.0
+
+    def __post_init__(self) -> None:
+        self._event_store = self.event_store or EventStore()
+        self._job_manager = self.job_manager or JobManager(self._event_store)
+        self._evaluate_handler = self.evaluate_handler or EvaluateHandler(
+            event_store=self._event_store,
+            llm_backend=self.llm_backend,
+            agent_runtime_backend=self.agent_runtime_backend,
+            opencode_mode=self.opencode_mode,
+        )
+
+    async def _enqueue_chained_ralph(
+        self,
+        evaluation_result: MCPToolResult,
+        *,
+        session_id: str,
+        arguments: dict[str, Any],
+    ) -> MCPToolResult:
+        """Compatibility seam for direct chain tests and embedders."""
+        from ouroboros.mcp.tools.evaluate_ralph_chain import enqueue_chained_ralph
+
+        return await enqueue_chained_ralph(
+            evaluation_result,
+            session_id=session_id,
+            arguments=arguments,
+            event_store=self._event_store,
+            job_manager=self._job_manager,
+            start_ralph_handler=self.start_ralph_handler,
+        )
 
     @property
     def definition(self) -> MCPToolDefinition:
-        """Return the tool definition."""
         return MCPToolDefinition(
-            name="ouroboros_lateral_think",
+            name="ouroboros_start_evaluate",
             description=(
-                "Generate alternative thinking approaches using lateral thinking personas. "
-                "Use this tool when stuck on a problem to get fresh perspectives from "
-                "different thinking modes: hacker (unconventional workarounds), "
-                "researcher (seeks information), simplifier (reduces complexity), "
-                "architect (restructures approach), or contrarian (challenges assumptions). "
-                "Set persona='all' (or pass personas=['hacker','architect',...]) to "
-                "fan out to MULTIPLE personas in parallel — each runs in its own "
-                "Task pane with an independent LLM context (no cross-contamination)."
+                "Verify that finished work meets its acceptance criteria, not just "
+                'that tests pass ("is it actually done?", "check it against '
+                'the spec"). '
+                "Start an evaluation in the background and return a job ID immediately. "
+                "Use this instead of ouroboros_evaluate when the three-stage pipeline "
+                "(mechanical + semantic + optional consensus) is expected to exceed the "
+                "MCP client tool-call timeout. Poll with ouroboros_job_status / "
+                "ouroboros_job_wait and read the verdict via ouroboros_job_result. "
+                "In plugin mode with auto_evolve disabled, evaluation is delegated "
+                "to an OpenCode Task pane and job_id is None. With auto_evolve enabled, "
+                "the parent keeps evaluation pollable so a rejection can start Ralph."
             ),
             parameters=(
+                *EvaluateHandler().definition.parameters,
                 MCPToolParameter(
-                    name="problem_context",
-                    type=ToolInputType.STRING,
-                    description="Description of the stuck situation or problem",
-                    required=True,
-                ),
-                MCPToolParameter(
-                    name="current_approach",
-                    type=ToolInputType.STRING,
-                    description="What has been tried so far that isn't working",
-                    required=True,
-                ),
-                MCPToolParameter(
-                    name="persona",
-                    type=ToolInputType.STRING,
+                    name="auto_evolve",
+                    type=ToolInputType.BOOLEAN,
                     description=(
-                        "Single persona (hacker, researcher, simplifier, architect, "
-                        "contrarian) OR 'all' to dispatch ALL 5 personas in parallel "
-                        "as separate Task panes."
-                    ),
-                    required=False,
-                    enum=(
-                        "hacker",
-                        "researcher",
-                        "simplifier",
-                        "architect",
-                        "contrarian",
-                        "all",
-                    ),
-                ),
-                MCPToolParameter(
-                    name="stagnation_pattern",
-                    type=ToolInputType.STRING,
-                    description=(
-                        "Detected stagnation pattern used to suggest a persona when "
-                        "persona is omitted."
-                    ),
-                    required=False,
-                    enum=(
-                        "spinning",
-                        "oscillation",
-                        "no_drift",
-                        "diminishing_returns",
-                    ),
-                ),
-                MCPToolParameter(
-                    name="personas",
-                    type=ToolInputType.ARRAY,
-                    description=(
-                        "Explicit list of personas to dispatch in parallel. "
-                        "Takes precedence over 'persona' arg. Example: "
-                        "['hacker','contrarian','architect']. Each runs in its "
-                        "own parallel Task pane."
+                        "Override execution.auto_evolve for this background call. "
+                        "When true, an explicitly rejected formal evaluation starts "
+                        "a bounded Ralph continuation loop."
                     ),
                     required=False,
                 ),
                 MCPToolParameter(
-                    name="failed_attempts",
-                    type=ToolInputType.ARRAY,
-                    description="Previous failed approaches to avoid repeating",
+                    name="seed_handoff_id",
+                    type=ToolInputType.STRING,
+                    description="Opaque parent-owned Seed handle for plugin evaluation",
                     required=False,
                 ),
             ),
@@ -1299,314 +1695,125 @@ class LateralThinkHandler(BridgeAwareMixin):
         self,
         arguments: dict[str, Any],
     ) -> Result[MCPToolResult, MCPServerError]:
-        """Handle a lateral thinking request.
-
-        Two modes:
-        - Single persona (default): return one prompt directly as text.
-        - Multi-persona parallel: when ``persona='all'`` or ``personas=[...]``
-          is passed, dispatch N subagents in parallel (one per persona) via
-          the ``_subagents`` bridge payload. Each runs in its own Task pane
-          with an independent LLM context.
-
-        Args:
-            arguments: Tool arguments including problem_context and current_approach.
-
-        Returns:
-            Result containing lateral thinking prompt(s) or error.
-        """
-        from ouroboros.resilience.lateral import LateralThinker, ThinkingPersona
-        from ouroboros.resilience.stagnation import StagnationPattern
-
-        problem_context = arguments.get("problem_context")
-        if not problem_context:
+        session_id = arguments.get("session_id")
+        if not session_id:
             return Result.err(
                 MCPToolError(
-                    "problem_context is required",
-                    tool_name="ouroboros_lateral_think",
+                    "session_id is required",
+                    tool_name="ouroboros_start_evaluate",
                 )
             )
-
-        current_approach = arguments.get("current_approach")
-        if not current_approach:
+        artifact = arguments.get("artifact")
+        if not artifact:
             return Result.err(
                 MCPToolError(
-                    "current_approach is required",
-                    tool_name="ouroboros_lateral_think",
+                    "artifact is required",
+                    tool_name="ouroboros_start_evaluate",
                 )
             )
 
-        failed_attempts_raw = arguments.get("failed_attempts") or []
-        failed_attempts = tuple(str(a) for a in failed_attempts_raw if a)
-
-        # --- Parallel multi-persona dispatch path ---
-        explicit_list = arguments.get("personas")
-        raw_persona_arg = arguments.get("persona")
-        if explicit_list or raw_persona_arg is None:
-            persona_arg = ""
-        else:
-            persona_arg = str(raw_persona_arg).strip()
-            if not persona_arg:
-                return Result.err(
-                    MCPToolError(
-                        "persona cannot be blank",
-                        tool_name="ouroboros_lateral_think",
-                    )
-                )
-        dispatch_all = persona_arg == "all"
-
-        if explicit_list or dispatch_all:
-            from ouroboros.mcp.tools.subagent import (
-                build_lateral_multi_subagent,
-                build_multi_subagent_result,
-                should_dispatch_via_plugin,
-            )
-
-            if explicit_list:
-                # Coerce each item to str, drop blanks/nulls, dedupe preserving order.
-                seen_p: set[str] = set()
-                personas_list: list[str] = []
-                for item in explicit_list:
-                    s = str(item).strip() if item is not None else ""
-                    if s and s not in seen_p:
-                        seen_p.add(s)
-                        personas_list.append(s)
-                if not personas_list:
-                    return Result.err(
-                        MCPToolError(
-                            "personas list is empty or contains only blank/null items",
-                            tool_name="ouroboros_lateral_think",
-                        )
-                    )
-            else:
-                # persona="all" → use every persona
-                personas_list = [p.value for p in ThinkingPersona]
-
-            try:
-                payloads = build_lateral_multi_subagent(
-                    personas=personas_list,
-                    problem_context=str(problem_context),
-                    current_approach=str(current_approach),
-                    failed_attempts=failed_attempts,
-                )
-            except ValueError as e:
-                return Result.err(
-                    MCPToolError(
-                        str(e),
-                        tool_name="ouroboros_lateral_think",
-                    )
-                )
-            except Exception as e:  # noqa: BLE001
-                log.error("mcp.tool.lateral_think.multi.error", error=str(e))
-                return Result.err(
-                    MCPToolError(
-                        f"Unexpected error building multi-persona dispatch: {e}",
-                        tool_name="ouroboros_lateral_think",
-                    )
-                )
-
-            log.info(
-                "mcp.tool.lateral_think.multi",
-                persona_count=len(payloads),
-                context_length=len(str(problem_context)),
-                failed_count=len(failed_attempts),
-            )
-
-            # Gate on runtime + opencode_mode — identical contract to the
-            # other subagent-emitting handlers. Subprocess mode (or a
-            # non-OpenCode runtime) falls back to synthesising a combined
-            # persona-prompt text inline, because no bridge plugin will
-            # consume the ``_subagents`` envelope.
-            if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
-                # Preserve public response shape (#442): ouroboros_lateral_think
-                # natural response documents alternative-thinking metadata.
-                # Expose persona_count + dispatch status at top level so callers
-                # can branch on delegation without parsing the envelope.
-                return build_multi_subagent_result(
-                    payloads,
-                    response_shape={
-                        "status": "delegated_to_subagent",
-                        "dispatch_mode": "plugin",
-                        "persona_count": len(payloads),
-                    },
-                )
-
-            # --- Inline fallback: concatenate persona prompts ---
-            thinker = LateralThinker()
-            sections: list[str] = []
-            for p_str in personas_list:
-                try:
-                    p_enum = ThinkingPersona(p_str)
-                except ValueError:
-                    continue
-                lateral_res = thinker.generate_alternative(
-                    persona=p_enum,
-                    problem_context=str(problem_context),
-                    current_approach=str(current_approach),
-                    failed_attempts=failed_attempts,
-                )
-                if lateral_res.is_err:
-                    continue
-                lr = lateral_res.unwrap()
-                sections.append(f"# Lateral Thinking: {lr.approach_summary}\n\n{lr.prompt}")
-
-            if not sections:
-                return Result.err(
-                    MCPToolError(
-                        "No valid personas produced output for inline fallback",
-                        tool_name="ouroboros_lateral_think",
-                    )
-                )
-
-            combined = "\n\n---\n\n".join(sections)
-            return Result.ok(
-                MCPToolResult(
-                    content=(MCPContentItem(type=ContentType.TEXT, text=combined),),
-                    is_error=False,
-                    meta={
-                        "persona_count": len(sections),
-                        "dispatch_mode": "inline_fallback",
-                    },
-                )
-            )
-
-        # --- Single-persona path ---
-        if not persona_arg:
-            stagnation_pattern_arg = arguments.get("stagnation_pattern")
-            if stagnation_pattern_arg:
-                try:
-                    stagnation_pattern = StagnationPattern(str(stagnation_pattern_arg))
-                except ValueError:
-                    return Result.err(
-                        MCPToolError(
-                            (
-                                f"Invalid stagnation_pattern: {stagnation_pattern_arg}. "
-                                "Must be one of: spinning, oscillation, no_drift, "
-                                "diminishing_returns"
-                            ),
-                            tool_name="ouroboros_lateral_think",
-                        )
-                    )
-
-                from ouroboros.resilience.recovery import suggest_lateral_persona_for_pattern
-
-                suggested = suggest_lateral_persona_for_pattern(
-                    stagnation_pattern,
-                    failed_attempts=failed_attempts,
-                )
-                if suggested is None:
-                    return Result.err(
-                        MCPToolError(
-                            (
-                                "No available lateral thinking persona remains after "
-                                "applying failed_attempts exclusions"
-                            ),
-                            tool_name="ouroboros_lateral_think",
-                        )
-                    )
-                persona_arg = suggested.value
-            else:
-                persona_arg = ThinkingPersona.CONTRARIAN.value
-
-        try:
-            persona = ThinkingPersona(persona_arg)
-        except ValueError:
-            return Result.err(
-                MCPToolError(
-                    f"Invalid persona: {persona_arg}. Must be one of: "
-                    f"hacker, researcher, simplifier, architect, contrarian, all",
-                    tool_name="ouroboros_lateral_think",
-                )
-            )
-
-        log.info(
-            "mcp.tool.lateral_think",
-            persona=persona.value,
-            context_length=len(str(problem_context)),
-            failed_count=len(failed_attempts),
+        from ouroboros.mcp.tools.evaluation_job import (
+            dispatch_plugin_evaluation,
+            resolve_auto_evolve_policy,
+            restore_seed_handoff,
         )
 
-        # Plugin mode: dispatch even a single persona as a subagent so the
-        # LLM in the child Task pane does the actual thinking — the parent
-        # session stays responsive and gets the result asynchronously.
-        from ouroboros.mcp.tools.subagent import (
-            build_subagent_result,
-            should_dispatch_via_plugin,
+        try:
+            arguments, auto_evolve_enabled = resolve_auto_evolve_policy(
+                arguments, configured_enabled=get_auto_evolve_enabled()
+            )
+            plugin_dispatch = should_dispatch_via_plugin(
+                self.agent_runtime_backend, self.opencode_mode
+            )
+            background_acceptance = background_jobs.BackgroundJobAcceptanceState()
+        except ValueError as exc:
+            return Result.err(MCPToolError(str(exc), tool_name="ouroboros_start_evaluate"))
+
+        try:
+            arguments, seed_handoff = restore_seed_handoff(
+                arguments, session_id=session_id, registry=self.seed_handoff_registry
+            )
+        except ValueError as exc:
+            return Result.err(MCPToolError(str(exc), tool_name="ouroboros_start_evaluate"))
+
+        # Plugin mode is terminal only when no convergence successor is needed:
+        # return the delegation envelope without enqueuing a background job,
+        # matching StartExecuteSeedHandler / StartEvolveStepHandler. Polling a
+        # fake job_id would break the ouroboros_job_status contract.
+        if plugin_dispatch and not auto_evolve_enabled:
+            return await seed_handoff.accept(
+                dispatch_plugin_evaluation(
+                    arguments=arguments,
+                    session_id=session_id,
+                    artifact=artifact,
+                    event_store=self._event_store,
+                    resolve_working_dir=_resolve_evaluate_working_dir,
+                ),
+                require_ok=True,
+                acceptance_may_have_occurred=False,
+            )
+
+        # The shared helper preserves job-scoped cancellation across restart.
+        async def _runner(_handle) -> MCPToolResult:
+            from ouroboros.mcp.tools.evaluation_job import run_evaluation_job
+
+            return await run_evaluation_job(
+                evaluate_handler=self._evaluate_handler,
+                arguments=arguments,
+                session_id=session_id,
+                deadline_seconds=self.deadline_seconds,
+                force_in_process=auto_evolve_enabled and plugin_dispatch,
+                auto_evolve=auto_evolve_enabled,
+                event_store=self._event_store,
+                job_manager=self._job_manager,
+                start_ralph_handler=self.start_ralph_handler,
+            )
+
+        snapshot = await seed_handoff.accept(
+            background_jobs.start_background_tool_job(
+                job_manager=self._job_manager,
+                event_store=self._event_store,
+                job_type="evaluate",
+                intent="evaluate",
+                process_scope=f"evaluate:{session_id}",
+                initial_message=f"Queued evaluation for {session_id}",
+                links=JobLinks(session_id=session_id),
+                work_fn=_runner,
+                cancelled_text="Evaluation cancelled before work began.",
+                detached_tool_name="ouroboros_start_evaluate",
+                detached_arguments=arguments,
+                runtime_backend=self.agent_runtime_backend,
+                llm_backend=self.llm_backend,
+                opencode_mode=self.opencode_mode,
+                acceptance_state=background_acceptance,
+            ),
+            acceptance_may_have_occurred=background_acceptance.may_have_accepted,
         )
 
-        if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
-            from ouroboros.mcp.tools.subagent import build_lateral_multi_subagent
-
-            try:
-                payloads = build_lateral_multi_subagent(
-                    personas=[persona.value],
-                    problem_context=str(problem_context),
-                    current_approach=str(current_approach),
-                    failed_attempts=failed_attempts,
-                )
-            except (ValueError, Exception) as e:  # noqa: BLE001
-                log.error("mcp.tool.lateral_think.single_dispatch.error", error=str(e))
-                return Result.err(
-                    MCPToolError(
-                        f"Failed to build single-persona subagent: {e}",
-                        tool_name="ouroboros_lateral_think",
-                    )
-                )
-
-            # Single payload → single _subagent envelope (not _subagents array)
-            return build_subagent_result(
-                payloads[0],
-                response_shape={
-                    "status": "delegated_to_subagent",
-                    "dispatch_mode": "plugin",
-                    "persona": persona.value,
-                },
+        observer = build_job_observer_contract(
+            job_id=snapshot.job_id,
+            cursor=snapshot.cursor,
+            session_id=session_id,
+            follow_result_job_keys=("chained_ralph_job_id",),
+        )
+        text = (
+            f"Started background evaluation.\n\nJob ID: {snapshot.job_id}\n"
+            f"Session ID: {session_id}\n\nUse ouroboros_job_status, ouroboros_job_wait, "
+            "or ouroboros_job_result to monitor it."
+        )
+        text = append_job_observer_inline_handoff(text, observer)
+        meta = {
+            "job_id": snapshot.job_id,
+            "session_id": session_id,
+            "status": snapshot.status.value,
+            "cursor": snapshot.cursor,
+            "job_observer": observer,
+        }
+        return Result.ok(
+            MCPToolResult(
+                content=(MCPContentItem(type=ContentType.TEXT, text=text),),
+                is_error=False,
+                meta=meta,
+                structured_content=dict(meta),
             )
-
-        # Inline fallback for subprocess / non-OpenCode runtimes.
-        try:
-            thinker = LateralThinker()
-            result = thinker.generate_alternative(
-                persona=persona,
-                problem_context=str(problem_context),
-                current_approach=str(current_approach),
-                failed_attempts=failed_attempts,
-            )
-
-            if result.is_err:
-                return Result.err(
-                    MCPToolError(
-                        result.error,
-                        tool_name="ouroboros_lateral_think",
-                    )
-                )
-
-            lateral_result = result.unwrap()
-
-            # Build the response
-            response_text = (
-                f"# Lateral Thinking: {lateral_result.approach_summary}\n\n"
-                f"{lateral_result.prompt}\n\n"
-                "## Questions to Consider\n"
-            )
-            for question in lateral_result.questions:
-                response_text += f"- {question}\n"
-
-            return Result.ok(
-                MCPToolResult(
-                    content=(MCPContentItem(type=ContentType.TEXT, text=response_text),),
-                    is_error=False,
-                    meta={
-                        "persona": lateral_result.persona.value,
-                        "approach_summary": lateral_result.approach_summary,
-                        "questions_count": len(lateral_result.questions),
-                    },
-                )
-            )
-        except Exception as e:
-            log.error("mcp.tool.lateral_think.error", error=str(e))
-            return Result.err(
-                MCPToolError(
-                    f"Lateral thinking failed: {e}",
-                    tool_name="ouroboros_lateral_think",
-                )
-            )
+        )

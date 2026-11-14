@@ -2,16 +2,31 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
+import re
+import subprocess
+import sys
 from unittest.mock import patch
 
 import pytest
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 import yaml
 
-from ouroboros.cli.commands.config import app
+from ouroboros.cli.commands.config import _INERT_SETTINGS, _resolve_db_path, app
 
 runner = CliRunner(env={"COLUMNS": "200"})
+
+_EVENT_STORE_CONFIG_COMMANDS = [
+    ["config", "show", "--json"],
+    ["status", "executions"],
+    ["resume"],
+    ["tui", "open"],
+    ["mcp", "doctor", "--json"],
+    ["mcp", "serve", "--transport", "stdio"],
+]
+_EVENT_STORE_CONFIG_TIMEOUT_SECONDS = 30
 
 
 @pytest.fixture()
@@ -47,6 +62,54 @@ def codex_config_dir(tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.fixture()
+def cp949_config_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Exercise locale-dependent config I/O even on UTF-8 CI hosts."""
+    original_open = Path.open
+    original_read_text = Path.read_text
+    original_write_text = Path.write_text
+
+    def text_encoding(path: Path, encoding: str | None) -> str | None:
+        if (
+            path.parent == tmp_path
+            and path.name in {"config.yaml", "config.yaml.bak"}
+            and encoding in (None, "locale")
+        ):
+            return "cp949"
+        return encoding
+
+    def read_text(path: Path, encoding=None, errors=None, **kwargs):
+        return original_read_text(
+            path, encoding=text_encoding(path, encoding), errors=errors, **kwargs
+        )
+
+    def write_text(path: Path, data: str, encoding=None, errors=None, newline=None):
+        return original_write_text(
+            path, data, encoding=text_encoding(path, encoding), errors=errors, newline=newline
+        )
+
+    def open_with_cp949_default(
+        path: Path,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ):
+        if "b" not in mode:
+            encoding = text_encoding(path, encoding)
+        return original_open(path, mode, buffering, encoding, errors, newline)
+
+    monkeypatch.setattr(Path, "open", open_with_cp949_default)
+    # read_text/write_text resolve an omitted encoding before calling open on
+    # newer Python versions, including when UTF-8 mode is enabled.
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "write_text", write_text)
+    monkeypatch.setattr("ouroboros.config.models.get_config_dir", lambda: tmp_path)
+    monkeypatch.setattr("ouroboros.config.loader.get_config_dir", lambda: tmp_path)
+    return tmp_path
+
+
 def _patch_config_dir(config_dir: Path):
     """Patch get_config_dir to return our temp dir."""
     return patch("ouroboros.cli.commands.config._load_config", side_effect=None)
@@ -70,6 +133,91 @@ class TestConfigShow:
         assert result.exit_code == 0
         assert "runtime_backend" in result.output
 
+    def test_show_evaluation_warns_about_persisted_inert_threshold(self, config_dir: Path) -> None:
+        path = config_dir / "config.yaml"
+        data = yaml.safe_load(path.read_text())
+        data["evaluation"] = {"satisfaction_threshold": 0.95}
+        path.write_text(yaml.safe_dump(data))
+        with patch("ouroboros.config.models.get_config_dir", return_value=config_dir):
+            result = runner.invoke(app, ["show", "evaluation"])
+        assert result.exit_code == 0
+        assert "satisfaction_threshold" in result.output
+        assert "does not affect" in result.output
+
+    def test_set_inert_threshold_warns_after_save(self, config_dir: Path) -> None:
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch("ouroboros.config.loader.get_config_dir", return_value=config_dir),
+        ):
+            result = runner.invoke(app, ["set", "evaluation.satisfaction_threshold", "0.95"])
+        assert result.exit_code == 0
+        assert "does not affect" in result.output
+        assert (
+            yaml.safe_load((config_dir / "config.yaml").read_text())["evaluation"][
+                "satisfaction_threshold"
+            ]
+            == 0.95
+        )
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("evaluation.stage1_enabled", "false"),
+            ("evaluation.stage2_enabled", "false"),
+            ("evaluation.stage3_enabled", "false"),
+            ("evaluation.satisfaction_threshold", "0.9"),
+            ("evaluation.uncertainty_threshold", "0.5"),
+            ("consensus.min_models", "4"),
+            ("consensus.threshold", "0.9"),
+            ("consensus.diversity_required", "false"),
+        ],
+    )
+    def test_each_documented_inert_field_warns_after_set(
+        self, config_dir: Path, key: str, value: str
+    ) -> None:
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch("ouroboros.config.loader.get_config_dir", return_value=config_dir),
+        ):
+            result = runner.invoke(app, ["set", key, value])
+        assert result.exit_code == 0
+        assert key in result.output
+        assert "does not affect" in result.output
+
+    def test_set_active_field_has_no_inert_warning(self, config_dir: Path) -> None:
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch("ouroboros.config.loader.get_config_dir", return_value=config_dir),
+        ):
+            result = runner.invoke(app, ["set", "logging.level", "debug"])
+        assert result.exit_code == 0
+        assert "does not affect" not in result.output
+
+    def test_summary_warns_for_saved_inert_keys_without_echoing_values(
+        self, config_dir: Path
+    ) -> None:
+        path = config_dir / "config.yaml"
+        data = yaml.safe_load(path.read_text())
+        data["consensus"] = {"threshold": "SYNTHETIC_PRIVATE_VALUE"}
+        path.write_text(yaml.safe_dump(data))
+        with patch("ouroboros.config.models.get_config_dir", return_value=config_dir):
+            result = runner.invoke(app, ["show"])
+        assert result.exit_code == 0
+        assert "consensus.threshold" in result.output
+        assert "does not affect" in result.output
+        assert "SYNTHETIC_PRIVATE_VALUE" not in result.output
+
+    def test_inert_warning_list_matches_documented_field_dispositions(self) -> None:
+        reference = (Path(__file__).resolve().parents[3] / "docs/config-reference.md").read_text(
+            encoding="utf-8"
+        )
+        for section, expected in _INERT_SETTINGS.items():
+            text = reference.split(f"## `{section}`", 1)[1].split("\n## ", 1)[0]
+            documented = set(
+                re.findall(r"^\| `([^`]+)` \|.*\*\*Currently inert", text, re.MULTILINE)
+            )
+            assert documented == expected
+
     def test_show_invalid_section(self, config_dir: Path) -> None:
         with patch("ouroboros.config.models.get_config_dir", return_value=config_dir):
             result = runner.invoke(app, ["show", "nonexistent"])
@@ -77,17 +225,54 @@ class TestConfigShow:
 
     def test_show_codex_cli_path(self, codex_config_dir: Path) -> None:
         """config show should display codex_cli_path for codex backend."""
-        with patch("ouroboros.config.models.get_config_dir", return_value=codex_config_dir):
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=codex_config_dir),
+            patch("ouroboros.cli.commands.setup._detect_runtimes", return_value={"codex": None}),
+        ):
             result = runner.invoke(app, ["show"])
         assert result.exit_code == 0
         assert "/usr/bin/codex" in result.output
+
+    def test_show_codex_cli_path_uses_runtime_wrapper_resolution(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Effective config output must report the executable runtime will launch."""
+        wrapper = tmp_path / "codex-wrapper"
+        wrapper.write_bytes(b"\xcf\xfa\xed\xfe" + b"zeude wrapper:codex")
+        wrapper.chmod(0o755)
+        real_dir = tmp_path / "bin"
+        real_dir.mkdir()
+        real_cli = real_dir / "codex"
+        real_cli.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        real_cli.chmod(0o755)
+
+        config = {
+            "orchestrator": {
+                "runtime_backend": "codex",
+                "codex_cli_path": str(wrapper),
+            },
+            "llm": {"backend": "codex"},
+            "logging": {"level": "info"},
+        }
+        (tmp_path / "config.yaml").write_text(yaml.dump(config), encoding="utf-8")
+
+        monkeypatch.setenv("PATH", str(real_dir))
+        with patch("ouroboros.config.models.get_config_dir", return_value=tmp_path):
+            result = runner.invoke(app, ["show", "--json"])
+
+        assert result.exit_code == 0
+        payload = json.loads(result.output)
+        assert payload["environment"]["cli_path"] == str(real_cli)
 
     def test_show_database_path_from_persistence(self, config_dir: Path) -> None:
         """config show should resolve persistence.database_path under config dir."""
         with patch("ouroboros.config.models.get_config_dir", return_value=config_dir):
             result = runner.invoke(app, ["show"])
         assert result.exit_code == 0
-        assert "data/ouroboros.db" in result.output
+        data = yaml.safe_load((config_dir / "config.yaml").read_text())
+        assert _resolve_db_path(data, config_dir / "config.yaml") == str(
+            config_dir / "data" / "ouroboros.db"
+        )
 
     def test_show_database_path_default(self, tmp_path: Path) -> None:
         """Without persistence.database_path, default is <config_dir>/ouroboros.db."""
@@ -101,7 +286,341 @@ class TestConfigShow:
         with patch("ouroboros.config.models.get_config_dir", return_value=tmp_path):
             result = runner.invoke(app, ["show"])
         assert result.exit_code == 0
-        assert "ouroboros.db" in result.output
+        assert _resolve_db_path(config, tmp_path / "config.yaml") == str(tmp_path / "ouroboros.db")
+
+    def test_show_database_path_uses_legacy_runtime_authority(self, config_dir: Path) -> None:
+        legacy_db = config_dir / "ouroboros.db"
+        legacy_db.touch()
+
+        with patch("ouroboros.config.models.get_config_dir", return_value=config_dir):
+            result = runner.invoke(app, ["show"])
+
+        assert result.exit_code == 0
+        data = yaml.safe_load((config_dir / "config.yaml").read_text())
+        assert _resolve_db_path(data, config_dir / "config.yaml") == str(legacy_db)
+
+    def test_show_invalid_database_path_exits_without_traceback(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        config_dir = home / ".ouroboros"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.yaml").write_text("persistence:\n  database_path:\n")
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+
+        result = subprocess.run(
+            [sys.executable, "-m", "ouroboros", "config", "show", "--json"],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+        )
+
+        assert result.returncode == 1
+        assert "persistence.database_path" in result.stdout
+        assert "Traceback" not in result.stdout + result.stderr
+
+    def test_show_json_reports_blank_execution_model_env_as_a_cleared_override(
+        self, config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The effective view must match ``get_execution_model()`` semantics."""
+        data = yaml.safe_load((config_dir / "config.yaml").read_text())
+        data["execution"] = {"default_model": "terra"}
+        (config_dir / "config.yaml").write_text(yaml.dump(data))
+        monkeypatch.setenv("OUROBOROS_PIN_MODELS", "1")
+        monkeypatch.setenv("OUROBOROS_EXECUTION_MODEL", "")
+
+        with patch("ouroboros.config.models.get_config_dir", return_value=config_dir):
+            result = runner.invoke(app, ["show", "--json"])
+
+        assert result.exit_code == 0
+        execute = json.loads(result.output)["stages"]["execute"]
+        assert execute["model"] == "sonnet"
+        assert execute["model_source"] == "env OUROBOROS_EXECUTION_MODEL (cleared) ⚠"
+
+    def test_show_json_reports_unpinned_claude_execution_model_truthfully(
+        self, config_dir: Path
+    ) -> None:
+        """The effective view must show the same Claude fallback the executors use."""
+        with patch("ouroboros.config.models.get_config_dir", return_value=config_dir):
+            result = runner.invoke(app, ["show", "--json"])
+
+        assert result.exit_code == 0
+        execute = json.loads(result.output)["stages"]["execute"]
+        assert execute["model"] == "sonnet"
+        assert execute["model_source"] == "default → backend default"
+
+    def test_show_codex_automatic_model_is_not_presented_as_a_runtime_fact(
+        self, codex_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A config hint is explicitly distinct from the live Codex choice."""
+        monkeypatch.setattr(
+            "ouroboros.backends.model_catalog.configured_default_model",
+            lambda _backend: "gpt-configured",
+        )
+
+        with patch("ouroboros.config.models.get_config_dir", return_value=codex_config_dir):
+            result = runner.invoke(app, ["show", "--json"])
+
+        assert result.exit_code == 0
+        execute = json.loads(result.output)["stages"]["execute"]
+        assert execute["model"] == (
+            "Codex current selected model (config.toml: gpt-configured; not confirmed at runtime)"
+        )
+        assert execute["model_source"] == "automatic Codex selection"
+
+
+@pytest.mark.parametrize("arguments", _EVENT_STORE_CONFIG_COMMANDS)
+def test_invalid_yaml_commands_redact_config_contents(tmp_path: Path, arguments: list[str]) -> None:
+    home = tmp_path / "home"
+    config_dir = home / ".ouroboros"
+    config_dir.mkdir(parents=True)
+    secret = "sk-super-secret"
+    (config_dir / "config.yaml").write_text(
+        f"persistence:\n  database_path: [\napi_key: {secret}: exposed\n"
+    )
+    env = os.environ.copy()
+    env.pop("_OUROBOROS_NESTED", None)
+    env["HOME"] = str(home)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ouroboros", *arguments],
+        stdin=subprocess.DEVNULL,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+        timeout=_EVENT_STORE_CONFIG_TIMEOUT_SECONDS,
+    )
+    output = result.stdout + result.stderr
+
+    assert result.returncode != 0
+    assert secret not in output
+    assert "Traceback" not in output
+    if arguments[:2] == ["mcp", "doctor"]:
+        checks = json.loads(result.stdout)
+        event_store = next(check for check in checks if check["name"] == "event_store")
+        assert event_store["message"] == "Invalid EventStore configuration."
+    else:
+        assert str(home) not in output
+
+
+@pytest.mark.parametrize("arguments", [["status", "executions"], ["resume"]])
+def test_non_mapping_config_redacts_config_path(tmp_path: Path, arguments: list[str]) -> None:
+    home = tmp_path / "home"
+    config_dir = home / ".ouroboros"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.yaml").write_text("- not-a-mapping\n")
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ouroboros", *arguments],
+        stdin=subprocess.DEVNULL,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+        timeout=_EVENT_STORE_CONFIG_TIMEOUT_SECONDS,
+    )
+    output = result.stdout + result.stderr
+
+    assert result.returncode != 0
+    assert str(home) not in output
+    assert "Traceback" not in output
+
+
+@pytest.mark.parametrize("arguments", _EVENT_STORE_CONFIG_COMMANDS)
+def test_wrong_type_persistence_redacts_config_value(
+    tmp_path: Path,
+    arguments: list[str],
+) -> None:
+    home = tmp_path / "home"
+    config_dir = home / ".ouroboros"
+    config_dir.mkdir(parents=True)
+    private_value = "/Users/gate/private"
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(f"persistence: {private_value}\n")
+    env = os.environ.copy()
+    env.pop("_OUROBOROS_NESTED", None)
+    env["HOME"] = str(home)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ouroboros", *arguments],
+        stdin=subprocess.DEVNULL,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+        timeout=_EVENT_STORE_CONFIG_TIMEOUT_SECONDS,
+    )
+    output = result.stdout + result.stderr
+
+    assert result.returncode != 0
+    assert private_value not in output
+    assert str(config_path) not in output
+    assert "Traceback" not in output
+
+
+@pytest.mark.parametrize("arguments", _EVENT_STORE_CONFIG_COMMANDS)
+def test_unresolvable_user_database_path_is_redacted(
+    tmp_path: Path,
+    arguments: list[str],
+) -> None:
+    home = tmp_path / "home"
+    config_dir = home / ".ouroboros"
+    config_dir.mkdir(parents=True)
+    private_user = "ouroboros-user-that-must-not-exist-1817"
+    config_path = config_dir / "config.yaml"
+    config_path.write_text(f"persistence:\n  database_path: '~{private_user}/events.db'\n")
+    env = os.environ.copy()
+    env.pop("_OUROBOROS_NESTED", None)
+    env["HOME"] = str(home)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "ouroboros", *arguments],
+        stdin=subprocess.DEVNULL,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+        timeout=_EVENT_STORE_CONFIG_TIMEOUT_SECONDS,
+    )
+    output = result.stdout + result.stderr
+
+    assert result.returncode != 0
+    assert private_user not in output
+    assert str(config_path) not in output
+    assert "Traceback" not in output
+
+
+class TestConfigShowModels:
+    """The models table: one row per role, the one switch, and ignored ids."""
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, config_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The resolver reads config through the loader's own get_config_dir.
+        monkeypatch.setattr("ouroboros.config.models.get_config_dir", lambda: config_dir)
+        monkeypatch.setattr("ouroboros.config.loader.get_config_dir", lambda: config_dir)
+        for name in ("OUROBOROS_MODEL", "OUROBOROS_PIN_MODELS", "OUROBOROS_SEMANTIC_MODEL"):
+            monkeypatch.delenv(name, raising=False)
+        # The table is asserted cell by cell; keep Rich from truncating columns
+        # on a narrow test console.
+        from ouroboros.cli.formatters import console
+
+        monkeypatch.setattr(console, "_width", 200)
+
+    @staticmethod
+    def _invoke(*args: str) -> Result:
+        result = runner.invoke(app, list(args))
+        assert result.exit_code == 0, result.output
+        return result
+
+    @staticmethod
+    def _text(result: Result) -> str:
+        return re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+
+    @staticmethod
+    def _write(config_dir: Path, **sections: dict) -> None:
+        data = yaml.safe_load((config_dir / "config.yaml").read_text())
+        data.update(sections)
+        (config_dir / "config.yaml").write_text(yaml.dump(data))
+
+    def test_show_prints_auto_header_and_role_table(self, config_dir: Path) -> None:
+        result = self._invoke("show")
+        text = self._text(result)
+        assert "models: auto (pin off)" in text
+        for column in ("Role", "Tier", "Backend", "Resolved model", "Source"):
+            assert column in text
+        rows = {
+            line.split("│")[1].strip(): [cell.strip() for cell in line.split("│")[2:6]]
+            for line in text.splitlines()
+            if line.count("│") == 6
+        }
+        assert rows["execute"] == ["standard", "claude", "sonnet", "auto"]
+        assert rows["check_package"] == ["standard", "claude", "sonnet", "auto"]
+        assert rows["interview"] == ["frontier", "claude", "opus", "auto"]
+        assert rows["brownfield_scan"] == ["frugal", "claude", "haiku", "auto"]
+        assert "ignored (pin off):" not in text
+
+    def test_show_names_ignored_persisted_ids_with_the_pin_hint(self, config_dir: Path) -> None:
+        self._write(
+            config_dir,
+            evaluation={"semantic_model": "claude-opus-4-6"},
+            resilience={"reflect_model": "my-research-model"},
+        )
+        result = self._invoke("show")
+        # Rich wraps long lines at the console width; compare with whitespace collapsed.
+        text = " ".join(self._text(result).split())
+        assert "ignored (pin off):" in text
+        assert (
+            "evaluation.semantic_model: claude-opus-4-6, set models.pin: true to use "
+            "(pin runs claude-opus-5-5)"
+        ) in text
+        assert "resilience.reflect_model: my-research-model, set models.pin: true to use" in text
+
+    def test_show_json_reports_models_under_a_stable_key(self, config_dir: Path) -> None:
+        self._write(config_dir, resilience={"reflect_model": "my-research-model"})
+        result = self._invoke("show", "--json")
+        models = json.loads(result.output)["models"]
+        assert models["header"] == "models: auto (pin off)"
+        assert models["default"] == {"value": "auto", "source": "default"}
+        assert models["pin"] is False
+        by_role = {row["role"]: row for row in models["roles"]}
+        assert by_role["check_package"] == {
+            "role": "check_package",
+            "tier": "standard",
+            "backend": "claude",
+            "model": "sonnet",
+            "source": "auto",
+        }
+        assert models["ignored"] == [
+            {
+                "setting": "resilience.reflect_model",
+                "value": "my-research-model",
+                "pinned_model": "my-research-model",
+                "hint": "set models.pin: true to use",
+                "roles": ["wonder", "reflect", "context_compression"],
+            }
+        ]
+
+    def test_show_pinned_runs_persisted_ids_and_lists_nothing_ignored(
+        self, config_dir: Path
+    ) -> None:
+        self._write(
+            config_dir,
+            models={"pin": True},
+            resilience={"reflect_model": "my-research-model"},
+        )
+        result = self._invoke("show", "--json")
+        models = json.loads(result.output)["models"]
+        assert models["header"] == "models: pinned"
+        reflect = next(row for row in models["roles"] if row["role"] == "reflect")
+        assert (reflect["model"], reflect["source"]) == ("my-research-model", "pin")
+        assert models["ignored"] == []
+
+    def test_show_one_switch_applies_to_every_role(self, config_dir: Path) -> None:
+        self._write(config_dir, models={"default": "frontier"})
+        result = self._invoke("show", "--json")
+        models = json.loads(result.output)["models"]
+        assert models["header"] == "models: frontier for every role (config)"
+        assert {(row["model"], row["source"]) for row in models["roles"]} == {
+            ("opus", "configured")
+        }
+
+    def test_show_blank_default_reads_as_auto(self, config_dir: Path) -> None:
+        self._write(config_dir, models={"default": ""})
+        result = self._invoke("show", "--json")
+
+        models = json.loads(result.output)["models"]
+        assert models["header"] == "models: auto (pin off)"
+        assert models["default"]["value"] == "auto"
+
+    def test_auto_is_an_automatic_model_value(self) -> None:
+        from ouroboros.cli.commands.config import _is_automatic_model_value
+
+        assert _is_automatic_model_value("auto")
+        assert _is_automatic_model_value(" Auto ")
+        assert not _is_automatic_model_value("claude-opus-5")
 
 
 # ── config backend ───────────────────────────────────────────────
@@ -110,11 +629,31 @@ class TestConfigShow:
 class TestConfigBackend:
     """Tests for config backend command."""
 
+    def test_help_lists_all_switchable_backends(self) -> None:
+        result = runner.invoke(app, ["backend", "--help"])
+
+        assert result.exit_code == 0
+        for backend in ("antigravity", "grok", "zcode"):
+            assert backend in result.output
+
     def test_show_current_backend(self, config_dir: Path) -> None:
         with patch("ouroboros.config.models.get_config_dir", return_value=config_dir):
             result = runner.invoke(app, ["backend"])
         assert result.exit_code == 0
         assert "claude" in result.output
+
+    def test_show_current_codex_backend_uses_runtime_resolver(self, codex_config_dir: Path) -> None:
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=codex_config_dir),
+            patch(
+                "ouroboros.cli.commands.setup._detect_runtimes",
+                side_effect=AssertionError("config backend must use the runtime resolver"),
+            ),
+        ):
+            result = runner.invoke(app, ["backend"])
+
+        assert result.exit_code == 0
+        assert "/usr/bin/codex" in result.output
 
     def test_switch_to_same_backend(self, config_dir: Path) -> None:
         with patch("ouroboros.config.models.get_config_dir", return_value=config_dir):
@@ -139,6 +678,7 @@ class TestConfigBackend:
         with (
             patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
             patch("shutil.which", return_value=None),
+            patch("ouroboros.cli.commands.setup._detect_runtimes", return_value={"codex": None}),
         ):
             result = runner.invoke(app, ["backend", "codex"])
         assert result.exit_code == 1
@@ -155,6 +695,34 @@ class TestConfigBackend:
         assert result.exit_code == 0
         mock_setup.assert_called_once_with("/usr/bin/codex")
 
+    def test_switch_to_codex_uses_canonical_detection(self, config_dir: Path) -> None:
+        """config backend codex must honor env/config/App detection, not only PATH."""
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch("shutil.which", return_value=None),
+            patch(
+                "ouroboros.cli.commands.setup._detect_runtimes",
+                return_value={"codex": "/opt/codex/bin/codex"},
+            ),
+            patch("ouroboros.cli.commands.setup._setup_codex", return_value=True) as mock_setup,
+        ):
+            result = runner.invoke(app, ["backend", "codex"])
+
+        assert result.exit_code == 0, result.output
+        mock_setup.assert_called_once_with("/opt/codex/bin/codex")
+
+    def test_switch_to_codex_fails_when_setup_returns_false(self, config_dir: Path) -> None:
+        """config backend codex must not report success when setup rolls back."""
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch("shutil.which", return_value="/usr/bin/codex"),
+            patch("ouroboros.cli.commands.setup._setup_codex", return_value=False),
+        ):
+            result = runner.invoke(app, ["backend", "codex"])
+
+        assert result.exit_code == 1
+        assert "Could not switch backend to codex" in result.output
+
     def test_switch_to_claude_delegates_to_setup(self, codex_config_dir: Path) -> None:
         """config backend claude should delegate to _setup_claude."""
         with (
@@ -165,6 +733,19 @@ class TestConfigBackend:
             result = runner.invoke(app, ["backend", "claude"])
         assert result.exit_code == 0
         mock_setup.assert_called_once_with("/usr/bin/claude")
+
+    def test_switch_to_claude_fails_when_setup_returns_false(self, codex_config_dir: Path) -> None:
+        """A failed Claude activation must propagate through the CLI exit status."""
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=codex_config_dir),
+            patch("shutil.which", return_value="/usr/bin/claude"),
+            patch("ouroboros.cli.commands.setup._setup_claude", return_value=False),
+        ):
+            result = runner.invoke(app, ["backend", "claude"])
+
+        assert result.exit_code == 1
+        assert "Could not switch backend to claude" in result.output
+        assert "Switched backend" not in result.output
 
     def test_switch_to_hermes_delegates_to_setup(self, config_dir: Path) -> None:
         """config backend hermes should delegate to _setup_hermes."""
@@ -177,12 +758,187 @@ class TestConfigBackend:
         assert result.exit_code == 0
         mock_setup.assert_called_once_with("/usr/bin/hermes")
 
+    def test_switch_to_gjc_delegates_to_setup(self, config_dir: Path) -> None:
+        """config backend gjc should delegate to _setup_gjc for install side effects."""
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            # Isolate from the developer's real ~/.ouroboros config, which may
+            # carry orchestrator.gjc_cli_path and shadow the shutil.which stub.
+            patch("ouroboros.config.get_gjc_cli_path", return_value=None),
+            patch("shutil.which", return_value="/usr/bin/gjc"),
+            patch("ouroboros.cli.commands.setup._setup_gjc") as mock_setup,
+        ):
+            result = runner.invoke(app, ["backend", "gjc"])
+        assert result.exit_code == 0
+        mock_setup.assert_called_once_with("/usr/bin/gjc")
+
+    def test_switch_to_gjc_fails_when_setup_returns_false(self, config_dir: Path) -> None:
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch("ouroboros.config.get_gjc_cli_path", return_value=None),
+            patch("shutil.which", return_value="/usr/bin/gjc"),
+            patch("ouroboros.cli.commands.setup._setup_gjc", return_value=False),
+        ):
+            result = runner.invoke(app, ["backend", "gjc"])
+
+        assert result.exit_code == 1
+        assert "Could not switch backend to gjc" in result.output
+
+    def test_switch_to_gjc_honors_configured_cli_path(self, config_dir: Path) -> None:
+        """config backend gjc should honor explicit env/config path helpers."""
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch("ouroboros.config.get_gjc_cli_path", return_value="/opt/gjc/bin/gjc"),
+            patch("shutil.which", return_value=None),
+            patch("ouroboros.cli.commands.setup._setup_gjc") as mock_setup,
+        ):
+            result = runner.invoke(app, ["backend", "gjc"])
+
+        assert result.exit_code == 0
+        mock_setup.assert_called_once_with("/opt/gjc/bin/gjc")
+
+    def test_switch_to_goose_honors_configured_cli_path(self, config_dir: Path) -> None:
+        """config backend goose should honor explicit env/config path helpers."""
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch("ouroboros.config.get_goose_cli_path", return_value="/opt/goose/bin/goose"),
+            patch("shutil.which", return_value=None),
+            patch("ouroboros.cli.commands.setup._setup_goose") as mock_setup,
+        ):
+            result = runner.invoke(app, ["backend", "goose"])
+
+        assert result.exit_code == 0
+        mock_setup.assert_called_once_with("/opt/goose/bin/goose")
+
+    def test_switch_to_pi_honors_configured_cli_path(self, config_dir: Path) -> None:
+        """config backend pi should honor explicit env/config path helpers."""
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch("ouroboros.config.get_pi_cli_path", return_value="/opt/pi/bin/pi"),
+            patch("shutil.which", return_value=None),
+            patch("ouroboros.cli.commands.setup._setup_pi") as mock_setup,
+        ):
+            result = runner.invoke(app, ["backend", "pi"])
+
+        assert result.exit_code == 0
+        mock_setup.assert_called_once_with("/opt/pi/bin/pi")
+
+    def test_switch_to_pi_reports_missing_cli_path(self, config_dir: Path) -> None:
+        """config backend pi should surface pi-specific guidance when no CLI is found."""
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch("ouroboros.config.get_pi_cli_path", return_value=None),
+            patch("shutil.which", return_value=None),
+        ):
+            result = runner.invoke(app, ["backend", "pi"])
+
+        assert result.exit_code == 1
+        assert "OUROBOROS_PI_CLI_PATH" in result.output
+
+    def test_switch_to_omp_honors_configured_cli_path(self, config_dir: Path) -> None:
+        """config backend omp should honor explicit env/config path helpers."""
+        from ouroboros.config.models import OrchestratorConfig, OuroborosConfig
+
+        def fake_which(name: str) -> str | None:
+            return "/opt/omp/bin/omp" if name == "/opt/omp/bin/omp" else None
+
+        config = OuroborosConfig(orchestrator=OrchestratorConfig(omp_cli_path="/opt/omp/bin/omp"))
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch.dict(os.environ, {"OUROBOROS_OMP_CLI_PATH": ""}),
+            patch("ouroboros.config._omp_cli.load_config", return_value=config),
+            patch("shutil.which", side_effect=fake_which),
+            patch("ouroboros.cli.commands.setup._setup_omp") as mock_setup,
+        ):
+            result = runner.invoke(app, ["backend", "omp"])
+
+        assert result.exit_code == 0
+        mock_setup.assert_called_once_with("/opt/omp/bin/omp")
+
+    def test_switch_to_omp_reports_missing_cli_path(self, config_dir: Path) -> None:
+        """config backend omp should surface omp-specific guidance when no CLI is found."""
+        from ouroboros.core.errors import ConfigError
+
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch.dict(os.environ, {"OUROBOROS_OMP_CLI_PATH": ""}),
+            patch("ouroboros.config._omp_cli.load_config", side_effect=ConfigError("no config")),
+            patch("shutil.which", return_value=None),
+        ):
+            result = runner.invoke(app, ["backend", "omp"])
+
+        assert result.exit_code == 1
+        assert "OUROBOROS_OMP_CLI_PATH" in result.output
+
+    def test_switch_to_omp_fails_when_setup_fails(self, config_dir: Path) -> None:
+        """config backend omp must fail (exit 1) when omp setup fails closed."""
+        from ouroboros.config.models import OrchestratorConfig, OuroborosConfig
+
+        def fake_which(name: str) -> str | None:
+            return "/opt/omp/bin/omp" if name == "/opt/omp/bin/omp" else None
+
+        config = OuroborosConfig(orchestrator=OrchestratorConfig(omp_cli_path="/opt/omp/bin/omp"))
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch.dict(os.environ, {"OUROBOROS_OMP_CLI_PATH": ""}),
+            patch("ouroboros.config._omp_cli.load_config", return_value=config),
+            patch("shutil.which", side_effect=fake_which),
+            patch("ouroboros.cli.commands.setup._setup_omp", return_value=False),
+        ):
+            result = runner.invoke(app, ["backend", "omp"])
+
+        assert result.exit_code == 1
+        assert "Could not switch backend to omp" in result.output
+
+    def test_switch_to_omp_falls_back_to_path_when_configured_path_is_stale(
+        self, config_dir: Path
+    ) -> None:
+        """PR #2299 round 4: a stale configured omp path must not shadow a valid PATH install."""
+        from ouroboros.config.models import OrchestratorConfig, OuroborosConfig
+
+        def fake_which(name: str) -> str | None:
+            return "/usr/bin/omp" if name == "omp" else None
+
+        config = OuroborosConfig(
+            orchestrator=OrchestratorConfig(omp_cli_path="/missing/configured/omp")
+        )
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch.dict(os.environ, {"OUROBOROS_OMP_CLI_PATH": ""}),
+            patch("ouroboros.config._omp_cli.load_config", return_value=config),
+            patch("shutil.which", side_effect=fake_which),
+            patch("ouroboros.cli.commands.setup._setup_omp") as mock_setup,
+        ):
+            result = runner.invoke(app, ["backend", "omp"])
+
+        assert result.exit_code == 0
+        mock_setup.assert_called_once_with("/usr/bin/omp")
+
+    def test_switch_to_zcode_honors_configured_cli_path(self, config_dir: Path) -> None:
+        """config backend zcode should use the app-bundle/config path and the
+        runtime-only setup helper instead of claiming success without writing."""
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch(
+                "ouroboros.config.get_zcode_cli_path",
+                return_value="/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
+            ),
+            patch("shutil.which", return_value=None),
+            patch("ouroboros.cli.commands.setup._setup_zcode") as mock_setup,
+        ):
+            result = runner.invoke(app, ["backend", "zcode"])
+
+        assert result.exit_code == 0, result.output
+        mock_setup.assert_called_once_with(
+            "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs"
+        )
+
     def test_switch_warns_on_setup_print_error(self, config_dir: Path) -> None:
         """config backend should warn when setup emits print_error (non-exception failure)."""
         from ouroboros.cli.commands import setup as setup_mod
 
         def _failing_setup(cli_path: str) -> None:
-            setup_mod.print_error("Could not locate packaged Codex rules.")
+            setup_mod.__dict__["print_error"]("Could not locate packaged Codex rules.")
 
         with (
             patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
@@ -200,7 +956,7 @@ class TestConfigBackend:
         with patch("ouroboros.config.models.get_config_dir", return_value=tmp_path):
             result = runner.invoke(app, ["show"])
         assert result.exit_code == 1
-        assert "Cannot parse" in result.output
+        assert "Invalid YAML" in result.output
 
     def test_structurally_invalid_section_type(self, tmp_path: Path) -> None:
         """config commands should handle sections with wrong types (e.g. orchestrator: [])."""
@@ -233,6 +989,7 @@ class TestConfigValidate:
         with (
             patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
             patch("pathlib.Path.exists", return_value=True),
+            patch("pathlib.Path.is_file", return_value=True),
             patch("ouroboros.config.loader.load_config"),
         ):
             result = runner.invoke(app, ["validate"])
@@ -284,6 +1041,39 @@ class TestConfigValidate:
             result = runner.invoke(app, ["validate"])
         assert result.exit_code == 0
 
+    def test_gjc_runtime_and_llm_backend_are_valid(self, tmp_path: Path) -> None:
+        """validate should accept the config written by `config backend gjc`."""
+        config = {
+            "orchestrator": {"runtime_backend": "gjc", "gjc_cli_path": "/usr/bin/gjc"},
+            "llm": {"backend": "gjc"},
+        }
+        (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=tmp_path),
+            patch("pathlib.Path.exists", return_value=True),
+            patch("pathlib.Path.is_file", return_value=True),
+            patch("ouroboros.config.loader.load_config"),
+        ):
+            result = runner.invoke(app, ["validate"])
+        assert result.exit_code == 0
+
+    @pytest.mark.parametrize(
+        "alias",
+        ["claude_code", "codex_cli", "opencode_cli", "gemini_cli", "hermes_cli"],
+    )
+    def test_runtime_backend_alias_is_valid(self, tmp_path: Path, alias: str) -> None:
+        """validate should accept runtime_backend aliases that the schema permits."""
+        config = {"orchestrator": {"runtime_backend": alias}, "llm": {"backend": "claude"}}
+        (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=tmp_path),
+            patch("ouroboros.config.loader.load_config"),
+        ):
+            result = runner.invoke(app, ["validate"])
+        assert result.exit_code == 0
+
     def test_missing_cli_path_exits_nonzero(self, tmp_path: Path) -> None:
         """validate should exit 1 when CLI path doesn't exist."""
         config = {
@@ -319,6 +1109,90 @@ class TestConfigSet:
         data = yaml.safe_load((config_dir / "config.yaml").read_text())
         assert data["logging"]["level"] == "debug"
 
+    def test_set_models_keys_absent_from_file_use_the_schema_type(self, config_dir: Path) -> None:
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch("ouroboros.config.loader.get_config_dir", return_value=config_dir),
+        ):
+            pin = runner.invoke(app, ["set", "models.pin", "true"])
+            default = runner.invoke(app, ["set", "models.default", "frontier"])
+
+        assert pin.exit_code == 0
+        assert default.exit_code == 0
+        data = yaml.safe_load((config_dir / "config.yaml").read_text())
+        assert data["models"] == {"pin": True, "default": "frontier"}
+
+    @pytest.mark.parametrize("stored_value", [None, True, False])
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("True", True),
+            ("1", True),
+            ("YES", True),
+            ("on", True),
+            ("t", True),
+            ("Y", True),
+            ("FaLsE", False),
+            ("0", False),
+            ("no", False),
+            ("OFF", False),
+            ("F", False),
+            ("n", False),
+        ],
+    )
+    def test_set_boolean_spellings(
+        self, config_dir: Path, stored_value: bool | None, value: str, expected: bool
+    ) -> None:
+        config_path = config_dir / "config.yaml"
+        data = yaml.safe_load(config_path.read_text())
+        if stored_value is not None:
+            data["models"] = {"pin": stored_value}
+        config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch("ouroboros.config.loader.get_config_dir", return_value=config_dir),
+        ):
+            result = runner.invoke(app, ["set", "models.pin", value])
+
+        assert result.exit_code == 0, result.output
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert saved["models"]["pin"] is expected
+        data["models"] = {"pin": expected}
+        assert saved == data
+
+    @pytest.mark.parametrize("stored_value", [None, True, False])
+    @pytest.mark.parametrize("backup_exists", [False, True])
+    @pytest.mark.parametrize("value", ["tru", "flase", "2", "", " true ", "maybe"])
+    def test_set_invalid_boolean_preserves_config_and_backup_bytes(
+        self,
+        cp949_config_dir: Path,
+        stored_value: bool | None,
+        backup_exists: bool,
+        value: str,
+    ) -> None:
+        config_path = cp949_config_dir / "config.yaml"
+        backup_path = cp949_config_dir / "config.yaml.bak"
+        original = "\ufeff# 한글 설정 🚀\r\nlogging:\r\n  level: info  # keep comment\r\n"
+        if stored_value is not None:
+            original += f"models:\r\n  pin: {str(stored_value).lower()}\r\n"
+        original_bytes = original.encode("utf-8")
+        config_path.write_bytes(original_bytes)
+        backup_bytes = "\ufeff# 이전 설정 🚀\r\nmodels:\r\n  pin: false\r\n".encode("utf-8")
+        if backup_exists:
+            backup_path.write_bytes(backup_bytes)
+
+        result = runner.invoke(app, ["set", "models.pin", value])
+
+        assert result.exit_code == 1, result.output
+        assert "Invalid boolean value" in result.output
+        assert "models.pin" in result.output
+        assert config_path.read_bytes() == original_bytes
+        if backup_exists:
+            assert backup_path.read_bytes() == backup_bytes
+        else:
+            assert not backup_path.exists()
+
     def test_set_unknown_top_level_key_rejected(self, config_dir: Path) -> None:
         """config set should reject unknown top-level keys."""
         with patch("ouroboros.config.models.get_config_dir", return_value=config_dir):
@@ -332,6 +1206,170 @@ class TestConfigSet:
             result = runner.invoke(app, ["set", "logging.levle", "debug"])
         assert result.exit_code == 1
         assert "Unknown config key" in result.output
+
+    def test_set_rejects_empty_database_path_without_writing(self, config_dir: Path) -> None:
+        config_path = config_dir / "config.yaml"
+        original = config_path.read_text()
+
+        with patch("ouroboros.config.models.get_config_dir", return_value=config_dir):
+            result = runner.invoke(app, ["set", "persistence.database_path", ""])
+
+        assert result.exit_code == 1
+        assert "Invalid value" in result.output
+        assert config_path.read_text() == original
+
+    def test_set_repairs_existing_invalid_database_path(self, config_dir: Path) -> None:
+        config_path = config_dir / "config.yaml"
+        data = yaml.safe_load(config_path.read_text())
+        data["persistence"]["database_path"] = ""
+        config_path.write_text(yaml.dump(data))
+
+        with (
+            patch("ouroboros.config.models.get_config_dir", return_value=config_dir),
+            patch("ouroboros.config.loader.load_config"),
+        ):
+            result = runner.invoke(
+                app,
+                ["set", "persistence.database_path", "data/repaired.db"],
+            )
+
+        assert result.exit_code == 0
+        repaired = yaml.safe_load(config_path.read_text())
+        assert repaired["persistence"]["database_path"] == "data/repaired.db"
+
+    def test_set_rejects_existing_directory_database_path(self, config_dir: Path) -> None:
+        config_path = config_dir / "config.yaml"
+        original = config_path.read_text()
+        directory = config_dir / "event-store-directory"
+        directory.mkdir()
+
+        with patch("ouroboros.config.models.get_config_dir", return_value=config_dir):
+            result = runner.invoke(
+                app,
+                ["set", "persistence.database_path", str(directory)],
+            )
+
+        assert result.exit_code == 1
+        assert "Invalid value" in result.output
+        assert config_path.read_text() == original
+
+
+class TestConfigEncoding:
+    """Config edits preserve Unicode values and failed edits preserve bytes."""
+
+    def test_set_preserves_unrelated_utf8_value(self, cp949_config_dir: Path) -> None:
+        from ouroboros.config.loader import load_config
+
+        config_path = cp949_config_dir / "config.yaml"
+        cli_path = "C:/도구/한글🚀/claude"
+        config_path.write_bytes(
+            (
+                "\ufefforchestrator:\r\n"
+                "  runtime_backend: claude\r\n"
+                f"  cli_path: '{cli_path}'\r\n"
+                "logging:\r\n"
+                "  level: info\r\n"
+            ).encode()
+        )
+
+        result = runner.invoke(app, ["set", "logging.level", "debug"])
+
+        assert result.exit_code == 0, result.output
+        saved = yaml.safe_load(config_path.read_bytes().decode("utf-8"))
+        assert saved["logging"]["level"] == "debug"
+        assert saved["orchestrator"]["cli_path"] == cli_path
+        assert load_config().orchestrator.cli_path == str(Path(cli_path))
+
+    def test_invalid_value_restores_original_utf8_bytes(self, cp949_config_dir: Path) -> None:
+        config_path = cp949_config_dir / "config.yaml"
+        original = (
+            "\ufeff# 한글 설정 🚀\r\n"
+            "orchestrator:\r\n"
+            "  runtime_backend: claude\r\n"
+            "  cli_path: 'C:/도구/claude'\r\n"
+            "logging:\r\n"
+            "  level: info  # retain this comment on rollback\r\n"
+        ).encode("utf-8")
+        config_path.write_bytes(original)
+
+        result = runner.invoke(app, ["set", "logging.level", "not-a-level"])
+
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert "Invalid value" in result.output
+        assert config_path.read_bytes() == original
+
+    def test_invalid_utf8_is_rejected_without_writing(self, cp949_config_dir: Path) -> None:
+        config_path = cp949_config_dir / "config.yaml"
+        original = b"logging:\n  level: info\n# invalid UTF-8: \xff\n"
+        config_path.write_bytes(original)
+
+        result = runner.invoke(app, ["set", "logging.level", "debug"])
+
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert "Invalid" in result.output
+        assert config_path.read_bytes() == original
+
+    def test_undo_redo_preserves_utf8_bom_and_newline_bytes(self, cp949_config_dir: Path) -> None:
+        config_path = cp949_config_dir / "config.yaml"
+        backup_path = cp949_config_dir / "config.yaml.bak"
+        current = (
+            "\ufeff# 현재 설정 🚀\r\n"
+            "orchestrator:\r\n"
+            "  runtime_backend: claude\r\n"
+            "  cli_path: 'C:/도구/현재🚀/claude'\r\n"
+        ).encode("utf-8")
+        previous = (
+            "# 이전 설정 🌱\n"
+            "orchestrator:\n"
+            "  runtime_backend: claude\n"
+            "  cli_path: 'C:/도구/이전🌱/claude'\n"
+        ).encode()
+        config_path.write_bytes(current)
+        backup_path.write_bytes(previous)
+
+        result = runner.invoke(app, ["undo"])
+
+        assert result.exit_code == 0, result.output
+        assert config_path.read_bytes() == previous
+        assert backup_path.read_bytes() == current
+
+        result = runner.invoke(app, ["undo"])
+
+        assert result.exit_code == 0, result.output
+        assert config_path.read_bytes() == current
+        assert backup_path.read_bytes() == previous
+
+    @pytest.mark.parametrize(
+        "invalid_backup",
+        [
+            b"orchestrator:\n  runtime_backend: not-a-backend\n",
+            b"logging:\n  level: info\n# invalid UTF-8: \xff\n",
+        ],
+        ids=["invalid-schema", "invalid-utf8"],
+    )
+    def test_undo_invalid_backup_preserves_both_files_bytes(
+        self, cp949_config_dir: Path, invalid_backup: bytes
+    ) -> None:
+        config_path = cp949_config_dir / "config.yaml"
+        backup_path = cp949_config_dir / "config.yaml.bak"
+        current = (
+            "\ufeff# 원본 설정 🚀\r\n"
+            "orchestrator:\r\n"
+            "  runtime_backend: claude\r\n"
+            "  cli_path: 'C:/도구/원본🚀/claude'\r\n"
+        ).encode("utf-8")
+        config_path.write_bytes(current)
+        backup_path.write_bytes(invalid_backup)
+
+        result = runner.invoke(app, ["undo"])
+
+        assert result.exit_code == 1
+        assert isinstance(result.exception, SystemExit)
+        assert "undo aborted" in result.output
+        assert config_path.read_bytes() == current
+        assert backup_path.read_bytes() == invalid_backup
 
 
 # ── config init ──────────────────────────────────────────────────
@@ -377,6 +1415,8 @@ class TestConfigInit:
         assert (tmp_path / "config.yaml").exists()
         data = yaml.safe_load((tmp_path / "config.yaml").read_text())
         assert "orchestrator" in data
+        assert data["models"] == {"default": "auto", "pin": False}
+        assert "semantic_model" not in data["evaluation"]
         # credentials.yaml should be untouched (still has our original content)
         cred_data = yaml.safe_load((tmp_path / "credentials.yaml").read_text())
         assert cred_data == {"providers": {}}

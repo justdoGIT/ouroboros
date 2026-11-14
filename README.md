@@ -1,12 +1,13 @@
+<!-- mcp-name: io.github.Q00/ouroboros -->
 <p align="right">
-  <strong>English</strong> | <a href="./README.ko.md">한국어</a>
+  <strong>English</strong> | <a href="./README.ko.md">한국어</a> | <a href="./README.zh-CN.md">简体中文</a>
 </p>
 
 <p align="center">
   <br/>
   ◯ ─────────── ◯
   <br/><br/>
-  <img src="./docs/images/ouroboros.png" width="520" alt="Ouroboros">
+  <img src="./docs/images/ouroboros.png" width="420" alt="Ouroboros">
   <br/><br/>
   <strong>O U R O B O R O S</strong>
   <br/><br/>
@@ -16,405 +17,183 @@
 
 
 <p align="center">
-  <strong>Stop prompting. Start specifying.</strong>
+  <strong>It gets smarter on its own. We just hold the line.</strong>
   <br/>
-  <sub>Agent OS for replayable, specification-first AI coding workflows</sub>
+  <sub>Ask first, build second, check always: spec-first AI coding for the agents you already use.</sub>
 </p>
 
 <p align="center">
+  <a href="https://github.com/Q00/ouroboros"><img src="https://img.shields.io/github/stars/Q00/ouroboros?color=yellow&logo=github&label=stars" alt="GitHub stars"></a>
   <a href="https://pypi.org/project/ouroboros-ai/"><img src="https://img.shields.io/pypi/v/ouroboros-ai?color=blue" alt="PyPI"></a>
   <a href="https://github.com/Q00/ouroboros/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/Q00/ouroboros/test.yml?branch=main" alt="Tests"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
+  <a href="https://github.com/sponsors/Q00"><img src="https://img.shields.io/github/sponsors/Q00?logo=githubsponsors&color=EA4AAA&label=sponsors" alt="GitHub Sponsors"></a>
 </p>
 
 <p align="center">
-  <a href="#quick-start">Quick Start</a> ·
-  <a href="#why-ouroboros">Why</a> ·
-  <a href="#what-you-get">Results</a> ·
-  <a href="#the-loop">How It Works</a> ·
-  <a href="#commands">Commands</a> ·
-  <a href="#from-wonder-to-ontology">Philosophy</a>
+  <a href="https://trendshift.io/repositories/26008?utm_source=repository-badge&utm_medium=badge&utm_campaign=badge-repository-26008" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/26008" alt="Q00%2Fouroboros | Trendshift" width="250" height="55"/></a>
 </p>
 
-**Turn a vague idea into a verified, working codebase -- across Claude Code, Codex CLI, OpenCode, and Hermes.**
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#first-steps">First steps</a> ·
+  <a href="#works-with">Works with</a> ·
+  <a href="#learn-more">Learn more</a> ·
+  <a href="https://ouroboros.page/learn/en/">Guide</a>
+</p>
 
-Ouroboros is an Agent OS for AI coding: a local-first runtime layer that turns
-non-deterministic agent work into a replayable, observable, policy-bound
-execution contract. It replaces ad-hoc prompting with a structured
-specification-first workflow: interview, crystallize, execute, evaluate,
-evolve.
+Ouroboros helps your AI coding agent build the right thing. It asks you
+questions until the goal is clear, writes the answer down as a spec with
+checkable acceptance criteria, hands that spec to the coding agent you already
+use, and then checks the result against the spec.
 
----
+<p align="center">
+  <img src="./docs/images/console-tour-en.gif" width="900" alt="Screen recording of the Ouroboros console in a browser. On the Chat page in Auto mode, the request Please make a todo cli tool starts an ouroboros auto run whose output streams into the chat; the tour then visits the Runs, Connect, Agents and models, Providers, Shared MCP and Health pages.">
+</p>
 
-## Why Ouroboros?
+<p align="center">
+  <sub>The Ouroboros console: type what you want in Chat, and it runs the interview, the spec, the build and the checks for you.</sub>
+</p>
 
-Most AI coding fails at the **input**, not the output. The bottleneck is not AI capability -- it is human clarity.
-
-| Problem       | What Happens                     | Ouroboros Fix                                 |
-| :------------ | :------------------------------- | :-------------------------------------------- |
-| Vague prompts | AI guesses, you rework           | Socratic interview exposes hidden assumptions |
-| No spec       | Architecture drifts mid-build    | Immutable seed spec locks intent before code  |
-| Manual QA     | "Looks good" is not verification | 3-stage automated evaluation gate             |
-
----
-
-## Quick Start
-
-**Install** — one command, everything auto-detected:
+## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Q00/ouroboros/main/scripts/install.sh | bash
+# macOS / Linux / WSL 2
+curl -fsSL https://raw.githubusercontent.com/Q00/ouroboros/main/scripts/install.sh | OUROBOROS_INSTALL_REF=readme bash
 ```
 
-**Build** — open your AI coding agent and go:
-
+```powershell
+# Windows (PowerShell) — no Python needed; installs Git and uv for you
+irm https://raw.githubusercontent.com/Q00/ouroboros/main/scripts/install.ps1 | iex
 ```
-> ooo interview "I want to build a task management CLI"
-```
 
-> Works with Claude Code, Codex CLI, OpenCode, and Hermes. The installer detects Claude Code, Codex CLI, and Hermes CLI automatically and registers the MCP server. For OpenCode, run `ouroboros setup --runtime opencode` after installation.
+When installation finishes, the Ouroboros console opens in your browser and
+walks you through connecting your agent tools. Reopen it any time with
+`ouroboros gui`.
 
-<details>
-<summary><strong>Other install methods</strong></summary>
+The installer finds the agent tools you already have and connects Ouroboros to
+them. Native Windows is experimental, and Codex CLI needs WSL 2; see
+[platform support](./docs/platform-support.md).
 
-**Claude Code plugin only** (no system package):
+**Other ways to install.** These don't open the console for you; run
+`ouroboros gui` once the `ouroboros` command is installed.
+
 ```bash
+# Claude Code plugin only (then run /ouroboros:setup inside Claude Code)
 claude plugin marketplace add Q00/ouroboros && claude plugin install ouroboros@ouroboros
-```
-Then run `ooo setup` inside a Claude Code session.
 
-**pip / uv / pipx**:
-```bash
-pip install ouroboros-ai                # base
-pip install ouroboros-ai[claude]        # + Claude Code deps
-pip install ouroboros-ai[litellm]       # + LiteLLM multi-provider
-pip install ouroboros-ai[mcp]           # + MCP server/client support
-pip install ouroboros-ai[tui]           # + Textual terminal UI
-pip install ouroboros-ai[all]           # everything (claude + litellm + mcp + tui + dashboard)
-ouroboros setup                         # configure runtime
+# pip / uv / pipx (Python 3.12+)
+pip install 'ouroboros-ai[mcp,tui]' && ouroboros setup --runtime claude-cli
+
+# Homebrew (macOS / Linux)
+brew tap q00/tap && brew install ouroboros-ai && ouroboros setup
 ```
 
-Legacy compatibility: `ouroboros-ai[dashboard]` is still accepted as a compatibility alias while extras migrate.
-
-See runtime guides: [Claude Code](./docs/runtime-guides/claude-code.md) · [Codex CLI](./docs/runtime-guides/codex.md) · [Hermes](./docs/runtime-guides/hermes.md) · [OpenCode](./docs/runtime-guides/opencode.md)
-
-</details>
-
-<details>
-<summary><strong>Uninstall</strong></summary>
-
-```bash
-ouroboros uninstall
-```
-
-Removes all configuration, MCP registration, and data. See [UNINSTALL.md](./UNINSTALL.md) for details.
-
-</details>
-
-> **Python >= 3.12 required.** See [pyproject.toml](./pyproject.toml) for the full dependency list.
-
----
-
-## What You Get
-
-After one loop of the Ouroboros cycle, a vague idea becomes a verified codebase:
-
-| Step          | Before                  | After                                                                   |
-| :------------ | :---------------------- | :---------------------------------------------------------------------- |
-| **Interview** | *"Build me a task CLI"* | 12 hidden assumptions exposed, ambiguity scored to 0.19                 |
-| **Seed**      | No spec                 | Immutable specification with acceptance criteria, ontology, constraints |
-| **Evaluate**  | Manual review           | 3-stage gate: Mechanical (free) -> Semantic -> Multi-Model Consensus    |
-
-<details>
-<summary><strong>What just happened?</strong></summary>
-
-```
-interview  ->  Socratic questioning exposed 12 hidden assumptions
-seed       ->  Crystallized answers into an immutable spec (Ambiguity: 0.15)
-run        ->  Executed via Double Diamond decomposition
-evaluate   ->  3-stage verification: Mechanical -> Semantic -> Consensus
-```
-
-> Use `ooo <cmd>` inside your AI coding agent session, or `ouroboros init start`, `ouroboros run seed.yaml`, etc. from the terminal.
-
-The serpent completed one loop. Each loop, it knows more than the last.
-
-</details>
-
----
-
-## How It Compares
-
-AI coding tools are powerful -- but they solve the **wrong problem** when the input is unclear.
-
-|                     | Vanilla AI Coding                        | Ouroboros                                                                       |
-| :------------------ | :--------------------------------------- | :------------------------------------------------------------------------------ |
-| **Vague prompt**    | AI guesses intent, builds on assumptions | Socratic interview forces clarity *before* code                                 |
-| **Spec validation** | No spec -- architecture drifts mid-build | Immutable seed spec locks intent; Ambiguity gate (<= 0.2) blocks premature code |
-| **Evaluation**      | "Looks good" / manual QA                 | 3-stage automated gate: Mechanical -> Semantic -> Multi-Model Consensus         |
-| **Rework rate**     | High -- wrong assumptions surface late   | Low -- assumptions surface in the interview, not in the PR review               |
-
----
-
-## The Loop
-
-The ouroboros -- a serpent devouring its own tail -- is not decoration. It IS the architecture:
-
-```
-    Interview -> Seed -> Execute -> Evaluate
-        ^                           |
-        +---- Evolutionary Loop ----+
-```
-
-Each cycle does not repeat -- it **evolves**. The output of evaluation feeds back as input for the next generation, until the system truly knows what it is building.
-
-| Phase         | What Happens                                                          |
-| :------------ | :-------------------------------------------------------------------- |
-| **Interview** | Socratic questioning exposes hidden assumptions                       |
-| **Seed**      | Answers crystallize into an immutable specification                   |
-| **Execute**   | Double Diamond: Discover -> Define -> Design -> Deliver               |
-| **Evaluate**  | 3-stage gate: Mechanical ($0) -> Semantic -> Multi-Model Consensus    |
-| **Evolve**    | Wonder *("What do we still not know?")* -> Reflect -> next generation |
-
-> *"This is where the Ouroboros eats its tail: the output of evaluation*
-> *becomes the input for the next generation's seed specification."*
-> -- `reflect.py`
-
-Convergence is reached when ontology similarity >= 0.95 -- when the system has questioned itself into clarity.
-
-### Ralph: The Loop That Never Stops
-
-`ooo ralph` runs the evolutionary loop persistently -- across session boundaries -- until convergence is reached. Each step is **stateless**: the EventStore reconstructs the full lineage, so even if your machine restarts, the serpent picks up where it left off.
-
-```
-Ralph Cycle 1: evolve_step(lineage, seed) -> Gen 1 -> action=CONTINUE
-Ralph Cycle 2: evolve_step(lineage)       -> Gen 2 -> action=CONTINUE
-Ralph Cycle 3: evolve_step(lineage)       -> Gen 3 -> action=CONVERGED
-                                                +-- Ralph stops.
-                                                    The ontology has stabilized.
-```
-
----
-
-## Commands
-
-Inside AI coding agent sessions, use `ooo <cmd>` skills. From the terminal, use the `ouroboros` CLI.
-
-| Skill (`ooo`)    | CLI equivalent                                                    | What It Does                                                 |
-| :--------------- | :---------------------------------------------------------------- | :----------------------------------------------------------- |
-| `ooo setup`      | `ouroboros setup`                                                 | Register runtime and configure project (one-time)            |
-| `ooo interview`  | `ouroboros init start`                                            | Socratic questioning -- expose hidden assumptions            |
-| `ooo seed`       | *(generated by interview)*                                        | Crystallize into immutable spec                              |
-| `ooo run`        | `ouroboros run seed.yaml`                                         | Execute via Double Diamond decomposition                     |
-| `ooo evaluate`   | *(via MCP)*                                                       | 3-stage verification gate                                    |
-| `ooo evolve`     | *(via MCP)*                                                       | Evolutionary loop until ontology converges                   |
-| `ooo unstuck`    | *(via MCP)*                                                       | 5 lateral thinking personas when you are stuck               |
-| `ooo status`     | `ouroboros status executions` / `ouroboros status execution <id>` | Session tracking + (MCP-only) drift detection                |
-| `ooo resume-session` | `ouroboros resume`                                           | List in-flight sessions and re-attach commands              |
-| `ooo cancel`     | `ouroboros cancel execution [<id>\|--all]`                        | Cancel stuck or orphaned executions                          |
-| `ooo ralph`      | *(via MCP)*                                                       | Persistent loop until verified                               |
-| `ooo tutorial`   | *(interactive)*                                                   | Interactive hands-on learning                                |
-| `ooo help`       | `ouroboros --help`                                                | Full reference                                               |
-| `ooo pm`         | *(via MCP)*                                                       | PM-focused interview + PRD generation                        |
-| `ooo qa`         | *(via skill)*                                                     | General-purpose QA verdict for any artifact                  |
-| `ooo update`     | `ouroboros update`                                                | Check for updates + upgrade to latest                        |
-| `ooo brownfield` | *(via skill)*                                                     | Scan and manage brownfield repo/worktree defaults            |
-| `ooo publish`    | *(skill/runtime surface; uses `gh` CLI)*                          | Publish a Seed as GitHub Epic/Task issues for team workflows |
-
-> Not all skills have direct CLI equivalents. Some (`evaluate`, `evolve`, `unstuck`, `ralph`, `publish`) are available through agent skills, runtime rules, or MCP tools rather than a direct `ouroboros <subcommand>` shell command.
-> `/resume` is reserved for Claude Code's built-in session picker; use `ooo resume-session` for Ouroboros in-flight sessions.
-
-See the [CLI reference](./docs/cli-reference.md) for full details.
-
----
-
-## The Nine Minds
-
-Nine agents, each a different mode of thinking. Loaded on-demand, never preloaded:
-
-| Agent                    | Role                               | Core Question                                       |
-| :----------------------- | :--------------------------------- | :-------------------------------------------------- |
-| **Socratic Interviewer** | Questions-only. Never builds.      | *"What are you assuming?"*                          |
-| **Ontologist**           | Finds essence, not symptoms        | *"What IS this, really?"*                           |
-| **Seed Architect**       | Crystallizes specs from dialogue   | *"Is this complete and unambiguous?"*               |
-| **Evaluator**            | 3-stage verification               | *"Did we build the right thing?"*                   |
-| **Contrarian**           | Challenges every assumption        | *"What if the opposite were true?"*                 |
-| **Hacker**               | Finds unconventional paths         | *"What constraints are actually real?"*             |
-| **Simplifier**           | Removes complexity                 | *"What's the simplest thing that could work?"*      |
-| **Researcher**           | Stops coding, starts investigating | *"What evidence do we actually have?"*              |
-| **Architect**            | Identifies structural causes       | *"If we started over, would we build it this way?"* |
-
----
-
-## Under the Hood
-
-<details>
-<summary><strong>Architecture overview -- Python >= 3.12</strong></summary>
-
-```
-src/ouroboros/
-+-- bigbang/        Interview, ambiguity scoring, brownfield explorer
-+-- routing/        PAL Router -- 3-tier cost optimization (1x / 10x / 30x)
-+-- execution/      Double Diamond, hierarchical AC decomposition
-+-- evaluation/     Mechanical -> Semantic -> Multi-Model Consensus
-+-- evolution/      Wonder / Reflect cycle, convergence detection
-+-- resilience/     4-pattern stagnation detection, 5 lateral personas
-+-- observability/  3-component drift measurement, auto-retrospective
-+-- persistence/    Event sourcing (SQLAlchemy + aiosqlite), checkpoints
-+-- orchestrator/   Runtime abstraction layer (Claude Code, Codex CLI, OpenCode, Hermes)
-+-- core/           Types, errors, seed, ontology, security
-+-- providers/      LiteLLM adapter (100+ models)
-+-- mcp/            MCP client/server integration
-+-- plugin/         Plugin system (skill/agent auto-discovery)
-+-- tui/            Terminal UI dashboard
-+-- cli/            Typer-based CLI
-```
-
-**Key internals:**
-- **PAL Router** -- Frugal (1x) -> Standard (10x) -> Frontier (30x) with auto-escalation on failure, auto-downgrade on success
-- **Drift** -- Goal (50%) + Constraint (30%) + Ontology (20%) weighted measurement, threshold <= 0.3
-- **Brownfield** -- Auto-detects config files across multiple language ecosystems
-- **Evolution** -- Up to 30 generations, convergence at ontology similarity >= 0.95
-- **Stagnation** -- Detects spinning, oscillation, no-drift, and diminishing returns patterns
-- **Agent OS runtime** -- Replayable execution contract across capability discovery, policy, directives, event journal, and agent processes
-- **Runtime backends** -- Pluggable abstraction layer (`orchestrator.runtime_backend` config) with first-class support for Claude Code, Codex CLI, OpenCode, and Hermes; same workflow spec, different execution engines
-
-See [Architecture](./docs/architecture.md) for the full design document.
-
-</details>
-
----
-
-## From Wonder to Ontology
-
-<details>
-<summary><strong>The philosophical engine behind Ouroboros</strong></summary>
-
-> *Wonder -> "How should I live?" -> "What IS 'live'?" -> Ontology*
-> -- Socrates
-
-Every great question leads to a deeper question -- and that deeper question is always **ontological**: not *"how do I do this?"* but *"what IS this, really?"*
-
-```
-   Wonder                          Ontology
-"What do I want?"    ->    "What IS the thing I want?"
-"Build a task CLI"   ->    "What IS a task? What IS priority?"
-"Fix the auth bug"   ->    "Is this the root cause, or a symptom?"
-```
-
-This is not abstraction for its own sake. When you answer *"What IS a task?"* -- deletable or archivable? solo or team? -- you eliminate an entire class of rework. **The ontological question is the most practical question.**
-
-Ouroboros embeds this into its architecture through the **Double Diamond**:
-
-```
-    * Wonder          * Design
-   /  (diverge)      /  (diverge)
-  /    explore      /    create
- /                 /
-* ------------ * ------------ *
- \                 \
-  \    define       \    deliver
-   \  (converge)     \  (converge)
-    * Ontology        * Evaluation
-```
-
-The first diamond is **Socratic**: diverge into questions, converge into ontological clarity. The second diamond is **pragmatic**: diverge into design options, converge into verified delivery. Each diamond requires the one before it -- you cannot design what you have not understood.
-
-</details>
-
-<details>
-<summary><strong>Ambiguity Score: The Gate Between Wonder and Code</strong></summary>
-
-The Interview does not end when you feel ready -- it ends when the **math** says you are ready. Ouroboros quantifies ambiguity as the inverse of weighted clarity:
-
-```
-Ambiguity = 1 - Sum(clarity_i * weight_i)
-```
-
-Each dimension is scored 0.0-1.0 by the LLM (temperature 0.1 for reproducibility), then weighted:
-
-| Dimension                                                     | Greenfield | Brownfield |
-| :------------------------------------------------------------ | :--------: | :--------: |
-| **Goal Clarity** -- *Is the goal specific?*                   |    40%     |    35%     |
-| **Constraint Clarity** -- *Are limitations defined?*          |    30%     |    25%     |
-| **Success Criteria** -- *Are outcomes measurable?*            |    30%     |    25%     |
-| **Context Clarity** -- *Is the existing codebase understood?* |     --     |    15%     |
-
-**Threshold: Ambiguity <= 0.2** -- only then can a Seed be generated.
-
-```
-Example (Greenfield):
-
-  Goal: 0.9 * 0.4  = 0.36
-  Constraint: 0.8 * 0.3  = 0.24
-  Success: 0.7 * 0.3  = 0.21
-                        ------
-  Clarity             = 0.81
-  Ambiguity = 1 - 0.81 = 0.19  <= 0.2 -> Ready for Seed
-```
-
-Why 0.2? Because at 80% weighted clarity, the remaining unknowns are small enough that code-level decisions can resolve them. Above that threshold, you are still guessing at architecture.
-
-</details>
-
-<details>
-<summary><strong>Ontology Convergence: When the Serpent Stops</strong></summary>
-
-The evolutionary loop does not run forever. It stops when consecutive generations produce ontologically identical schemas. Similarity is measured as a weighted comparison of schema fields:
-
-```
-Similarity = 0.5 * name_overlap + 0.3 * type_match + 0.2 * exact_match
-```
-
-| Component        | Weight | What It Measures                                   |
-| :--------------- | :----: | :------------------------------------------------- |
-| **Name overlap** |  50%   | Do the same field names exist in both generations? |
-| **Type match**   |  30%   | Do shared fields have the same types?              |
-| **Exact match**  |  20%   | Are name, type, AND description all identical?     |
-
-**Threshold: Similarity >= 0.95** -- the loop converges and stops evolving.
-
-But raw similarity is not the only signal. The system also detects pathological patterns:
-
-| Signal                  | Condition                                        | What It Means                      |
-| :---------------------- | :----------------------------------------------- | :--------------------------------- |
-| **Stagnation**          | Similarity >= 0.95 for 3 consecutive generations | Ontology has stabilized            |
-| **Oscillation**         | Gen N ~ Gen N-2 (period-2 cycle)                 | Stuck bouncing between two designs |
-| **Repetitive feedback** | >= 70% question overlap across 3 generations     | Wonder is asking the same things   |
-| **Hard cap**            | 30 generations reached                           | Safety valve                       |
-
-```
-Gen 1: {Task, Priority, Status}
-Gen 2: {Task, Priority, Status, DueDate}     -> similarity 0.78 -> CONTINUE
-Gen 3: {Task, Priority, Status, DueDate}     -> similarity 1.00 -> CONVERGED
-```
-
-Two mathematical gates, one philosophy: **do not build until you are clear (Ambiguity <= 0.2), do not stop evolving until you are stable (Similarity >= 0.95).**
-
-</details>
-
----
+Every install path, profile and host is in
+[Getting Started](./docs/getting-started.md). `ouroboros uninstall` removes
+Ouroboros's configuration, MCP registrations and data directory
+(`~/.ouroboros/`). It leaves the Python package and the Claude Code plugin
+installed; finish with the steps in [UNINSTALL.md](./UNINSTALL.md).
+
+## First steps
+
+Describe what you want in plain words. Four good places to start:
+
+- **Console Chat**: type a goal and pick **Interview** (it asks until the goal is clear) or **Auto** (it fills the gaps itself), then hand the spec to your agents and watch the run.
+- **`ooo interview "a todo CLI with due dates"`** in your agent: questions until the goal is clear, then a spec (a *Seed*).
+- **`ooo auto "a todo CLI with due dates"`**: asks only what is missing, writes the spec, runs it, and checks it.
+- **`ooo run`**: builds an existing Seed and checks every acceptance criterion.
+
+In Claude Code, run `/ouroboros:setup` once and finish its questions, then send
+your first `ooo` command as a separate message. From a plain terminal,
+`ouroboros init start "..."` and `ouroboros auto "..."` do the same without an
+agent host. The full command list is in
+[Getting Started](./docs/getting-started.md#commands).
+
+> Ouroboros runs coding agents that can change files and run commands in your
+> project. Read [permission scope](./skills/help/TROUBLESHOOTING.md#permission-scope)
+> before using it on a project you don't trust.
+
+## Works with
+
+[Claude Code](./docs/runtime-guides/claude-code.md) ·
+[Codex CLI](./docs/runtime-guides/codex.md) ·
+[GitHub Copilot CLI](./docs/runtime-guides/copilot.md) ·
+[OpenCode](./docs/runtime-guides/opencode.md) ·
+[Hermes](./docs/runtime-guides/hermes.md) ·
+[Gemini CLI](./docs/runtime-guides/gemini.md) ·
+[Kiro CLI](./docs/runtime-guides/kiro.md) ·
+[Pi](./docs/runtime-guides/pi.md) ·
+[OMP](./docs/runtime-guides/omp.md) ·
+[Zcode](./docs/runtime-guides/zcode.md) ·
+[Goose](./docs/runtime-guides/goose.md) ·
+[GJC](./docs/runtime-guides/gjc.md) ·
+[Antigravity CLI](./docs/runtime-guides/antigravity.md) ·
+[Grok Build CLI](./docs/runtime-guides/grok.md) ·
+[DeepSeek Harness](./docs/guides/deepseek-harness.md)
+
+The installer connects the ones you have; the console's **Connect** page
+installs and connects the rest. Want to see it first?
+[Watch the interview run on seven different hosts](./docs/how-ouroboros-works.md#see-it-on-each-host).
+
+## Learn more
+
+- [Getting Started](./docs/getting-started.md): every install path, host-by-host setup, your first workflow, and all commands.
+- [Console guide](./docs/guides/console.md): what each console page does, the shared MCP server, and starting the console at login.
+- [How Ouroboros works](./docs/how-ouroboros-works.md): the loop, the agents, the ambiguity gate, the Agent OS stack, architecture, and philosophy.
+- [CLI reference](./docs/cli-reference.md) · [Configuration](./docs/config-reference.md) · [Platform support](./docs/platform-support.md) · [All docs](./docs/README.md)
+- [Interactive guide](https://ouroboros.page/learn/en/)
+
+<p align="center">
+  <sub>Most people find out they were unclear about three files into the review.<br/>
+  If that feels familiar, star <a href="https://github.com/Q00/ouroboros"><strong>Q00/ouroboros on GitHub</strong></a> so the next person it could save can find it.</sub>
+</p>
 
 ## Contributing
 
 ```bash
 git clone https://github.com/Q00/ouroboros
 cd ouroboros
-uv sync --all-groups && uv run pytest
+uv sync --python 3.13 --all-groups
+uv run --python 3.13 --no-sync pytest
 ```
 
 [Issues](https://github.com/Q00/ouroboros/issues) · [Discussions](https://github.com/Q00/ouroboros/discussions) · [Contributing Guide](./CONTRIBUTING.md)
 
----
+## Sponsors
 
-## Star History
+Ouroboros is MIT-licensed and built in the open. If it saves you rework, consider
+sponsoring: it funds maintenance, new runtime integrations, and sponsor-only
+deep-dive content.
 
-<a href="https://www.star-history.com/?repos=Q00/ouroboros&type=Date#gh-light-mode-only">
-  <img src="https://api.star-history.com/svg?repos=Q00/ouroboros&type=Date&theme=light" alt="Star History Chart" width="100%" />
-</a>
-<a href="https://www.star-history.com/?repos=Q00/ouroboros&type=Date#gh-dark-mode-only">
-  <img src="https://api.star-history.com/svg?repos=Q00/ouroboros&type=Date&theme=dark" alt="Star History Chart" width="100%" />
-</a>
+<p align="center">
+  <a href="https://github.com/sponsors/Q00"><img src="https://img.shields.io/badge/%E2%9D%A4%EF%B8%8E%20Sponsor%20on%20GitHub-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor Q00 on GitHub"></a>
+</p>
+
+## Activity
+
+These numbers are generated from GitHub data and refreshed automatically; caching may delay updates.
+
+<p align="center">
+  <a href="https://github.com/Q00/ouroboros/graphs/contributors"><img src="https://img.shields.io/github/contributors/Q00/ouroboros?color=orange" alt="Contributors"></a>
+  <a href="https://github.com/Q00/ouroboros/commits/main"><img src="https://img.shields.io/github/commit-activity/m/Q00/ouroboros?color=orange" alt="Commit activity"></a>
+  <a href="https://github.com/Q00/ouroboros/pulls?q=is%3Apr+is%3Aclosed"><img src="https://img.shields.io/github/issues-pr-closed/Q00/ouroboros?color=orange" alt="Closed pull requests"></a>
+  <a href="https://github.com/Q00/ouroboros/commits/main"><img src="https://img.shields.io/github/last-commit/Q00/ouroboros?color=orange" alt="Last commit"></a>
+</p>
+
+## Disclaimer
+
+> The Ouroboros project and community are **not affiliated with any
+> cryptocurrency, token, memecoin, or trading community** — including, but not
+> limited to, any "ouroboros" tickers on pump.fun or other launchpads. This is
+> an open-source developer tool. We do not issue, endorse, or hold any coins.
+> Any token claiming association with this project is unauthorized.
+
+> **Naming note.** A separate, unaffiliated open-source project also uses the
+> name "Ouroboros" — Anton Razzhigaev's self-modifying, autonomous-memory agent
+> at `github.com/razzant/ouroboros`. No shared code, no relationship. This
+> project locks a specification before executing rather than rewriting its own
+> architecture; if you're looking for the latter, that's the other one.
 
 ---
 

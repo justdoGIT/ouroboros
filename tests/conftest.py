@@ -1,9 +1,58 @@
 """Pytest configuration for Ouroboros."""
 
+import atexit
 import inspect
 import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
 
+import pytest
 import pytest_asyncio
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Classify tests before marker selection and xdist's loadgroup scheduling."""
+    integration_root = Path(__file__).resolve().parent / "integration"
+    for item in items:
+        if item.path.is_relative_to(integration_root):
+            item.add_marker(pytest.mark.integration)
+        if isinstance(item, pytest.Function) and "built_wheel" in item.fixturenames:
+            item.add_marker(pytest.mark.slow)
+            item.add_marker(pytest.mark.xdist_group("built_wheel"))
+
+
+@pytest.fixture(scope="session")
+def built_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Build one wheel for packaging-contract tests that inspect its contents.
+
+    The wheel is an immutable artifact for the duration of a test session;
+    rebuilding it in each test only repeats a 20–30 second subprocess.
+    Parallel runs must use --dist loadgroup so every consumer shares a worker.
+    """
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv not on PATH; wheel packaging tests require a build")
+    output = tmp_path_factory.mktemp("built-wheel")
+    project_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [uv, "build", "--wheel", "--out-dir", str(output)],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"uv build failed: stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    wheels = list(output.glob("*.whl"))
+    assert len(wheels) == 1, f"expected exactly one wheel, got {wheels}"
+    return wheels[0]
+
 
 # In CI, GITHUB_ACTIONS env var causes Typer to set force_terminal=True on
 # Rich Console (see typer/rich_utils.py:75-78). This makes Rich emit ANSI
@@ -12,6 +61,268 @@ import pytest_asyncio
 # assertions. _TYPER_FORCE_DISABLE_TERMINAL is Typer's built-in escape hatch
 # that sets force_terminal=False, letting Rich detect non-TTY output correctly.
 os.environ["_TYPER_FORCE_DISABLE_TERMINAL"] = "1"
+
+# The live web dashboard spawns a detached daemon process + binds a port the first
+# time a run is launched. Unit tests must never do that (process/port/FS side
+# effects, non-deterministic URL in responses). Force it OFF by default; tests that
+# exercise the wiring opt back in explicitly via monkeypatch + a mocked resolver.
+os.environ["OUROBOROS_DASHBOARD"] = "0"
+
+# Anonymous usage telemetry ships with an embedded PostHog key, so without this
+# kill switch any test that reaches a CLI callback or MCP call_tool would send
+# real events. Tests that exercise telemetry itself delete this var and inject
+# a fake key + transport (see tests/unit/test_telemetry.py).
+os.environ["OUROBOROS_TELEMETRY"] = "0"
+
+
+# ── Hermetic home isolation (before collection) ──────────────────────────────
+# Ouroboros resolves its state root two ways: ``Path.home()`` AND
+# ``os.path.expanduser("~")`` (e.g. cli/commands/{cancel,run,job,resume,tui}.py
+# build the default ``EventStore`` DB path via ``expanduser``). ``Path.home()``
+# calls ``expanduser("~")`` internally; redirect HOME and, on Windows,
+# USERPROFILE to isolate home-based config, default DB, logs, and CLI paths.
+#
+# With these paths redirected,
+# subprocesses spawned by tests inherit the isolated home instead of the real
+# one. We set it at conftest import — *before* collection — so it also covers
+# effects the per-test fixture cannot reach (module-level constants, a logging
+# handler opening ``~/.ouroboros/logs/ouroboros.log``, ``config.loader`` reading
+# ``~/.ouroboros/.env`` at import).
+#
+# External tools that legitimately need the real home get an explicit location:
+# ``uv build`` (exercised by the wheel-packaging test) keeps its real cache via
+# ``UV_CACHE_DIR``. git fixtures set per-repo identity, so no global git config
+# is required under the isolated home.
+_REAL_HOME = Path(os.path.expanduser("~"))
+_SESSION_HOME = Path(tempfile.mkdtemp(prefix="ouroboros-test-home-"))
+atexit.register(shutil.rmtree, _SESSION_HOME, ignore_errors=True)
+os.environ.setdefault("UV_CACHE_DIR", str(_REAL_HOME / ".cache" / "uv"))
+os.environ["HOME"] = str(_SESSION_HOME)
+# On Windows pathlib and expanduser use USERPROFILE rather than HOME.
+if sys.platform == "win32":
+    os.environ["USERPROFILE"] = str(_SESSION_HOME)
+# Codex's explicit configuration directory overrides HOME.  Inheriting it from
+# an interactive Codex session would let setup/uninstall tests modify the
+# developer's actual configuration. Individual tests can explicitly opt in to
+# a temporary CODEX_HOME after collection.
+os.environ.pop("CODEX_HOME", None)
+# Exposed so tests can assert import-time constants were captured under the
+# isolated home rather than the developer's real ``~``.
+os.environ["_OUROBOROS_TEST_SESSION_HOME"] = str(_SESSION_HOME)
+
+
+@pytest.fixture(autouse=True)
+def isolate_ouroboros_home(tmp_path_factory, monkeypatch):
+    """Give each test its own home dir on top of the session-wide baseline set
+    above, so per-test runtime state does not bleed across tests.
+
+    Runtime-backend resolution and the default ``EventStore`` DB path resolve
+    through ``get_config_dir()`` / ``expanduser`` → ``$HOME``. Two concrete
+    failure modes this prevents:
+
+    * Runtime-inference tests read the developer's real ``config.yaml``
+      ``runtime_profile`` (e.g. ``interview: codex``) and fail locally with
+      ``codex != opencode`` while passing on CI's empty home — the classic
+      "passes on CI, fails on my machine" split.
+    * A no-arg ``EventStore()`` writes into a single shared ``ouroboros.db``;
+      under ``pytest -n`` a per-test home keeps that off any shared file.
+
+    Tests that need a specific home still win: their own
+    ``monkeypatch.setenv("HOME", ...)`` / ``patch("pathlib.Path.home", ...)`` is
+    applied after this fixture.
+    """
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    if sys.platform == "win32":
+        monkeypatch.setenv("USERPROFILE", str(home))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def isolate_heartbeat_locks_per_test_worker(tmp_path_factory):
+    """Keep xdist workers from competing over illustrative session IDs.
+
+    Unit tests intentionally use short deterministic IDs (for example
+    ``sess_1``). Production's liveness lease correctly rejects those IDs when
+    two independent processes own them concurrently, but xdist workers are
+    independent processes too. Give each worker a private lock directory while
+    preserving real lease semantics within that worker.
+    """
+    from ouroboros.orchestrator import heartbeat
+
+    previous_lock_dir = heartbeat.LOCK_DIR
+    previous_cancellation_dir = heartbeat.CANCELLATION_DIR
+    heartbeat.LOCK_DIR = tmp_path_factory.mktemp("heartbeat-locks")
+    heartbeat.CANCELLATION_DIR = tmp_path_factory.mktemp("cancellation-signals")
+    try:
+        yield
+    finally:
+        # A cancellation-focused test may deliberately leave a session alive.
+        # Close those descriptors before pytest tears down the worker.
+        for session_id in tuple(heartbeat._HELD_LEASE_FDS):
+            heartbeat.release(session_id)
+        heartbeat.LOCK_DIR = previous_lock_dir
+        heartbeat.CANCELLATION_DIR = previous_cancellation_dir
+
+
+@pytest.fixture(scope="session", autouse=True)
+def render_logged_exceptions_with_plain_tracebacks():
+    """Keep structlog's DEV renderer from paying rich+pygments per exception.
+
+    ``ConsoleRenderer(colors=True)`` defaults to rich's traceback formatter,
+    which syntax-highlights the source context of every frame. Failure-path
+    tests that log a real exception (event-store append failures, adapter
+    errors, ...) each paid multiple seconds of pygments tokenization for
+    output nobody reads under pytest. Render with the stdlib formatter
+    instead — same information, plain text. Production DEV output is
+    untouched; this only rewrites the renderer inside the test session.
+    """
+    import structlog
+
+    from ouroboros.observability import logging as obs_logging
+
+    def _plain_renderer() -> structlog.dev.ConsoleRenderer:
+        return structlog.dev.ConsoleRenderer(
+            colors=True, exception_formatter=structlog.dev.plain_traceback
+        )
+
+    def _swap_in_place(processors: list) -> list:
+        for index, processor in enumerate(processors):
+            if isinstance(processor, structlog.dev.ConsoleRenderer):
+                # In-place: capture_logs() shares this exact list object.
+                processors[index] = _plain_renderer()
+        return processors
+
+    original_get_console_processors = obs_logging._get_console_processors
+
+    def _plain_console_processors(mode):
+        return _swap_in_place(original_get_console_processors(mode))
+
+    _swap_in_place(obs_logging._live_generation.processors)
+    obs_logging._get_console_processors = _plain_console_processors
+    try:
+        yield
+    finally:
+        obs_logging._get_console_processors = original_get_console_processors
+
+
+def _is_explicit_live_canonical_test(request: pytest.FixtureRequest) -> bool:
+    """Only the opt-in canonical live test may use production LLM dependencies."""
+    enabled = os.environ.get("OUROBOROS_RUN_CANONICAL", "").strip().lower() in {"1", "true", "yes"}
+    canonical_test = Path(__file__).resolve().parent / "canonical" / "test_canonical.py"
+    return (
+        enabled
+        and request.node.path.resolve() == canonical_test
+        and getattr(request.node, "originalname", None) == "test_scenario_live_run_or_skip"
+    )
+
+
+@pytest.fixture(autouse=True)
+def block_runner_real_llm_adapter(monkeypatch, request):
+    """Block execute_seed's dependency analysis from spawning real agent CLIs.
+
+    ``OrchestratorRunner._build_dependency_analyzer`` resolves an LLM adapter
+    from the adapter's ``llm_backend`` / the developer's real ~/.ouroboros
+    config, and if a matching CLI binary exists on the machine (claude,
+    opencode, ...) it spawns it for a REAL completion — with no timeout on
+    some backends. In tests this meant real API calls locally and a ~60s
+    hang per failure-path e2e test on CI.
+
+    Raising here routes the builder through its existing RuntimeError
+    fallback (structured-only ``DependencyAnalyzer()``), which is also the
+    effective CI behavior. Tests that exercise the builder itself patch
+    ``ouroboros.orchestrator.runner.create_llm_adapter`` inside the test
+    body; that patch is applied after this one and wins.
+
+    Gated on sys.modules so tests that never import the orchestrator don't
+    pay the import cost.
+    """
+    if _is_explicit_live_canonical_test(request):
+        return
+    runner_mod = sys.modules.get("ouroboros.orchestrator.runner")
+    if runner_mod is not None:
+
+        def _blocked_create_llm_adapter(*_args, **_kwargs):
+            raise RuntimeError(
+                "create_llm_adapter blocked in tests: dependency analysis must not "
+                "spawn real agent CLIs (patch ouroboros.orchestrator.runner."
+                "create_llm_adapter to test the LLM path)"
+            )
+
+        monkeypatch.setattr(runner_mod, "create_llm_adapter", _blocked_create_llm_adapter)
+
+
+@pytest.fixture(autouse=True)
+def block_interview_answer_refiner_cli_spawn(monkeypatch, request):
+    """Stop the auto interview's answer refiner from spawning real agent CLIs.
+
+    ``build_answer_refiner()`` builds an ``LLMAnswerRefiner`` from the configured
+    interview backend via ``ouroboros.providers.create_llm_adapter``. When a
+    matching CLI (claude, ...) is installed, the safe-default synthesis path then
+    spawns it for a REAL completion per open section — ~4 ``claude`` subprocesses
+    and ~13s in a single otherwise-mocked auto test locally, while CI (no CLI
+    auth) simply degrades the refiner to ``None``.
+
+    Force the refiner OFF by default. Its own documented fallback is
+    deterministic-only answering (``build_answer_refiner`` returns ``None`` when
+    the provider is unavailable), so this preserves behavior and makes local runs
+    match CI. Tests that exercise the refiner inject an ``LLMAnswerRefiner``
+    directly or re-patch after this fixture and win.
+
+    Patched in the consuming modules (where the name is bound at import) and
+    gated on sys.modules so tests that never import them don't pay.
+    """
+    if _is_explicit_live_canonical_test(request):
+        return
+    for mod_name in ("ouroboros.mcp.tools.auto_handler", "ouroboros.cli.commands.auto"):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "build_answer_refiner"):
+            monkeypatch.setattr(mod, "build_answer_refiner", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def block_interview_investigator_cli_spawn(monkeypatch, request):
+    """Stop the auto self-answer investigator from spawning real agent CLIs.
+
+    ``build_repo_investigator()`` returns a ``RepoInvestigator`` that builds an
+    agent runtime (claude, codex, ...) per routed interview question. Its own
+    fallback, ``None``, keeps the deterministic answerer, so this matches a
+    machine without any agent CLI. Tests that exercise the investigator inject
+    one directly or re-patch after this fixture and win.
+    """
+    if _is_explicit_live_canonical_test(request):
+        return
+    for mod_name in ("ouroboros.mcp.tools.auto_handler", "ouroboros.cli.commands.auto"):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "build_repo_investigator"):
+            monkeypatch.setattr(mod, "build_repo_investigator", lambda *_a, **_k: None)
+
+
+@pytest.fixture(autouse=True)
+def block_setup_probe_cli_spawns(monkeypatch):
+    """Stop ``ooo setup`` capability probes from spawning real codex/opencode CLIs.
+
+    ``_codex_uses_profile_v2`` spawns ``codex --help`` and ``_debug_paths_config_dir``
+    spawns ``opencode debug paths`` to sniff installed-CLI capabilities. On a
+    machine where those CLIs happen to be installed the probe result — and thus
+    the setup tests' behavior — depends on the real binary's output, so the same
+    test can branch differently across machines (the "passes on CI, fails on my
+    machine" split). Pin both to their documented CLI-unavailable fallback
+    (``False`` / ``None``), which is exactly the behavior on a clean CI with no
+    such CLI on PATH. Tests that exercise the probe re-patch after this fixture
+    and win.
+
+    Note: this deliberately does NOT touch runtime adapters (e.g. the zcode/codex
+    CLI runtimes) that exec a caller-provided CLI path — those tests build a stub
+    binary under ``tmp_path`` and executing it IS the behavior under test.
+
+    Gated on sys.modules so tests that never import these modules don't pay.
+    """
+    setup_mod = sys.modules.get("ouroboros.cli.commands.setup")
+    if setup_mod is not None and hasattr(setup_mod, "_codex_uses_profile_v2"):
+        monkeypatch.setattr(setup_mod, "_codex_uses_profile_v2", lambda *_a, **_k: False)
+    opencode_mod = sys.modules.get("ouroboros.cli.opencode_config")
+    if opencode_mod is not None and hasattr(opencode_mod, "_debug_paths_config_dir"):
+        monkeypatch.setattr(opencode_mod, "_debug_paths_config_dir", lambda *_a, **_k: None)
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -54,3 +365,17 @@ async def close_test_owned_stores(monkeypatch):
                     await close_result
                 except Exception:
                     pass
+
+
+@pytest.fixture(autouse=True)
+def reset_ignored_model_warning():
+    """Make the once-per-process ignored-model warning independent of test order.
+
+    ``config.model_selection`` warns only on the first ignored persisted model id
+    in a process. Under ``pytest -n`` that first call would otherwise land in
+    whichever test a worker happens to run first. Reset it per test so a test
+    that reads CLI output sees the same stream alone or in the full suite.
+    """
+    selection_mod = sys.modules.get("ouroboros.config.model_selection")
+    if selection_mod is not None:
+        selection_mod.reset_ignored_model_warning()

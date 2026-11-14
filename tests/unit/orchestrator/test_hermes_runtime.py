@@ -13,10 +13,16 @@ import pytest
 from ouroboros.core.types import Result
 from ouroboros.mcp.errors import MCPToolError
 from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
-from ouroboros.orchestrator.adapter import AgentMessage, RuntimeHandle
+from ouroboros.orchestrator.adapter import AgentMessage, ParamSupport, RuntimeHandle
 import ouroboros.orchestrator.hermes_runtime as hermes_runtime_module
-from ouroboros.orchestrator.hermes_runtime import HermesCliRuntime, _parse_quiet_output
+from ouroboros.orchestrator.hermes_runtime import (
+    HermesCliRuntime,
+    _parse_quiet_output,
+    _resolve_hermes_profile,
+)
 from ouroboros.router import Resolved, ResolveRequest, SkillDispatchRouter
+
+_EXPECTED_CWD = str(Path("/tmp/project").resolve())
 
 
 class _FakeStream:
@@ -119,12 +125,211 @@ class TestHermesCliRuntime:
     def test_runtime_properties(self) -> None:
         runtime = HermesCliRuntime(cli_path="hermes", cwd="/tmp/project")
         assert runtime.runtime_backend == "hermes_cli"
-        assert runtime.working_directory == "/tmp/project"
+        assert runtime.working_directory == _EXPECTED_CWD
         assert runtime.permission_mode == "default"
+        assert runtime.permission_mode_requested is False
+
+    @pytest.mark.asyncio
+    async def test_iter_stream_lines_enforces_line_buffer_cap(self) -> None:
+        """Regression (DUP-3): the Hermes stream reader must cap its line buffer.
+
+        The standalone Hermes copy of ``_iter_stream_lines`` shipped without a
+        buffer cap, so newline-free stdout grew memory without bound.  After
+        consolidating onto the shared runtime reader, newline-free output that
+        exceeds the cap must raise ``ProviderError`` instead of accumulating.
+        """
+        from ouroboros.core.errors import ProviderError
+        from ouroboros.providers.codex_cli_stream import _MAX_RUNTIME_LINE_BUFFER_BYTES
+
+        runtime = HermesCliRuntime(cli_path="hermes", cwd="/tmp/project")
+
+        # The estimate counts 4 bytes per decoded char; size just past the cap.
+        oversized_chars = (_MAX_RUNTIME_LINE_BUFFER_BYTES // 4) + 1
+        newline_free = _FakeStream("a" * oversized_chars)
+
+        with pytest.raises(ProviderError, match="JSONL line buffer exceeded"):
+            async for _ in runtime._iter_stream_lines(newline_free):
+                pass
+
+    def test_tracks_requested_permission_mode_and_declares_translated_support(self) -> None:
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            cwd="/tmp/project",
+            permission_mode="acceptEdits",
+        )
+
+        assert runtime.permission_mode == "acceptEdits"
+        assert runtime.permission_mode_requested is True
+        assert runtime.capabilities.system_prompt_support is ParamSupport.TRANSLATED
+        assert runtime.capabilities.tool_restriction_support is ParamSupport.TRANSLATED
+        assert runtime.capabilities.permission_mode_support is ParamSupport.TRANSLATED
+        assert runtime.capabilities.targeted_resume is True
+        assert runtime.capabilities.session_signals.after_turn_delivery is False
 
     def test_constructor_accepts_llm_backend(self) -> None:
         runtime = HermesCliRuntime(cli_path="hermes", llm_backend="opencode")
         assert runtime._llm_backend == "opencode"
+
+    def test_explicit_runtime_profile_wins_over_host_profile(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        host_profile = tmp_path / ".hermes" / "profiles" / "astraia"
+        host_profile.mkdir(parents=True)
+        (host_profile / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_HOME", str(host_profile))
+
+        assert _resolve_hermes_profile("worker") == "worker"
+
+    def test_infers_runtime_profile_from_hermes_home(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        host_profile = tmp_path / ".hermes" / "profiles" / "astraia"
+        host_profile.mkdir(parents=True)
+        (host_profile / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(host_profile))
+
+        assert _resolve_hermes_profile(None) == "astraia"
+
+    def test_infers_runtime_profile_with_profile_scoped_home(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        host_profile = tmp_path / ".hermes" / "profiles" / "astraia"
+        profile_home = host_profile / "home"
+        profile_home.mkdir(parents=True)
+        (host_profile / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+        monkeypatch.setenv("HOME", str(profile_home))
+        monkeypatch.setenv("HERMES_REAL_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_HOME", str(host_profile))
+
+        assert _resolve_hermes_profile(None) == "astraia"
+
+    def test_does_not_infer_runtime_profile_without_hermes_home(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.chdir(project)
+
+        assert _resolve_hermes_profile(None) is None
+
+    @staticmethod
+    def _clear_timeout_env(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Drop ambient timeout env vars so kwarg/default tests stay deterministic."""
+        for name in (
+            "OUROBOROS_HERMES_STARTUP_TIMEOUT_SECONDS",
+            "OUROBOROS_HERMES_IDLE_TIMEOUT_SECONDS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+    def test_default_timeouts_match_class_attributes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_timeout_env(monkeypatch)
+        runtime = HermesCliRuntime(cli_path="hermes")
+        assert (
+            runtime._startup_output_timeout_seconds
+            == HermesCliRuntime._startup_output_timeout_seconds
+        )
+        assert runtime._stdout_idle_timeout_seconds == HermesCliRuntime._stdout_idle_timeout_seconds
+
+    def test_explicit_timeout_kwargs_override_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._clear_timeout_env(monkeypatch)
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            startup_output_timeout_seconds=10.0,
+            stdout_idle_timeout_seconds=20.0,
+        )
+        assert runtime._startup_output_timeout_seconds == 10.0
+        assert runtime._stdout_idle_timeout_seconds == 20.0
+
+    def test_zero_timeout_disables_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``0`` opts out of the runtime-local guard so the watchdog owns liveness."""
+        self._clear_timeout_env(monkeypatch)
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            startup_output_timeout_seconds=0,
+            stdout_idle_timeout_seconds=0,
+        )
+        assert runtime._startup_output_timeout_seconds is None
+        assert runtime._stdout_idle_timeout_seconds is None
+
+    def test_negative_timeout_disables_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._clear_timeout_env(monkeypatch)
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            startup_output_timeout_seconds=-1.0,
+            stdout_idle_timeout_seconds=-5.0,
+        )
+        assert runtime._startup_output_timeout_seconds is None
+        assert runtime._stdout_idle_timeout_seconds is None
+
+    def test_env_vars_set_timeouts_when_kwargs_omitted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OUROBOROS_HERMES_STARTUP_TIMEOUT_SECONDS", "120")
+        monkeypatch.setenv("OUROBOROS_HERMES_IDLE_TIMEOUT_SECONDS", "900")
+        runtime = HermesCliRuntime(cli_path="hermes")
+        assert runtime._startup_output_timeout_seconds == 120.0
+        assert runtime._stdout_idle_timeout_seconds == 900.0
+
+    def test_env_var_zero_disables_guard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OUROBOROS_HERMES_IDLE_TIMEOUT_SECONDS", "0")
+        runtime = HermesCliRuntime(cli_path="hermes")
+        assert runtime._stdout_idle_timeout_seconds is None
+
+    def test_kwargs_take_priority_over_env_vars(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OUROBOROS_HERMES_STARTUP_TIMEOUT_SECONDS", "120")
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            startup_output_timeout_seconds=42.0,
+        )
+        assert runtime._startup_output_timeout_seconds == 42.0
+
+    def test_invalid_env_var_falls_back_to_class_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("OUROBOROS_HERMES_IDLE_TIMEOUT_SECONDS", "not-a-number")
+        runtime = HermesCliRuntime(cli_path="hermes")
+        assert runtime._stdout_idle_timeout_seconds == HermesCliRuntime._stdout_idle_timeout_seconds
+
+    @pytest.mark.parametrize("raw", ["nan", "NaN", "inf", "Infinity", "-inf"])
+    def test_non_finite_env_var_falls_back_to_class_default(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str
+    ) -> None:
+        """``float()`` parses ``nan``/``inf`` but they break ``asyncio.wait_for``."""
+        monkeypatch.setenv("OUROBOROS_HERMES_IDLE_TIMEOUT_SECONDS", raw)
+        runtime = HermesCliRuntime(cli_path="hermes")
+        assert runtime._stdout_idle_timeout_seconds == HermesCliRuntime._stdout_idle_timeout_seconds
+
+    def test_non_finite_kwarg_falls_back_to_class_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._clear_timeout_env(monkeypatch)
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            startup_output_timeout_seconds=float("nan"),
+            stdout_idle_timeout_seconds=float("inf"),
+        )
+        assert (
+            runtime._startup_output_timeout_seconds
+            == HermesCliRuntime._startup_output_timeout_seconds
+        )
+        assert runtime._stdout_idle_timeout_seconds == HermesCliRuntime._stdout_idle_timeout_seconds
 
     def test_runtime_does_not_expose_local_dispatch_parser_helpers(self) -> None:
         """Dispatch parsing and metadata resolution live in the shared router."""
@@ -256,7 +461,7 @@ class TestHermesCliRuntime:
         resolve_request = observed_requests[0]
         assert isinstance(resolve_request, ResolveRequest)
         assert resolve_request.prompt == prompt
-        assert resolve_request.cwd == "/tmp/project"
+        assert resolve_request.cwd == _EXPECTED_CWD
         assert resolve_request.skills_dir == tmp_path
         dispatcher.assert_awaited_once()
         mock_exec.assert_not_called()
@@ -268,9 +473,9 @@ class TestHermesCliRuntime:
         assert intercept.first_argument == expected_argument
         assert intercept.mcp_args == {
             "seed_path": expected_argument,
-            "cwd": "/tmp/project",
-            "label": f"cwd=/tmp/project seed={expected_argument}",
-            "nested": {"values": [expected_argument, "/tmp/project"]},
+            "cwd": _EXPECTED_CWD,
+            "label": f"cwd={_EXPECTED_CWD} seed={expected_argument}",
+            "nested": {"values": [expected_argument, _EXPECTED_CWD]},
         }
         assert messages[-1].content == "Intercepted"
 
@@ -327,7 +532,7 @@ class TestHermesCliRuntime:
         request = mock_resolve.call_args.args[0]
         assert isinstance(request, ResolveRequest)
         assert request.prompt == "ooo run seed.yaml"
-        assert request.cwd == "/tmp/project"
+        assert request.cwd == _EXPECTED_CWD
         assert request.skills_dir == tmp_path
         dispatcher.assert_awaited_once()
         assert dispatcher.await_args.args[0] is resolved
@@ -389,7 +594,7 @@ class TestHermesCliRuntime:
         request = mock_resolve.call_args.args[0]
         assert isinstance(request, ResolveRequest)
         assert request.prompt == "ooo run prompt-derived.yaml"
-        assert request.cwd == "/tmp/project"
+        assert request.cwd == _EXPECTED_CWD
         assert request.skills_dir == tmp_path
         mock_lookup.assert_called_once_with("router_only_tool")
         fake_handler.handle.assert_awaited_once_with(
@@ -462,6 +667,50 @@ class TestHermesCliRuntime:
         assert messages[-1].content == "Hermes fallback completed"
 
     @pytest.mark.asyncio
+    async def test_execute_task_nonzero_exit_emits_typed_error_metadata(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A non-zero hermes exit carrying a provider 429 must surface typed
+        error metadata (issue 1.1 regression). Without it the failure lacks
+        runtime-error shape and the run hard-fails instead of pausing."""
+        self._write_skill(
+            tmp_path,
+            "run",
+            [
+                "name: run",
+                "mcp_tool: ouroboros_execute_seed",
+                "mcp_args:",
+                '  seed_path: "$1"',
+            ],
+        )
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            cwd="/tmp/project",
+            skills_dir=tmp_path,
+        )
+        process = _FakeProcess(
+            stdout="",
+            stderr="HTTP 429: Usage limit reached for 5 hour.",
+            returncode=1,
+        )
+
+        with patch(
+            "ouroboros.orchestrator.hermes_runtime.asyncio.create_subprocess_exec",
+            return_value=process,
+        ):
+            messages = [
+                message async for message in runtime.execute_task("please ooo run seed.yaml")
+            ]
+
+        final = messages[-1]
+        assert final.is_error
+        assert final.data["subtype"] == "error"
+        assert final.data["exit_code"] == 1
+        assert final.data["error_type"] == "RateLimitError"
+        assert final.data["http_status"] == 429
+
+    @pytest.mark.asyncio
     async def test_execute_task_maps_interview_argument_to_initial_context(
         self,
         tmp_path: Path,
@@ -499,7 +748,7 @@ class TestHermesCliRuntime:
         assert intercept.mcp_tool == "ouroboros_interview"
         assert intercept.mcp_args == {
             "initial_context": "Build a REST API",
-            "cwd": "/tmp/project",
+            "cwd": _EXPECTED_CWD,
         }
         assert messages[-1].content == "Intercepted"
 
@@ -757,6 +1006,28 @@ class TestHermesCliRuntime:
         assert messages[0].resume_handle.native_session_id == "20260413_120000_deadbeef"
 
     @pytest.mark.asyncio
+    async def test_execute_task_passes_runtime_profile_before_chat(self) -> None:
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            cwd="/tmp/project",
+            runtime_profile="astraia",
+        )
+        process = _FakeProcess("Completed\n")
+
+        with patch(
+            "ouroboros.orchestrator.hermes_runtime.asyncio.create_subprocess_exec",
+            return_value=process,
+        ) as mock_exec:
+            _ = [message async for message in runtime.execute_task("Do the thing")]
+
+        assert mock_exec.call_args.args[:4] == (
+            "hermes",
+            "--profile",
+            "astraia",
+            "chat",
+        )
+
+    @pytest.mark.asyncio
     async def test_execute_task_falls_through_on_recoverable_dispatch_failure(
         self,
         tmp_path: Path,
@@ -942,6 +1213,25 @@ class TestHermesCliRuntime:
         assert messages[0].resume_handle == handle
 
     @pytest.mark.asyncio
+    async def test_execute_task_reads_success_session_id_from_stderr(self) -> None:
+        runtime = HermesCliRuntime(cli_path="hermes", cwd="/tmp/project")
+        process = _FakeProcess(
+            "Completed",
+            stderr="session_id: 20260713_004624_559062\n",
+        )
+
+        with patch(
+            "ouroboros.orchestrator.hermes_runtime.asyncio.create_subprocess_exec",
+            return_value=process,
+        ):
+            messages = [message async for message in runtime.execute_task("Do the thing")]
+
+        assert len(messages) == 1
+        assert messages[0].content == "Completed"
+        assert messages[0].resume_handle is not None
+        assert messages[0].resume_handle.native_session_id == "20260713_004624_559062"
+
+    @pytest.mark.asyncio
     async def test_execute_task_times_out_when_hermes_never_emits_output(self) -> None:
         runtime = HermesCliRuntime(cli_path="hermes", cwd="/tmp/project")
         runtime._startup_output_timeout_seconds = 0.01
@@ -969,7 +1259,11 @@ class TestHermesCliRuntime:
         swallowed the protocol's ``resume_handle``, so multi-turn
         orchestrator flows always started a fresh session.
         """
-        runtime = HermesCliRuntime(cli_path="hermes", cwd="/tmp/project")
+        runtime = HermesCliRuntime(
+            cli_path="hermes",
+            cwd="/tmp/project",
+            permission_mode="bypassPermissions",
+        )
         process = _FakeProcess("Continued work\nsession_id: 20260413_120000_deadbeef\n")
         handle = RuntimeHandle(backend="hermes_cli", native_session_id="20260412_090000_cafebabe")
 
@@ -986,6 +1280,8 @@ class TestHermesCliRuntime:
         call_args = mock_exec.call_args.args
         assert "--resume" in call_args
         assert "20260412_090000_cafebabe" in call_args
+        assert "--yolo" in call_args
+        assert "--accept-hooks" in call_args
 
     @pytest.mark.asyncio
     async def test_execute_task_resumes_from_legacy_resume_session_id(self) -> None:

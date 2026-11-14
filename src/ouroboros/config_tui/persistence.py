@@ -1,0 +1,125 @@
+"""Validated settings writes shared by the GUI and ``config set``.
+
+Both callers validate key paths before saving. The shared write path checks
+the resulting configuration before publishing its one-step Undo backup and
+restores the previous configuration on recoverable save failures.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from contextlib import suppress
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Any
+
+import yaml
+
+from ouroboros.config.models import get_config_dir
+
+
+class ConfigWriteError(Exception):
+    """A settings write failed; the message reports any rollback failure."""
+
+
+def load_raw_config() -> dict[str, Any]:
+    """Read ``config.yaml`` as a plain dict (empty when the file is missing)."""
+    config_path = get_config_dir() / "config.yaml"
+    if not config_path.exists():
+        return {}
+    try:
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except UnicodeError:
+        msg = "Configuration file must be UTF-8 encoded."
+        raise ConfigWriteError(msg) from None
+    if not isinstance(data, dict):
+        msg = f"Invalid config format in {config_path} (expected mapping)"
+        raise ConfigWriteError(msg)
+    return data
+
+
+def apply_config_values(values: Mapping[str, Any]) -> None:
+    """Apply a validated batch of dot-notation ``{key: value}`` updates.
+
+    A ``None`` value deletes the key (used to clear a per-stage runtime
+    override back to "inherit"). Raises :class:`ConfigWriteError` on an
+    unknown key or a failed save. Validation and recoverable I/O failures
+    restore the previous file byte-for-byte without changing the Undo backup.
+    Only a successful save advances the one-step Undo snapshot.
+    """
+    if not values:
+        return
+
+    # Shared with `config set` — the single schema-aware key validator.
+    from ouroboros.cli.commands.config import _validate_key_path
+
+    config_path = get_config_dir() / "config.yaml"
+    data = load_raw_config()
+
+    for key, value in values.items():
+        keys = key.split(".")
+        error = _validate_key_path(keys)
+        if error:
+            raise ConfigWriteError(error)
+        target = data
+        for part in keys[:-1]:
+            node = target.get(part)
+            if node is None:
+                node = {}
+                target[part] = node
+            if not isinstance(node, dict):
+                msg = f"Cannot set nested key: {key} ({part!r} is not a section)"
+                raise ConfigWriteError(msg)
+            target = node
+        if value is None:
+            target.pop(keys[-1], None)
+        else:
+            target[keys[-1]] = value
+
+    save_config_with_backup(data, config_path)
+
+
+def save_config_with_backup(data: dict[str, Any], config_path: Path) -> None:
+    """Save a config and retain its previous bytes for one-step Undo.
+
+    Callers validate changed key paths before calling this function. Only a
+    fully validated save advances the backup; recoverable failures restore
+    the original configuration without replacing the previous backup.
+    """
+    original_bytes = config_path.read_bytes() if config_path.exists() else None
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_temp: Path | None = None
+    try:
+        config_path.write_text(
+            yaml.dump(data, default_flow_style=False, sort_keys=False), encoding="utf-8"
+        )
+        from ouroboros.config.loader import load_config
+
+        load_config(config_path)
+        if original_bytes is not None:
+            # Preserve the previous Undo snapshot until validation and the
+            # complete backup write succeed. Close before replacing on Windows.
+            with NamedTemporaryFile(
+                dir=config_path.parent, prefix=".config.yaml.bak-", delete=False
+            ) as backup:
+                backup_temp = Path(backup.name)
+                backup.write(original_bytes)
+            backup_temp.replace(config_path.parent / "config.yaml.bak")
+    except Exception as exc:
+        try:
+            if original_bytes is None:
+                config_path.unlink(missing_ok=True)
+            else:
+                config_path.write_bytes(original_bytes)
+        except OSError as rollback_exc:
+            msg = f"{exc}. Configuration rollback also failed: {rollback_exc}"
+            raise ConfigWriteError(msg) from exc
+        msg = f"Configuration rolled back. {exc}"
+        raise ConfigWriteError(msg) from exc
+    finally:
+        if backup_temp is not None:
+            with suppress(OSError):
+                backup_temp.unlink(missing_ok=True)
+
+
+__all__ = ["ConfigWriteError", "apply_config_values", "load_raw_config", "save_config_with_backup"]

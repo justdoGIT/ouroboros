@@ -9,6 +9,25 @@ doc_metadata:
 
 The Seed is Ouroboros's immutable specification -- a "constitution" that drives execution, evaluation, and drift control. This guide covers the YAML structure, field semantics, and best practices for writing effective seeds.
 
+### Structured first question for MCP hosts
+
+An in-process MCP host may start `ouroboros_interview` with
+`structured_first_question: true`. The first response contains
+`meta.first_question_presentation`: one question, two to four suggested choices,
+and a direct-input label. These choices are hypotheses until the user selects
+one. To record an explicit choice, send `session_id` and the 1-based integer
+`selected_first_choice`, without `answer`. To record a different or numeric
+free-text answer, send `session_id` and `answer` instead. A plain text `"1"` is
+always an answer, not a selection. Ask the user when their intent is unclear.
+
+The same pending presentation is returned after a session resume. Invalid
+provider output is reported as an error without echoing it; no extra provider
+call is made to repair it. This experimental path covers only the first question
+and single selection in the in-process mode. Later questions use the existing
+text flow; OpenCode plugin mode, multiple selections, and mixed-version writers
+are not supported by this option. The ordinary interview path is unchanged when
+the option is omitted.
+
 ## Seed YAML Schema
 
 ```yaml
@@ -319,7 +338,7 @@ metadata:
 When ACs have dependencies, Ouroboros automatically detects them and schedules independent ACs in parallel. To help the dependency analyzer:
 
 1. **Mention dependencies explicitly**: "depends on AC1's config module" helps the analyzer
-2. **Name shared files**: "Both AC2 and AC3 modify `src/config.py`" signals potential conflicts
+2. **Name shared files**: "Both AC2 and AC3 modify `src/config.py`" signals potential conflicts <!-- docs-drift: ignore -->
 3. **Order by dependency**: List foundation ACs first, integration ACs last
 
 ```yaml
@@ -332,6 +351,53 @@ acceptance_criteria:
   # Level 3: Integration (depends on Level 2)
   - "Create app entry point that integrates auth and logging"
 ```
+
+## Verification Working Directory
+
+Structured criteria can also set `verify_cwd` to a portable workspace-relative
+subdirectory alongside `verify_command`, for example `verify_cwd: app` for a
+test configuration in `app/`. Use `verify_cwd: "."` to select the workspace root
+explicitly and disable inference. Missing, escaping, symlinked, or replaced
+directories cannot supply accepted verification evidence. When cwd is omitted,
+complete recognized `npm`, `npx`, `yarn`, and `pnpm` invocations use the sole
+nested directory with `package.json` if there is no root manifest. Ambiguous
+projects, compound commands, and unsupported shell syntax use the workspace root.
+Commands with their own cwd selectors and `env -S` also retain root execution
+instead of inferring a directory. Secure non-root execution requires
+POSIX no-follow directory capabilities; when unavailable, including native Windows,
+the gate fails closed. Explicit root execution keeps existing platform behavior.
+`expected_artifacts` and workspace mutation checks always stay
+relative to the workspace root. Changing cwd invalidates prior execution evidence.
+
+## Optional Investment Metadata
+
+Use structured acceptance criteria when the executor needs explicit difficulty
+or cost-of-being-wrong authority. This metadata is optional; legacy string ACs
+remain valid.
+
+```yaml
+acceptance_criteria:
+  - description: "Rotate production payment signing keys"
+    verify_command: "pytest -q tests/security/test_key_rotation.py"
+    investment:
+      difficulty: medium
+      stakes: high
+      provenance: declared
+      confidence: high
+```
+
+`difficulty` and `stakes` accept `low`, `medium`, or `high`. `provenance`
+accepts `declared`, `measured`, `inferred`, or `absent`; `confidence` accepts
+`low`, `medium`, or `high` and defaults to `low`. Only complete, high-confidence
+`measured` low/low metadata can authorize cheaper execution. `declared`, missing,
+inferred, absent, or low-confidence metadata preserves the base effort, though a
+high axis may still raise its floor. See the [investment assessment
+RFC](../rfc/spend-estimator.md) for policy precedence.
+
+Any Seed containing investment metadata executes through the per-AC executor,
+including single-criterion and explicit sequential runs. Whole-session resume is
+blocked for those Seeds until resume can restore per-AC investment authority;
+restart the run instead of resuming through the legacy whole-seed path.
 
 ## Validation
 
@@ -710,21 +776,24 @@ ouroboros run minimal_seed.yaml
 
 ### CLI Flag Warnings
 
-#### `--runtime` without `--orchestrator` (init command)
+#### `--runtime` and `--orchestrator` (init command)
 
-**Symptom:**
-```
-Warning: --runtime only affects the workflow execution step when --orchestrator is enabled.
-```
+The two flags act on different stages, and neither gates the other:
 
-**Cause:** `--runtime` (e.g., `--runtime codex`) was passed to `ouroboros init` without `--orchestrator`. The `--runtime` flag only controls which agent runtime backend is used when the generated seed is immediately handed off to workflow execution. Without `--orchestrator`, the workflow handoff step uses a placeholder.
+- `--runtime` selects the agent runtime for the workflow handoff — the execution
+  that starts when you accept "Start workflow now?". It applies whether or not
+  `--orchestrator` is passed.
+- `--orchestrator` selects Claude Code as the LLM backend for the *interview and
+  seed generation*, and is equivalent to `--llm-backend claude_code`.
 
-**Behavior:** This is a **warning only** — the interview and seed generation proceed normally. The runtime flag has no effect.
-
-**Fix:** Add `--orchestrator` if you want to use the specified runtime backend for the post-generation workflow step:
 ```bash
-ouroboros init start --orchestrator --runtime codex "Build a REST API"
+# Interview on the configured backend, execute the Seed with the Codex runtime
+ouroboros init start --runtime codex "Build a REST API"
 ```
+
+Earlier releases warned that `--runtime` had no effect without `--orchestrator`,
+because the handoff without that flag printed a placeholder instead of executing.
+The handoff now always runs, so the warning is gone.
 
 ---
 

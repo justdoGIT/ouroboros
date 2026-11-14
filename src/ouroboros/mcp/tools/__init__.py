@@ -8,6 +8,7 @@ Public API:
 """
 
 from ouroboros.mcp.tools.brownfield_handler import BrownfieldHandler
+from ouroboros.mcp.tools.conductor_handler import RecordConductorDecisionHandler
 from ouroboros.mcp.tools.definitions import (
     OUROBOROS_TOOLS,
     ACDashboardHandler,
@@ -26,10 +27,14 @@ from ouroboros.mcp.tools.definitions import (
     LateralThinkHandler,
     LineageStatusHandler,
     MeasureDriftHandler,
+    ProjectStatusHandler,
     QueryEventsHandler,
+    RalphHandler,
     SessionStatusHandler,
+    StartEvaluateHandler,
     StartEvolveStepHandler,
     StartExecuteSeedHandler,
+    StartRalphHandler,
     ac_tree_hud_handler,
     cancel_job_handler,
     evaluate_handler,
@@ -45,12 +50,17 @@ from ouroboros.mcp.tools.definitions import (
     lateral_think_handler,
     lineage_status_handler,
     measure_drift_handler,
+    project_status_handler,
     query_events_handler,
+    ralph_handler,
     session_status_handler,
+    start_evaluate_handler,
     start_evolve_step_handler,
     start_execute_seed_handler,
+    start_ralph_handler,
 )
 from ouroboros.mcp.tools.registry import ToolRegistry
+from ouroboros.mcp.tools.synapse_handler import SynapseSignalHandler, SynapseTargetsHandler
 
 __all__ = [
     "ACTreeHUDHandler",
@@ -71,11 +81,18 @@ __all__ = [
     "LineageStatusHandler",
     "MeasureDriftHandler",
     "OUROBOROS_TOOLS",
+    "ProjectStatusHandler",
     "QueryEventsHandler",
+    "RecordConductorDecisionHandler",
+    "RalphHandler",
+    "StartRalphHandler",
     "SessionStatusHandler",
+    "StartEvaluateHandler",
     "StartEvolveStepHandler",
     "StartExecuteSeedHandler",
     "ToolRegistry",
+    "SynapseSignalHandler",
+    "SynapseTargetsHandler",
     "ac_tree_hud_handler",
     "cancel_job_handler",
     "evaluate_handler",
@@ -91,8 +108,12 @@ __all__ = [
     "lateral_think_handler",
     "lineage_status_handler",
     "measure_drift_handler",
+    "project_status_handler",
     "query_events_handler",
+    "ralph_handler",
+    "start_ralph_handler",
     "session_status_handler",
+    "start_evaluate_handler",
     "start_evolve_step_handler",
     "start_execute_seed_handler",
 ]

@@ -8,9 +8,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from ouroboros.bigbang.interview import InterviewRound, InterviewState, InterviewStatus
 from ouroboros.config.models import RuntimeControlsConfig
 from ouroboros.core.errors import ConfigError
+from ouroboros.core.seed import Seed
 from ouroboros.core.types import Result
+from ouroboros.events.base import BaseEvent
 from ouroboros.mcp.tools.authoring_handlers import _is_interview_completion_signal
 from ouroboros.mcp.tools.brownfield_handler import BrownfieldHandler
 from ouroboros.mcp.tools.definitions import (
@@ -30,7 +33,9 @@ from ouroboros.mcp.tools.definitions import (
     LateralThinkHandler,
     LineageStatusHandler,
     MeasureDriftHandler,
+    ProjectionQueryHandler,
     QueryEventsHandler,
+    RalphHandler,
     SessionStatusHandler,
     StartEvolveStepHandler,
     StartExecuteSeedHandler,
@@ -41,6 +46,11 @@ from ouroboros.mcp.tools.definitions import (
     interview_handler,
     start_execute_seed_handler,
 )
+from ouroboros.mcp.tools.execution_handlers import (
+    _classify_synchronous_execution_status,
+    _pause_metadata_from_progress,
+)
+from ouroboros.mcp.tools.job_observer import extract_job_observer_inline_handoff
 from ouroboros.mcp.tools.pm_handler import PMInterviewHandler
 from ouroboros.mcp.tools.qa import QAHandler
 from ouroboros.mcp.types import ToolInputType
@@ -48,8 +58,9 @@ from ouroboros.orchestrator.adapter import (
     DELEGATED_PARENT_EFFECTIVE_TOOLS_ARG,
     DELEGATED_PARENT_SESSION_ID_ARG,
 )
-from ouroboros.orchestrator.session import SessionTracker
+from ouroboros.orchestrator.session import SessionStatus, SessionTracker
 from ouroboros.persistence.event_store import EventStore
+from ouroboros.persistence.schema import events_table
 from ouroboros.resilience.lateral import ThinkingPersona
 
 
@@ -62,6 +73,13 @@ async def memory_event_store() -> AsyncIterator[EventStore]:
         yield store
     finally:
         await store.close()
+
+
+async def _append_legacy_event_unchecked(store: EventStore, event: BaseEvent) -> None:
+    """Seed malformed legacy history that current public append guards reject."""
+    assert store._engine is not None
+    async with store._engine.begin() as conn:
+        await conn.execute(events_table.insert().values(**event.to_db_dict()))
 
 
 class TestExecuteSeedHandler:
@@ -99,6 +117,7 @@ class TestExecuteSeedHandler:
         assert "session_id" in param_names
         assert "model_tier" in param_names
         assert "max_iterations" in param_names
+        assert "auto_evaluate" in param_names
 
     def test_definition_excludes_internal_delegation_parameters(self) -> None:
         """Internal parent-session propagation must not change the public tool schema."""
@@ -115,6 +134,596 @@ class TestExecuteSeedHandler:
 
         assert result.is_err
         assert "seed_content or seed_path is required" in str(result.error)
+
+    async def test_handle_restores_fat_harness_mode_from_session_contract(
+        self,
+        memory_event_store: EventStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """MCP resume preserves the acceptance contract chosen at session creation."""
+        captured_modes: list[bool] = []
+        fresh_tracker = SessionTracker.create("exec_fresh", "seed-123")
+        gated_resume_tracker = SessionTracker.create("exec_resume", "seed-123").with_progress(
+            {"fat_harness_mode": True}
+        )
+        opted_out_resume_tracker = SessionTracker.create(
+            "exec_opted_out", "seed-123"
+        ).with_progress({"fat_harness_mode": False})
+        legacy_resume_tracker = SessionTracker.create("exec_legacy", "seed-123")
+        missing_contract_tracker = SessionTracker.create("exec_missing", "seed-123")
+
+        workspace = SimpleNamespace(
+            effective_cwd="/tmp/ouroboros-worktree",
+            worktree_path="/tmp/ouroboros-worktree",
+            branch="ooo/test",
+            lock_path="/tmp/ouroboros.lock",
+            lock_owner={},
+        )
+
+        class FakeSessionRepository:
+            def __init__(self, _event_store: EventStore) -> None:
+                pass
+
+            async def reconstruct_session(self, session_id: str) -> Result:
+                trackers = {
+                    "sess_resume": gated_resume_tracker,
+                    "sess_opted_out": opted_out_resume_tracker,
+                    "sess_legacy": legacy_resume_tracker,
+                    "sess_missing": missing_contract_tracker,
+                }
+                return Result.ok(trackers.get(session_id, fresh_tracker))
+
+            async def mark_failed(self, session_id: str, *, error_message: str) -> None:
+                raise AssertionError(f"unexpected failure mark for {session_id}: {error_message}")
+
+        class FakeRunner:
+            def __init__(self, *args: object, fat_harness_mode: bool, **kwargs: object) -> None:
+                captured_modes.append(fat_harness_mode)
+
+            def _has_live_process_local_authority(self, *args: object, **kwargs: object) -> bool:
+                return False
+
+            async def prepare_session(self, *args: object, **kwargs: object) -> Result:
+                return Result.ok(fresh_tracker)
+
+            async def execute_precreated_session(self, *args: object, **kwargs: object) -> Result:
+                return Result.ok(
+                    SimpleNamespace(
+                        success=True,
+                        execution_id="exec_fresh",
+                        summary={},
+                        final_message="done",
+                    )
+                )
+
+            async def resume_session(self, *args: object, **kwargs: object) -> Result:
+                return Result.ok(
+                    SimpleNamespace(
+                        success=True,
+                        execution_id="exec_resume",
+                        summary={},
+                        final_message="resumed",
+                    )
+                )
+
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.SessionRepository",
+            FakeSessionRepository,
+        )
+        monkeypatch.setattr("ouroboros.orchestrator.runner_factory.OrchestratorRunner", FakeRunner)
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.create_agent_runtime",
+            lambda **_kwargs: SimpleNamespace(runtime_backend="test"),
+        )
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.maybe_prepare_task_workspace",
+            lambda *_args, **_kwargs: workspace,
+        )
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.maybe_restore_task_workspace",
+            lambda *_args, **_kwargs: workspace,
+        )
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.release_lock", lambda *_args: None
+        )
+
+        handler = ExecuteSeedHandler(event_store=memory_event_store)
+
+        fresh = await handler.handle(
+            {"seed_content": VALID_SEED_YAML, "skip_qa": True},
+            synchronous=True,
+        )
+        legacy_fresh = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML.replace(
+                    "metadata:", "orchestrator:\n  execution_mode: legacy\nmetadata:", 1
+                ),
+                "skip_qa": True,
+            },
+            synchronous=True,
+        )
+        resumed = await handler.handle(
+            {"seed_content": VALID_SEED_YAML, "session_id": "sess_resume", "skip_qa": True},
+            synchronous=True,
+        )
+        opted_out_resumed = await handler.handle(
+            {"seed_content": VALID_SEED_YAML, "session_id": "sess_opted_out", "skip_qa": True},
+            synchronous=True,
+        )
+        legacy_resumed = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML.replace(
+                    "metadata:", "orchestrator:\n  execution_mode: legacy\nmetadata:", 1
+                ),
+                "session_id": "sess_legacy",
+                "skip_qa": True,
+            },
+            synchronous=True,
+        )
+        missing_contract_resumed = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML,
+                "session_id": "sess_missing",
+                "skip_qa": True,
+            },
+            synchronous=True,
+        )
+
+        assert fresh.is_ok
+        assert legacy_fresh.is_ok
+        assert resumed.is_ok
+        assert opted_out_resumed.is_ok
+        assert legacy_resumed.is_ok
+        assert missing_contract_resumed.is_ok
+        # Verify-by-default: fresh runs enforce fat-harness unless the seed
+        # opts out with execution_mode='legacy'; a persisted contract always
+        # wins on resume (True stays True, False stays False); resume without
+        # a persisted contract mirrors the fresh default.
+        assert captured_modes == [True, False, True, False, False, True]
+
+    @pytest.mark.parametrize("use_snapshot", [False, True])
+    @pytest.mark.parametrize(
+        "selected, expected, later",
+        [
+            ("adaptive", "adaptive", "quality_first"),
+            ("quality_first", "quality_first", "adaptive"),
+            (None, "adaptive", "quality_first"),
+        ],
+    )
+    async def test_handle_passes_execution_model_to_runtime(
+        self,
+        memory_event_store: EventStore,
+        monkeypatch: pytest.MonkeyPatch,
+        selected: str | None,
+        expected: str,
+        later: str,
+        use_snapshot: bool,
+    ) -> None:
+        """Execution handoff honors OUROBOROS_EXECUTION_MODEL for CLI runtimes."""
+        captured_runtime_kwargs: dict[str, object] = {}
+        captured_runner_kwargs: dict[str, object] = {}
+        tracker = SessionTracker.create("exec_model", "seed-123")
+        workspace = SimpleNamespace(
+            effective_cwd="/tmp/ouroboros-worktree",
+            worktree_path="/tmp/ouroboros-worktree",
+            branch="ooo/test",
+            lock_path="/tmp/ouroboros.lock",
+            lock_owner={},
+        )
+
+        class FakeSessionRepository:
+            def __init__(self, _event_store: EventStore) -> None:
+                pass
+
+            async def reconstruct_session(self, _session_id: str) -> Result:
+                return Result.ok(tracker)
+
+            async def mark_failed(self, session_id: str, *, error_message: str) -> None:
+                raise AssertionError(f"unexpected failure mark for {session_id}: {error_message}")
+
+        class FakeRunner:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                captured_runner_kwargs.update(kwargs)
+
+            def _has_live_process_local_authority(self, *args: object, **kwargs: object) -> bool:
+                return False
+
+            async def prepare_session(self, *args: object, **kwargs: object) -> Result:
+                return Result.ok(tracker)
+
+            async def execute_precreated_session(self, *args: object, **kwargs: object) -> Result:
+                return Result.ok(
+                    SimpleNamespace(
+                        success=True,
+                        execution_id="exec_model",
+                        summary={},
+                        final_message="done",
+                    )
+                )
+
+        def fake_create_agent_runtime(**kwargs: object) -> SimpleNamespace:
+            captured_runtime_kwargs.update(kwargs)
+            return SimpleNamespace(runtime_backend="pi")
+
+        monkeypatch.setenv("OUROBOROS_PIN_MODELS", "1")
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.default_execution_efficiency_mode",
+            lambda: selected,
+        )
+        import importlib
+
+        notice_module = importlib.import_module("ouroboros.config.policy_notice")
+        monkeypatch.setattr(notice_module, "default_execution_efficiency_mode", lambda: later)
+        monkeypatch.setenv("OUROBOROS_EXECUTION_MODEL", "openai-codex/gpt-5.4-mini")
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.SessionRepository",
+            FakeSessionRepository,
+        )
+        monkeypatch.setattr("ouroboros.orchestrator.runner_factory.OrchestratorRunner", FakeRunner)
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.create_agent_runtime",
+            fake_create_agent_runtime,
+        )
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.maybe_prepare_task_workspace",
+            lambda *_args, **_kwargs: workspace,
+        )
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.release_lock", lambda *_args: None
+        )
+
+        handler = ExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="pi",
+            llm_backend="claude_code",
+        )
+
+        snapshot = None
+        if use_snapshot:
+            from ouroboros.mcp.tools.execution_handlers import (
+                _resolve_execution_preferences_request,
+            )
+
+            snapshot = _resolve_execution_preferences_request({}, is_resume=False)
+            monkeypatch.setattr(
+                "ouroboros.mcp.tools.execution_handlers.default_execution_efficiency_mode",
+                lambda: later,
+            )
+        result = await handler.handle(
+            {"seed_content": VALID_SEED_YAML, "skip_qa": True},
+            synchronous=True,
+            _preference_snapshot=snapshot,
+        )
+
+        assert result.is_ok
+        assert captured_runner_kwargs["efficiency_mode"] == selected
+        assert f"Efficiency Mode: {expected}" in result.value.text_content
+        assert ("(default;" in result.value.text_content) == (expected == "quality_first")
+        assert captured_runtime_kwargs["backend"] == "pi"
+        assert captured_runtime_kwargs["model"] == "openai-codex/gpt-5.4-mini"
+        assert captured_runtime_kwargs["llm_backend"] == "claude_code"
+
+    async def test_handle_marks_completed_run_as_unverified_without_formal_evaluation(
+        self,
+        memory_event_store: EventStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A completed execute_seed run is not the same as 3-stage evaluation."""
+        running_tracker = SessionTracker.create(
+            "exec_verify",
+            "test-seed-123",
+            session_id="orch_verify",
+        )
+        completed_tracker = running_tracker.with_status(SessionStatus.COMPLETED)
+        workspace = SimpleNamespace(
+            effective_cwd="/tmp/ouroboros-worktree",
+            worktree_path="/tmp/ouroboros-worktree",
+            branch="ooo/test",
+            lock_path="/tmp/ouroboros.lock",
+            lock_owner={},
+        )
+
+        class FakeSessionRepository:
+            def __init__(self, _event_store: EventStore) -> None:
+                pass
+
+            async def reconstruct_session(self, session_id: str) -> Result:
+                assert session_id == "orch_verify"
+                return Result.ok(completed_tracker)
+
+            async def mark_failed(self, session_id: str, *, error_message: str) -> None:
+                raise AssertionError(f"unexpected failure mark for {session_id}: {error_message}")
+
+        class FakeRunner:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def _has_live_process_local_authority(self, *args: object, **kwargs: object) -> bool:
+                return False
+
+            async def prepare_session(self, *args: object, **kwargs: object) -> Result:
+                return Result.ok(running_tracker)
+
+            async def execute_precreated_session(self, *args: object, **kwargs: object) -> Result:
+                return Result.ok(
+                    SimpleNamespace(
+                        success=True,
+                        execution_id="exec_verify",
+                        summary={},
+                        final_message="done",
+                    )
+                )
+
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.SessionRepository",
+            FakeSessionRepository,
+        )
+        monkeypatch.setattr("ouroboros.orchestrator.runner_factory.OrchestratorRunner", FakeRunner)
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.create_agent_runtime",
+            lambda **_kwargs: SimpleNamespace(runtime_backend="test"),
+        )
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.maybe_prepare_task_workspace",
+            lambda *_args, **_kwargs: workspace,
+        )
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.release_lock", lambda *_args: None
+        )
+
+        handler = ExecuteSeedHandler(event_store=memory_event_store)
+
+        result = await handler.handle(
+            {"seed_content": VALID_SEED_YAML, "skip_qa": True},
+            execution_id="exec_verify",
+            session_id_override="orch_verify",
+            synchronous=True,
+        )
+
+        assert result.is_ok
+        assert result.value.is_error is False
+        assert result.value.meta["status"] == "completed"
+        assert result.value.meta["success"] is True
+        assert result.value.meta["evaluated"] is False
+        assert result.value.meta["verification_status"] == "executed_unverified"
+        assert result.value.meta["formal_evaluation_required"] is True
+        assert result.value.meta["next_step"] == "ooo evaluate orch_verify"
+        assert "Verification Status: executed_unverified" in result.value.text_content
+        assert "Formal Evaluation: NOT evaluated" in result.value.text_content
+        assert "Next: ooo evaluate orch_verify" in result.value.text_content
+
+    def test_fresh_execution_mode_gate_readmits_legacy_opt_out(self) -> None:
+        """Verify-by-default re-admits 'legacy' as the explicit opt-out.
+
+        #978 P5 removed 'legacy' while the default runner was observe-mode
+        (the token was redundant). With verify-by-default the opt-out token is
+        meaningful again, matching the CLI resolver vocabulary.
+        """
+        from ouroboros.mcp.tools.execution_handlers import (
+            _fresh_fat_harness_mode,
+            _validate_fresh_execution_mode,
+        )
+
+        for mode in (None, "", "fat_harness", "legacy"):
+            assert _validate_fresh_execution_mode(mode, tool_name="t").is_ok
+
+        assert _fresh_fat_harness_mode(None) is True
+        assert _fresh_fat_harness_mode("") is True
+        assert _fresh_fat_harness_mode("fat_harness") is True
+        assert _fresh_fat_harness_mode("legacy") is False
+
+    async def test_handle_plugin_marks_direct_delegation_unverified(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Direct plugin-dispatched execute_seed still reports formal evaluation state."""
+        handler = ExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+
+        result = await handler.handle({"seed_content": VALID_SEED_YAML})
+
+        assert result.is_ok
+        assert result.value.meta["status"] == "delegated_to_subagent"
+        assert result.value.meta["dispatch_mode"] == "plugin"
+        assert result.value.meta["evaluated"] is False
+        assert result.value.meta["verification_status"] == "evaluation_delegated"
+        assert result.value.meta["formal_evaluation_required"] is True
+        assert result.value.meta["evaluation_status"] == "delegated_to_plugin"
+        assert result.value.meta["formal_evaluation_delegated"] is True
+        assert result.value.meta["next_step"] == (
+            "wait for delegated plugin task to complete formal evaluation"
+        )
+        assert result.value.meta["manual_retry_next_step"].startswith("ooo evaluate orch_")
+
+    async def test_handle_plugin_accepts_legacy_opt_out_without_downgrade_note(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """An explicit legacy opt-out dispatches via plugin with no downgrade stamp."""
+        handler = ExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+        result = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML.replace(
+                    "metadata:", "orchestrator:\n  execution_mode: legacy\nmetadata:", 1
+                )
+            }
+        )
+
+        assert result.is_ok
+        assert result.value.meta["dispatch_mode"] == "plugin"
+        assert "fat_harness_downgraded" not in result.value.meta
+
+    async def test_handle_plugin_default_stamps_fat_harness_downgrade(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Verify-by-default would enable fat-harness; plugin dispatch cannot
+        enforce it, so the silent downgrade must be visible in the meta."""
+        handler = ExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+        result = await handler.handle({"seed_content": VALID_SEED_YAML})
+
+        assert result.is_ok
+        assert result.value.meta["dispatch_mode"] == "plugin"
+        assert result.value.meta["fat_harness_downgraded"] == "plugin_dispatch_cannot_enforce"
+
+    async def test_handle_plugin_rejects_fat_harness_execution_mode(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Plugin-dispatched execute_seed must not acknowledge unenforced fat-harness."""
+        handler = ExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+        result = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML.replace(
+                    "metadata:", "orchestrator:\n  execution_mode: fat_harness\nmetadata:", 1
+                )
+            }
+        )
+
+        assert result.is_err
+        assert "execution_mode='fat_harness' is not supported in OpenCode plugin dispatch" in str(
+            result.error
+        )
+
+    async def test_handle_plugin_rejects_fat_harness_resume_contract(
+        self,
+        memory_event_store: EventStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Plugin-dispatched execute_seed must not resume unenforceable fat-harness sessions."""
+        tracker = SessionTracker.create("exec_resume", "seed-123").with_progress(
+            {"fat_harness_mode": True}
+        )
+
+        class FakeSessionRepository:
+            def __init__(self, _event_store: EventStore) -> None:
+                pass
+
+            async def reconstruct_session(self, session_id: str) -> Result:
+                assert session_id == "sess_resume"
+                return Result.ok(tracker)
+
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.SessionRepository",
+            FakeSessionRepository,
+        )
+        handler = ExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+
+        result = await handler.handle(
+            {"seed_content": VALID_SEED_YAML, "session_id": "sess_resume"}
+        )
+
+        assert result.is_err
+        assert "cannot resume sessions created with fat_harness_mode=True" in str(result.error)
+
+    async def test_handle_plugin_rejects_fat_harness_resume_without_contract(
+        self,
+        memory_event_store: EventStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Plugin-dispatched execute_seed must not infer fat-harness from seed on resume."""
+        tracker = SessionTracker.create("exec_missing", "seed-123")
+
+        class FakeSessionRepository:
+            def __init__(self, _event_store: EventStore) -> None:
+                pass
+
+            async def reconstruct_session(self, session_id: str) -> Result:
+                assert session_id == "sess_missing"
+                return Result.ok(tracker)
+
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.SessionRepository",
+            FakeSessionRepository,
+        )
+        handler = ExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+
+        result = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML.replace(
+                    "metadata:", "orchestrator:\n  execution_mode: fat_harness\nmetadata:", 1
+                ),
+                "session_id": "sess_missing",
+            }
+        )
+
+        assert result.is_err
+        assert "without a persisted fat_harness_mode contract" in str(result.error)
+
+    async def test_handle_plugin_rejects_resume_without_execution_contract_restore(
+        self,
+        memory_event_store: EventStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A delegated child must not replace Seed/backend/workspace/model identity."""
+        tracker = SessionTracker.create("exec_resume", "seed-original").with_progress(
+            {"fat_harness_mode": False, "execution_contract": {"version": 1}}
+        )
+
+        class FakeSessionRepository:
+            def __init__(self, _event_store: EventStore) -> None:
+                pass
+
+            async def reconstruct_session(self, session_id: str) -> Result:
+                assert session_id == "sess_resume"
+                return Result.ok(tracker)
+
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.SessionRepository",
+            FakeSessionRepository,
+        )
+        handler = ExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+
+        result = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML.replace("Test Goal", "Completely Changed Goal"),
+                "session_id": "sess_resume",
+            }
+        )
+
+        assert result.is_err
+        assert "cannot safely resume an existing execute_seed session" in str(result.error)
+
+    async def test_handle_rejects_unknown_execution_mode(self) -> None:
+        """MCP execute_seed keeps execution_mode non-configurable like the CLI."""
+        handler = ExecuteSeedHandler()
+        result = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML.replace(
+                    "metadata:", "orchestrator:\n  execution_mode: nope\nmetadata:", 1
+                )
+            }
+        )
+
+        assert result.is_err
+        assert "execution_mode must be 'fat_harness' or 'legacy' when set" in str(result.error)
 
     async def test_handle_reports_execution_handler_config_error(self) -> None:
         """Config failures should surface with execution-handler context."""
@@ -161,6 +770,59 @@ class TestExecuteSeedHandler:
         handler = execute_seed_handler(runtime_backend="opencode", llm_backend="opencode")
         assert handler.agent_runtime_backend == "opencode"
         assert handler.llm_backend == "opencode"
+
+    def test_synchronous_paused_status_is_not_mcp_error(self) -> None:
+        """Paused executions are resumable and should not be failed tool results."""
+        status, success, is_error, header = _classify_synchronous_execution_status(
+            SessionStatus.PAUSED
+        )
+
+        assert status == "paused"
+        assert success is None
+        assert is_error is False
+        assert header == "Seed Execution PAUSED"
+
+    def test_pause_metadata_from_progress_exposes_resume_contract(self) -> None:
+        """Synchronous MCP paused results should carry resume timing metadata."""
+        metadata = _pause_metadata_from_progress(
+            {
+                "runtime_status": "paused",
+                "pause_kind": "usage_limit",
+                "pause_seconds": 5400,
+                "resume_after": "2026-01-01T01:30:00+00:00",
+                "resume_hint": "Resume after the quota window.",
+                "pause_reason": "Usage limit reached",
+                "unrelated": "ignored",
+            }
+        )
+
+        assert metadata == {
+            "pause_kind": "usage_limit",
+            "pause_seconds": 5400,
+            "resume_after": "2026-01-01T01:30:00+00:00",
+            "resume_hint": "Resume after the quota window.",
+            "pause_reason": "Usage limit reached",
+        }
+
+    def test_synchronous_failed_status_is_mcp_error(self) -> None:
+        """Failed executions still surface as failed tool results."""
+        status, success, is_error, header = _classify_synchronous_execution_status(
+            SessionStatus.FAILED
+        )
+
+        assert status == "failed"
+        assert success is False
+        assert is_error is True
+        assert header == "Seed Execution FINISHED"
+
+    def test_synchronous_unknown_status_is_mcp_error(self) -> None:
+        """Unknown synchronous outcomes should not hide reconstruction failures."""
+        status, success, is_error, header = _classify_synchronous_execution_status(None)
+
+        assert status == "unknown"
+        assert success is False
+        assert is_error is True
+        assert header == "Seed Execution FINISHED"
 
 
 class TestSessionStatusHandler:
@@ -229,6 +891,8 @@ class TestSessionStatusHandler:
 
         mock_event_store = AsyncMock()
         mock_event_store.initialize = AsyncMock()
+        mock_event_store.get_events_after = AsyncMock(return_value=([], 0))
+        mock_event_store.query_events = AsyncMock(return_value=[])
 
         handler = SessionStatusHandler(event_store=mock_event_store)
         handler._initialized = True
@@ -448,11 +1112,804 @@ class TestQueryEventsHandler:
         assert "exec_parallel_123_sub_ac_0_0" in text
 
 
+class TestProjectionQueryHandler:
+    """Test ProjectionQueryHandler class."""
+
+    def test_definition_name(self) -> None:
+        handler = ProjectionQueryHandler()
+        assert handler.definition.name == "ouroboros_query_projection"
+
+    def test_definition_has_read_only_query_parameters(self) -> None:
+        handler = ProjectionQueryHandler()
+        param_names = {p.name for p in handler.definition.parameters}
+        assert param_names == {"session_id", "execution_id", "seed_id", "limit"}
+        assert all(p.required is False for p in handler.definition.parameters)
+
+    async def test_handle_requires_session_or_execution_id(self) -> None:
+        handler = ProjectionQueryHandler()
+        result = await handler.handle({})
+
+        assert result.is_err
+        assert "session_id or execution_id is required" in str(result.error)
+
+    async def test_handle_rejects_empty_event_set(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        handler = ProjectionQueryHandler(event_store=memory_event_store)
+        result = await handler.handle({"execution_id": "exec_missing_projection"})
+
+        assert result.is_err
+        assert "No events found" in str(result.error)
+
+    async def test_handle_never_initializes_injected_store_with_schema_creation(self) -> None:
+        """Read-only projection queries must not create schema on shared stores."""
+        from datetime import UTC, datetime
+
+        from ouroboros.events.base import BaseEvent
+
+        class FakeEventStore:
+            create_schema_values: list[bool | None]
+
+            def __init__(self) -> None:
+                self.create_schema_values = []
+
+            async def initialize(self, *, create_schema: bool | None = None) -> None:
+                self.create_schema_values.append(create_schema)
+
+            async def query_execution_related_events(
+                self,
+                *,
+                execution_id: str,
+                limit: int | None = None,
+            ) -> list[BaseEvent]:
+                return [
+                    BaseEvent(
+                        id="evt_read_only_init",
+                        type="tool.call.started",
+                        timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+                        aggregate_type="execution",
+                        aggregate_id=execution_id,
+                        data={"call_id": "read_only", "tool_name": "Bash"},
+                    )
+                ]
+
+        store = FakeEventStore()
+        handler = ProjectionQueryHandler(event_store=store)  # type: ignore[arg-type]
+        result = await handler.handle({"execution_id": "exec_read_only_init"})
+
+        assert result.is_ok
+        assert store.create_schema_values == [False]
+
+    async def test_handle_projects_execution_events(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Execution aggregate queries expose machine-readable projection records."""
+        from datetime import UTC, datetime, timedelta
+
+        from ouroboros.events.base import BaseEvent
+
+        t0 = datetime(2026, 1, 1, tzinfo=UTC)
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_proj_start",
+                type="tool.call.started",
+                timestamp=t0,
+                aggregate_type="execution",
+                aggregate_id="exec_projection_123",
+                data={
+                    "call_id": "call_1",
+                    "tool_name": "Bash",
+                    "seed_id": "seed_projection_123",
+                    "goal": "Inspect projection",
+                    "args_preview": "pytest -q",
+                },
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_proj_return",
+                type="tool.call.returned",
+                timestamp=t0 + timedelta(milliseconds=10),
+                aggregate_type="execution",
+                aggregate_id="exec_projection_123",
+                data={
+                    "call_id": "call_1",
+                    "tool_name": "Bash",
+                    "is_error": False,
+                    "duration_ms": 10,
+                    "result_preview": "ok",
+                },
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_proj_artifact",
+                type="harness.artifact.recorded",
+                timestamp=t0 + timedelta(milliseconds=15),
+                aggregate_type="execution",
+                aggregate_id="exec_projection_123",
+                data={
+                    "call_id": "call_1",
+                    "artifact_id": "artifact_projection_123",
+                    "kind": "evidence",
+                    "path": "artifacts/projection.json",
+                },
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_proj_verdict",
+                type="harness.verdict.recorded",
+                timestamp=t0 + timedelta(milliseconds=18),
+                aggregate_type="execution",
+                aggregate_id="exec_projection_123",
+                data={
+                    "verdict_id": "verdict_projection_123",
+                    "scope": "run",
+                    "outcome": "pass",
+                    "evidence_artifact_ids": ["artifact_projection_123"],
+                },
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_proj_child",
+                type="tool.call.started",
+                timestamp=t0 + timedelta(milliseconds=20),
+                aggregate_type="execution",
+                aggregate_id="exec_projection_123_child_0",
+                data={
+                    "parent_execution_id": "exec_projection_123",
+                    "call_id": "call_child",
+                    "tool_name": "Read",
+                },
+            )
+        )
+
+        handler = ProjectionQueryHandler(event_store=memory_event_store)
+        result = await handler.handle({"execution_id": "exec_projection_123"})
+        second_result = await handler.handle({"execution_id": "exec_projection_123"})
+
+        assert result.is_ok
+        assert second_result.is_ok
+        assert "Run Projection" in result.value.text_content
+        assert result.value.meta["execution_id"] == "exec_projection_123"
+        assert result.value.meta["seed_id"] == "seed_projection_123"
+        assert result.value.meta["seed_id_source"] == "event"
+        assert result.value.meta["event_count"] == 5
+        assert "Artifacts: 1" in result.value.text_content
+        assert "Verdicts: 1" in result.value.text_content
+        assert result.value.meta["run"]["goal"] == "Inspect projection"
+        assert result.value.meta["run"]["verdict_id"] == "verdict_projection_123"
+        assert len(result.value.meta["stages"]) == 1
+        assert len(result.value.meta["steps"]) == 2
+        assert result.value.meta["artifacts"] == [
+            {
+                "schema_version": 1,
+                "artifact_id": "artifact_projection_123",
+                "step_id": result.value.meta["steps"][0]["step_id"],
+                "kind": "evidence",
+                "path": "artifacts/projection.json",
+                "media_type": None,
+                "size_bytes": None,
+                "digest": None,
+                "summary": "",
+                "metadata": {
+                    "source_event_id": "evt_proj_artifact",
+                    "event_type": "harness.artifact.recorded",
+                },
+            }
+        ]
+        assert result.value.meta["verdicts"][0]["verdict_id"] == "verdict_projection_123"
+        assert result.value.meta["verdicts"][0]["evidence_artifact_ids"] == [
+            "artifact_projection_123"
+        ]
+        step = result.value.meta["steps"][0]
+        assert step["kind"] == "shell_command"
+        assert step["ok"] is True
+        assert step["source_event_ids"] == ["evt_proj_start", "evt_proj_return"]
+        assert result.value.meta["steps"][1]["name"] == "Read"
+        assert result.value.meta["run"]["run_id"] == second_result.value.meta["run"]["run_id"]
+        assert (
+            result.value.meta["stages"][0]["stage_id"]
+            == second_result.value.meta["stages"][0]["stage_id"]
+        )
+        assert [step["step_id"] for step in result.value.meta["steps"]] == [
+            step["step_id"] for step in second_result.value.meta["steps"]
+        ]
+
+    async def test_handle_projects_session_related_events(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Session queries include execution events connected by execution_id."""
+        from datetime import UTC, datetime, timedelta
+
+        from ouroboros.events.base import BaseEvent
+
+        t0 = datetime(2026, 1, 1, tzinfo=UTC)
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_session_start",
+                type="orchestrator.session.started",
+                timestamp=t0,
+                aggregate_type="session",
+                aggregate_id="orch_projection_123",
+                data={
+                    "execution_id": "exec_projection_456",
+                    "seed_id": "seed_projection_456",
+                    "seed_goal": "Project session",
+                },
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_session_tool",
+                type="tool.call.started",
+                timestamp=t0,
+                aggregate_type="execution",
+                aggregate_id="exec_projection_456",
+                data={
+                    "execution_id": "exec_projection_456",
+                    "call_id": "call_session",
+                    "tool_name": "Read",
+                },
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_session_completed",
+                type="orchestrator.session.completed",
+                timestamp=t0 + timedelta(milliseconds=100),
+                aggregate_type="session",
+                aggregate_id="orch_projection_123",
+                data={"status": "completed"},
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_session_foreign",
+                type="tool.call.started",
+                aggregate_type="lineage",
+                aggregate_id="lineage_projection_456",
+                data={
+                    "session_id": "orch_projection_123",
+                    "execution_id": "exec_projection_456",
+                    "call_id": "foreign",
+                    "tool_name": "Bash",
+                },
+            )
+        )
+
+        handler = ProjectionQueryHandler(event_store=memory_event_store)
+        result = await handler.handle({"session_id": "orch_projection_123"})
+        second_result = await handler.handle({"session_id": "orch_projection_123"})
+
+        assert result.is_ok
+        assert second_result.is_ok
+        assert result.value.meta["session_id"] == "orch_projection_123"
+        assert result.value.meta["seed_id"] == "seed_projection_456"
+        assert result.value.meta["seed_id_source"] == "event"
+        assert result.value.meta["run"]["goal"] == "Project session"
+        assert result.value.meta["event_count"] == 3
+        assert result.value.meta["run"]["ended_at"] == "2026-01-01T00:00:00.100000Z"
+        assert result.value.meta["steps"][0]["name"] == "Read"
+        assert result.value.meta["run"]["run_id"] == second_result.value.meta["run"]["run_id"]
+        assert (
+            result.value.meta["stages"][0]["stage_id"]
+            == second_result.value.meta["stages"][0]["stage_id"]
+        )
+
+    async def test_handle_rejects_mismatched_session_execution(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Explicit execution_id must belong to the requested session."""
+        from ouroboros.events.base import BaseEvent
+
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_session_declares_a",
+                type="orchestrator.session.started",
+                aggregate_type="session",
+                aggregate_id="orch_projection_mismatch",
+                data={
+                    "execution_id": "exec_projection_a",
+                    "seed_id": "seed_projection_a",
+                },
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_unrelated_exec_b",
+                type="tool.call.started",
+                aggregate_type="execution",
+                aggregate_id="exec_projection_b",
+                data={"execution_id": "exec_projection_b", "call_id": "b", "tool_name": "Bash"},
+            )
+        )
+
+        handler = ProjectionQueryHandler(event_store=memory_event_store)
+        result = await handler.handle(
+            {
+                "session_id": "orch_projection_mismatch",
+                "execution_id": "exec_projection_b",
+            }
+        )
+
+        assert result.is_err
+        assert "does not belong" in str(result.error)
+
+    async def test_handle_narrows_session_metadata_to_requested_execution(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Combined selectors must not reuse older metadata from the same session."""
+        from ouroboros.events.base import BaseEvent
+
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_session_exec_a",
+                type="orchestrator.session.started",
+                aggregate_type="session",
+                aggregate_id="orch_projection_multi",
+                data={
+                    "execution_id": "exec_projection_a",
+                    "seed_id": "seed_projection_a",
+                    "seed_goal": "Older execution",
+                },
+            )
+        )
+        await _append_legacy_event_unchecked(
+            memory_event_store,
+            BaseEvent(
+                id="evt_session_exec_b",
+                type="orchestrator.session.started",
+                aggregate_type="session",
+                aggregate_id="orch_projection_multi",
+                data={
+                    "execution_id": "exec_projection_b",
+                    "seed_id": "seed_projection_b",
+                    "seed_goal": "Requested execution",
+                },
+            ),
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_exec_b_tool",
+                type="tool.call.started",
+                aggregate_type="execution",
+                aggregate_id="exec_projection_b",
+                data={
+                    "session_id": "orch_projection_multi",
+                    "execution_id": "exec_projection_b",
+                    "call_id": "b",
+                    "tool_name": "Bash",
+                },
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_exec_b_child",
+                type="tool.call.started",
+                aggregate_type="execution",
+                aggregate_id="exec_projection_b_child",
+                data={
+                    "parent_execution_id": "exec_projection_b",
+                    "call_id": "b_child",
+                    "tool_name": "Read",
+                },
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_exec_b_foreign",
+                type="tool.call.started",
+                aggregate_type="lineage",
+                aggregate_id="lineage_projection_b",
+                data={
+                    "execution_id": "exec_projection_b",
+                    "call_id": "b_foreign",
+                    "tool_name": "Write",
+                },
+            )
+        )
+
+        handler = ProjectionQueryHandler(event_store=memory_event_store)
+        result = await handler.handle(
+            {
+                "session_id": "orch_projection_multi",
+                "execution_id": "exec_projection_b",
+            }
+        )
+
+        assert result.is_ok
+        assert result.value.meta["seed_id"] == "seed_projection_b"
+        assert result.value.meta["seed_id_source"] == "event"
+        assert result.value.meta["run"]["goal"] == "Requested execution"
+        assert result.value.meta["event_count"] == 3
+        assert [step["name"] for step in result.value.meta["steps"]] == ["Bash", "Read"]
+
+    async def test_handle_rejects_session_only_reused_session(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Session-only queries must fail when a session declares multiple executions."""
+        from ouroboros.events.base import BaseEvent
+
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_reused_session_a",
+                type="orchestrator.session.started",
+                aggregate_type="session",
+                aggregate_id="orch_projection_reused",
+                data={"execution_id": "exec_reused_a", "seed_id": "seed_reused_a"},
+            )
+        )
+        await _append_legacy_event_unchecked(
+            memory_event_store,
+            BaseEvent(
+                id="evt_reused_session_b",
+                type="orchestrator.session.started",
+                aggregate_type="session",
+                aggregate_id="orch_projection_reused",
+                data={"execution_id": "exec_reused_b", "seed_id": "seed_reused_b"},
+            ),
+        )
+
+        handler = ProjectionQueryHandler(event_store=memory_event_store)
+        result = await handler.handle({"session_id": "orch_projection_reused"})
+
+        assert result.is_err
+        assert "declares multiple executions" in str(result.error)
+
+    async def test_handle_rejects_metadata_less_session_only_multi_execution_payloads(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Session-only queries must fail closed when payloads imply multiple runs."""
+        from ouroboros.events.base import BaseEvent
+
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_payload_exec_a",
+                type="tool.call.started",
+                aggregate_type="execution",
+                aggregate_id="exec_payload_a",
+                data={
+                    "session_id": "orch_projection_payload_only",
+                    "execution_id": "exec_payload_a",
+                    "call_id": "payload_a",
+                    "tool_name": "Bash",
+                },
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_payload_exec_b",
+                type="tool.call.started",
+                aggregate_type="execution",
+                aggregate_id="exec_payload_b",
+                data={
+                    "session_id": "orch_projection_payload_only",
+                    "execution_id": "exec_payload_b",
+                    "call_id": "payload_b",
+                    "tool_name": "Read",
+                },
+            )
+        )
+
+        handler = ProjectionQueryHandler(event_store=memory_event_store)
+        result = await handler.handle({"session_id": "orch_projection_payload_only"})
+
+        assert result.is_err
+        assert "references multiple executions" in str(result.error)
+
+    async def test_handle_ignores_foreign_payload_execution_candidates(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Foreign aggregates must not establish session execution membership."""
+        from ouroboros.events.base import BaseEvent
+
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_payload_real_exec",
+                type="tool.call.started",
+                aggregate_type="execution",
+                aggregate_id="exec_payload_real",
+                data={
+                    "session_id": "orch_projection_foreign_payload",
+                    "execution_id": "exec_payload_real",
+                    "call_id": "payload_real",
+                    "tool_name": "Bash",
+                },
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_payload_foreign_exec",
+                type="tool.call.started",
+                aggregate_type="lineage",
+                aggregate_id="lineage_payload_foreign",
+                data={
+                    "session_id": "orch_projection_foreign_payload",
+                    "execution_id": "exec_payload_foreign",
+                    "call_id": "payload_foreign",
+                    "tool_name": "Read",
+                },
+            )
+        )
+
+        handler = ProjectionQueryHandler(event_store=memory_event_store)
+        result = await handler.handle({"session_id": "orch_projection_foreign_payload"})
+
+        assert result.is_ok
+        assert result.value.meta["event_count"] == 1
+        assert result.value.meta["seed_id"] == "orch_projection_foreign_payload"
+        assert result.value.meta["seed_id_source"] == "fallback"
+        assert [step["name"] for step in result.value.meta["steps"]] == ["Bash"]
+
+    async def test_handle_rejects_foreign_only_payload_session_query(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Session-only projections must not project foreign payload-only aggregates."""
+        from ouroboros.events.base import BaseEvent
+
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_payload_foreign_only_session",
+                type="tool.call.started",
+                aggregate_type="lineage",
+                aggregate_id="lineage_payload_foreign_only_session",
+                data={
+                    "session_id": "orch_projection_foreign_only_session",
+                    "execution_id": "exec_payload_foreign_only_session",
+                    "call_id": "payload_foreign_only_session",
+                    "tool_name": "Read",
+                },
+            )
+        )
+
+        handler = ProjectionQueryHandler(event_store=memory_event_store)
+        result = await handler.handle({"session_id": "orch_projection_foreign_only_session"})
+
+        assert result.is_err
+        assert "No events found" in str(result.error)
+
+    async def test_handle_rejects_foreign_only_payload_session_execution(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Explicit session/execution selectors cannot be proven by foreign aggregates."""
+        from ouroboros.events.base import BaseEvent
+
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_payload_foreign_only_exec",
+                type="tool.call.started",
+                aggregate_type="lineage",
+                aggregate_id="lineage_payload_foreign_only",
+                data={
+                    "session_id": "orch_projection_foreign_only",
+                    "execution_id": "exec_payload_foreign_only",
+                    "call_id": "payload_foreign_only",
+                    "tool_name": "Read",
+                },
+            )
+        )
+
+        handler = ProjectionQueryHandler(event_store=memory_event_store)
+        result = await handler.handle(
+            {
+                "session_id": "orch_projection_foreign_only",
+                "execution_id": "exec_payload_foreign_only",
+            }
+        )
+
+        assert result.is_err
+        assert "does not belong" in str(result.error)
+
+    async def test_handle_disambiguates_metadata_less_session_with_execution_id(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Explicit execution_id can disambiguate payload-only session links."""
+        from ouroboros.events.base import BaseEvent
+
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_payload_exec_a",
+                type="tool.call.started",
+                aggregate_type="execution",
+                aggregate_id="exec_payload_a",
+                data={
+                    "session_id": "orch_projection_payload_multi",
+                    "execution_id": "exec_payload_a",
+                    "call_id": "payload_a",
+                    "tool_name": "Bash",
+                },
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_payload_exec_b",
+                type="tool.call.started",
+                aggregate_type="execution",
+                aggregate_id="exec_payload_b",
+                data={
+                    "session_id": "orch_projection_payload_multi",
+                    "execution_id": "exec_payload_b",
+                    "call_id": "payload_b",
+                    "tool_name": "Read",
+                },
+            )
+        )
+
+        handler = ProjectionQueryHandler(event_store=memory_event_store)
+        result = await handler.handle(
+            {
+                "session_id": "orch_projection_payload_multi",
+                "execution_id": "exec_payload_a",
+            }
+        )
+
+        assert result.is_ok
+        assert result.value.meta["event_count"] == 1
+        assert result.value.meta["seed_id"] == "exec_payload_a"
+        assert result.value.meta["seed_id_source"] == "fallback"
+        assert [step["name"] for step in result.value.meta["steps"]] == ["Bash"]
+
+    async def test_handle_narrows_metadata_less_session_only_single_execution_payload(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """A metadata-less session projection may use one payload execution candidate."""
+        from datetime import UTC, datetime, timedelta
+
+        from ouroboros.events.base import BaseEvent
+
+        t0 = datetime(2026, 1, 1, tzinfo=UTC)
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_payload_session_metadata",
+                type="orchestrator.session.started",
+                timestamp=t0,
+                aggregate_type="session",
+                aggregate_id="orch_projection_payload_single",
+                data={
+                    "seed_id": "seed_payload_single",
+                    "seed_goal": "Project metadata-less session",
+                },
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_payload_single",
+                type="tool.call.started",
+                timestamp=t0 + timedelta(milliseconds=10),
+                aggregate_type="execution",
+                aggregate_id="exec_payload_single",
+                data={
+                    "session_id": "orch_projection_payload_single",
+                    "execution_id": "exec_payload_single",
+                    "call_id": "payload_single",
+                    "tool_name": "Bash",
+                },
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_payload_child",
+                type="tool.call.started",
+                timestamp=t0 + timedelta(milliseconds=20),
+                aggregate_type="execution",
+                aggregate_id="exec_payload_single_child",
+                data={
+                    "parent_execution_id": "exec_payload_single",
+                    "call_id": "payload_child",
+                    "tool_name": "Read",
+                },
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_payload_foreign_family",
+                type="tool.call.started",
+                timestamp=t0 + timedelta(milliseconds=30),
+                aggregate_type="lineage",
+                aggregate_id="lineage_payload_single",
+                data={
+                    "session_id": "orch_projection_payload_single",
+                    "execution_id": "exec_payload_single",
+                    "call_id": "payload_foreign",
+                    "tool_name": "Read",
+                },
+            )
+        )
+
+        handler = ProjectionQueryHandler(event_store=memory_event_store)
+        result = await handler.handle({"session_id": "orch_projection_payload_single"})
+
+        assert result.is_ok
+        assert result.value.meta["event_count"] == 3
+        assert result.value.meta["seed_id"] == "seed_payload_single"
+        assert result.value.meta["seed_id_source"] == "event"
+        assert result.value.meta["run"]["goal"] == "Project metadata-less session"
+        assert result.value.meta["run"]["started_at"] == "2026-01-01T00:00:00Z"
+        assert [step["name"] for step in result.value.meta["steps"]] == ["Bash", "Read"]
+
+    async def test_handle_records_argument_seed_id_provenance(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Caller-provided seed IDs remain visible as argument-sourced labels."""
+        from ouroboros.events.base import BaseEvent
+
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_seed_argument",
+                type="tool.call.started",
+                aggregate_type="execution",
+                aggregate_id="exec_seed_argument",
+                data={"call_id": "seed_argument", "tool_name": "Bash"},
+            )
+        )
+
+        handler = ProjectionQueryHandler(event_store=memory_event_store)
+        result = await handler.handle(
+            {
+                "execution_id": "exec_seed_argument",
+                "seed_id": "seed_from_argument",
+            }
+        )
+
+        assert result.is_ok
+        assert result.value.meta["seed_id"] == "seed_from_argument"
+        assert result.value.meta["seed_id_source"] == "argument"
+
+    async def test_handle_limit_is_fail_closed_safety_cap(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Projection queries reject caps that would create partial projections."""
+        from ouroboros.events.base import BaseEvent
+
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_cap_1",
+                type="tool.call.started",
+                aggregate_type="execution",
+                aggregate_id="exec_projection_cap",
+                data={"call_id": "cap_1", "tool_name": "Bash"},
+            )
+        )
+        await memory_event_store.append(
+            BaseEvent(
+                id="evt_cap_2",
+                type="tool.call.returned",
+                aggregate_type="execution",
+                aggregate_id="exec_projection_cap",
+                data={"call_id": "cap_1", "tool_name": "Bash", "is_error": False},
+            )
+        )
+
+        handler = ProjectionQueryHandler(event_store=memory_event_store)
+        result = await handler.handle({"execution_id": "exec_projection_cap", "limit": 1})
+
+        assert result.is_err
+        assert "exceeds limit 1" in str(result.error)
+
+
 class TestOuroborosTools:
     """Test OUROBOROS_TOOLS constant."""
 
     EXPECTED_OUROBOROS_TOOL_NAMES = {
         "ouroboros_ac_tree_hud",
+        "ouroboros_auto",
         "ouroboros_brownfield",
         "ouroboros_cancel_execution",
         "ouroboros_cancel_job",
@@ -461,6 +1918,7 @@ class TestOuroborosTools:
         "ouroboros_evolve_rewind",
         "ouroboros_evolve_step",
         "ouroboros_execute_seed",
+        "ouroboros_fetch_artifact",
         "ouroboros_generate_seed",
         "ouroboros_interview",
         "ouroboros_job_result",
@@ -470,11 +1928,18 @@ class TestOuroborosTools:
         "ouroboros_lineage_status",
         "ouroboros_measure_drift",
         "ouroboros_pm_interview",
+        "ouroboros_project_status",
         "ouroboros_qa",
+        "ouroboros_query_projection",
         "ouroboros_query_events",
+        "ouroboros_ralph",
         "ouroboros_session_status",
+        "ouroboros_start_auto",
+        "ouroboros_start_evaluate",
         "ouroboros_start_evolve_step",
         "ouroboros_start_execute_seed",
+        "ouroboros_start_ralph",
+        "ouroboros_submit_fanout_results",
     }
 
     def test_ouroboros_tools_contains_all_handlers(self) -> None:
@@ -494,6 +1959,7 @@ class TestOuroborosTools:
         assert JobResultHandler in handler_types
         assert CancelJobHandler in handler_types
         assert QueryEventsHandler in handler_types
+        assert ProjectionQueryHandler in handler_types
         assert GenerateSeedHandler in handler_types
         assert MeasureDriftHandler in handler_types
         assert InterviewHandler in handler_types
@@ -508,6 +1974,10 @@ class TestOuroborosTools:
         assert BrownfieldHandler in handler_types
         assert PMInterviewHandler in handler_types
         assert QAHandler in handler_types
+        assert RalphHandler in handler_types
+        from ouroboros.mcp.tools.ralph_handlers import StartRalphHandler
+
+        assert StartRalphHandler in handler_types
 
     def test_all_tools_have_unique_names(self) -> None:
         """All tools have unique names."""
@@ -523,9 +1993,38 @@ class TestOuroborosTools:
     def test_get_ouroboros_tools_can_inject_runtime_backend(self) -> None:
         """Tool factory can build execute_seed with a specific runtime backend."""
         tools = get_ouroboros_tools(runtime_backend="codex")
-        assert {h.definition.name for h in tools} == self.EXPECTED_OUROBOROS_TOOL_NAMES
+        assert {h.definition.name for h in tools} == self.EXPECTED_OUROBOROS_TOOL_NAMES | {
+            "ouroboros_auto"
+        }
         execute_handler = next(h for h in tools if isinstance(h, ExecuteSeedHandler))
         assert execute_handler.agent_runtime_backend == "codex"
+
+    def test_get_ouroboros_tools_uses_explicit_runtime_project_for_artifacts(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Disposable bodies belong to the runtime workspace, not launcher CWD."""
+        launcher = tmp_path / "launcher"
+        project = tmp_path / "runtime-project"
+        launcher.mkdir()
+        project.mkdir()
+        monkeypatch.chdir(launcher)
+
+        tools = get_ouroboros_tools(runtime_backend="codex", project_dir=project)
+        submit = next(
+            handler
+            for handler in tools
+            if handler.definition.name == "ouroboros_submit_fanout_results"
+        )
+
+        assert submit.disposable_memory is not None
+        assert submit.disposable_memory.artifact_store.root == (
+            project.resolve() / ".ouroboros" / "artifacts"
+        )
+        assert submit.disposable_memory.artifact_store.root != (
+            launcher.resolve() / ".ouroboros" / "artifacts"
+        )
 
     def test_get_ouroboros_tools_can_inject_llm_backend(self) -> None:
         """Tool factory propagates llm backend to LLM-only handlers."""
@@ -566,6 +2065,76 @@ class TestAsyncJobHandlers:
         assert "ouroboros_ac_tree_hud" in handler.definition.description
         assert "ouroboros_job_wait" not in handler.definition.description
 
+
+class TestEntryToolRoutingContracts:
+    """Entry-tool descriptions carry Use when / Result / Do not use when routing.
+
+    The activation contract (HANDOFF: MCP-active users → product usage): a host
+    model reading only these descriptions must route an ambiguous request to
+    interview, a substantial end-to-end request to start_auto, and a
+    Seed-provided request to start_execute_seed — without the literal `ooo`.
+    """
+
+    @staticmethod
+    def _start_auto_description() -> str:
+        from ouroboros.mcp.tools.auto_handler import StartAutoHandler
+
+        return StartAutoHandler().definition.description
+
+    def test_interview_description_routes_ambiguous_requests(self) -> None:
+        description = InterviewHandler().definition.description
+        assert "Use when" in description
+        assert "Result" in description
+        assert "Do not use when" in description
+        # Ambiguous / no-AC requests route here, before implementation.
+        assert "ambiguous" in description
+        assert "acceptance criteria" in description
+        assert "before any" in description
+        # Not gated on the literal `ooo` syntax.
+        assert "'ooo'" in description
+        # Seed-provided requests are routed away, and trivial work is excluded.
+        assert "ouroboros_start_execute_seed" in description
+        assert "simple" in description
+
+    def test_start_auto_description_routes_end_to_end_requests(self) -> None:
+        description = self._start_auto_description()
+        assert "Use when" in description
+        assert "Result" in description
+        assert "Do not use when" in description
+        # Substantial end-to-end work routes here.
+        assert "end-to-end" in description
+        assert "migrations" in description
+        # The product contract stays visible: interview → Seed → execution.
+        assert "interview" in description
+        assert "Seed" in description
+        # Trivial work and Seed-provided requests are routed away.
+        assert "simple question" in description
+        assert "ouroboros_start_execute_seed" in description
+
+    def test_lateral_think_description_triggers_proactively_on_stagnation(self) -> None:
+        description = LateralThinkHandler().definition.description
+        assert "Use when" in description
+        assert "Result" in description
+        assert "Do not use when" in description
+        # Stagnation signals trigger the call proactively, not on the literal
+        # 'lateral'/'unstuck' keywords alone.
+        assert "stuck" in description
+        assert "proactively" in description
+        assert "do not wait for the user" in description
+        # But not when work is progressing normally.
+        assert "progressing normally" in description
+
+    def test_start_execute_seed_description_requires_existing_seed(self) -> None:
+        description = StartExecuteSeedHandler().definition.description
+        assert "Use when" in description
+        assert "Result" in description
+        assert "Do not use when" in description
+        # Only Seed-provided requests route here; raw requests go to the
+        # clarification entry points instead.
+        assert "already exists" in description
+        assert "ouroboros_interview" in description
+        assert "ouroboros_start_auto" in description
+
     async def test_start_execute_seed_background_generates_ids_without_session(
         self,
     ) -> None:
@@ -576,10 +2145,13 @@ class TestAsyncJobHandlers:
                 return None
 
         class FakeJobManager:
-            async def start_job(self, *, job_type, initial_message, runner, links):
+            async def allocate_job_id(self):
+                return "job_test"
+
+            async def start_job(self, *, job_type, initial_message, runner, links, job_id=None):
                 runner.close()
                 return SimpleNamespace(
-                    job_id="job_test",
+                    job_id=job_id or "job_test",
                     links=links,
                     status=SimpleNamespace(value="queued"),
                     cursor=1,
@@ -601,6 +2173,323 @@ class TestAsyncJobHandlers:
         assert result.is_ok
         assert result.value.meta["execution_id"].startswith("exec_")
         assert result.value.meta["session_id"].startswith("orch_")
+        assert result.value.meta["evaluated"] is False
+        assert result.value.meta["verification_status"] == "executed_unverified"
+        assert result.value.meta["formal_evaluation_required"] is True
+        assert result.value.meta["next_step"].startswith("ooo evaluate orch_")
+        observer = result.value.meta["job_observer"]
+        assert observer["recommended_host_action"] == "spawn_observer_session"
+        assert observer["ownership"] == "exclusive"
+        assert observer["job_id"] == "job_test"
+        assert observer["session_id"] == result.value.meta["session_id"]
+        assert observer["execution_id"] == result.value.meta["execution_id"]
+        assert observer["wait"]["arguments"]["stream"] == "linked"
+        assert observer["wait"]["arguments"]["wait_for"] == "attention_or_ac_change"
+        assert observer["relay"]["mode"] == "event_driven"
+        assert observer["parent_session"]["availability"] == "available_after_handoff"
+        assert observer["host_lifecycle"]["codex_parent_relay"]["wait_tool"] == "wait_agent"
+        assert observer["follow_result_job_keys"] == [
+            "chained_evaluate_job_id",
+            "chained_ralph_job_id",
+        ]
+        assert (
+            extract_job_observer_inline_handoff(
+                result.value.text_content,
+                expected_job_id=observer["job_id"],
+                expected_session_id=observer["session_id"],
+                expected_execution_id=observer["execution_id"],
+            )
+            == observer
+        )
+        assert "Verification Status: executed_unverified" in result.value.text_content
+        assert "Formal Evaluation: NOT evaluated" in result.value.text_content
+        assert "Next: ooo evaluate orch_" in result.value.text_content
+
+    async def test_start_execute_seed_resume_reports_persisted_execution_preferences(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Resume acknowledgement must not replace quality-first with fresh defaults."""
+
+        class FakeEventStore:
+            async def initialize(self) -> None:
+                return None
+
+            # The resume reads the run's check package mode from the journal
+            # before the receipt; this run has none (it was off).
+            async def replay(self, *_args: object, **_kwargs: object) -> list[object]:
+                return []
+
+            async def query_events(self, *_args: object, **_kwargs: object) -> list[object]:
+                return []
+
+        class FakeJobManager:
+            async def allocate_job_id(self):
+                return "job_resume_preferences"
+
+            async def start_job(self, *, job_type, initial_message, runner, links, job_id=None):
+                runner.close()
+                return SimpleNamespace(
+                    job_id=job_id or "job_resume_preferences",
+                    links=links,
+                    status=SimpleNamespace(value="queued"),
+                    cursor=1,
+                )
+
+        tracker = SessionTracker.create(
+            "exec_resume_preferences",
+            "seed-resume-preferences",
+            session_id="orch_resume_preferences",
+        ).with_progress(
+            {
+                "execution_contract": {
+                    "execution_preferences": {
+                        "efficiency_mode": "quality_first",
+                        "frugality_assurance": "off",
+                        "frugality_assurance_explicit": False,
+                    }
+                }
+            }
+        )
+        reconstruction_calls = 0
+
+        class FakeSessionRepository:
+            def __init__(self, _event_store) -> None:
+                pass
+
+            async def reconstruct_session(self, session_id: str) -> Result:
+                nonlocal reconstruction_calls
+                reconstruction_calls += 1
+                assert session_id == "orch_resume_preferences"
+                return Result.ok(tracker)
+
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.SessionRepository",
+            FakeSessionRepository,
+        )
+        execute_handler = MagicMock()
+        execute_handler.agent_runtime_backend = None
+        execute_handler.llm_backend = None
+        handler = StartExecuteSeedHandler(
+            execute_handler=execute_handler,
+            event_store=FakeEventStore(),
+            job_manager=FakeJobManager(),
+            agent_runtime_backend="codex",
+            opencode_mode=None,
+        )
+
+        result = await handler.handle(
+            {
+                "seed_content": "goal: test",
+                "session_id": "orch_resume_preferences",
+            }
+        )
+
+        assert result.is_ok
+        assert reconstruction_calls == 1
+        assert result.value.meta["execution_id"] == "exec_resume_preferences"
+        assert result.value.meta["efficiency_mode"] == "quality_first"
+        assert result.value.meta["frugality_assurance"] == "off"
+        assert "Efficiency Mode: quality_first\n" in result.value.text_content
+        assert "Frugality Assurance: off" in result.value.text_content
+
+    async def test_start_execute_seed_plugin_marks_delegation_unverified(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Plugin-dispatched execute runs are delegated but still not formally evaluated."""
+        handler = StartExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+
+        result = await handler.handle({"seed_content": VALID_SEED_YAML})
+
+        assert result.is_ok
+        assert result.value.meta["job_id"] is None
+        assert result.value.meta["status"] == "delegated_to_plugin"
+        assert result.value.meta["evaluated"] is False
+        assert result.value.meta["verification_status"] == "evaluation_delegated"
+        assert result.value.meta["formal_evaluation_required"] is True
+        assert result.value.meta["evaluation_status"] == "delegated_to_plugin"
+        assert result.value.meta["formal_evaluation_delegated"] is True
+        assert result.value.meta["next_step"] == (
+            "wait for delegated plugin task to complete formal evaluation"
+        )
+        assert result.value.meta["manual_retry_next_step"].startswith("ooo evaluate orch_")
+
+    async def test_start_execute_seed_plugin_accepts_legacy_opt_out(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """An explicit legacy opt-out dispatches via plugin with no downgrade stamp."""
+        handler = StartExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+
+        result = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML.replace(
+                    "metadata:", "orchestrator:\n  execution_mode: legacy\nmetadata:", 1
+                )
+            }
+        )
+
+        assert result.is_ok
+        assert result.value.meta["dispatch_mode"] == "plugin"
+        assert "fat_harness_downgraded" not in result.value.meta
+
+    async def test_start_execute_seed_plugin_default_stamps_fat_harness_downgrade(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """The default-ON fat-harness downgrade is visible on start_execute_seed too."""
+        handler = StartExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+
+        result = await handler.handle({"seed_content": VALID_SEED_YAML})
+
+        assert result.is_ok
+        assert result.value.meta["dispatch_mode"] == "plugin"
+        assert result.value.meta["fat_harness_downgraded"] == "plugin_dispatch_cannot_enforce"
+
+    async def test_start_execute_seed_plugin_rejects_fat_harness_execution_mode(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """Plugin-dispatched start_execute_seed cannot enforce fat-harness acceptance."""
+        handler = StartExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+
+        result = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML.replace(
+                    "metadata:", "orchestrator:\n  execution_mode: fat_harness\nmetadata:", 1
+                )
+            }
+        )
+
+        assert result.is_err
+        assert "execution_mode='fat_harness' is not supported in OpenCode plugin dispatch" in str(
+            result.error
+        )
+
+    async def test_start_execute_seed_plugin_rejects_fat_harness_resume_contract(
+        self,
+        memory_event_store: EventStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Plugin-dispatched start_execute_seed must not resume unenforceable fat-harness sessions."""
+        tracker = SessionTracker.create("exec_resume", "seed-123").with_progress(
+            {"fat_harness_mode": True}
+        )
+
+        class FakeSessionRepository:
+            def __init__(self, _event_store: EventStore) -> None:
+                pass
+
+            async def reconstruct_session(self, session_id: str) -> Result:
+                assert session_id == "sess_resume"
+                return Result.ok(tracker)
+
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.SessionRepository",
+            FakeSessionRepository,
+        )
+        handler = StartExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+
+        result = await handler.handle(
+            {"seed_content": VALID_SEED_YAML, "session_id": "sess_resume"}
+        )
+
+        assert result.is_err
+        assert "cannot resume sessions created with fat_harness_mode=True" in str(result.error)
+
+    async def test_start_execute_seed_plugin_rejects_fat_harness_resume_without_contract(
+        self,
+        memory_event_store: EventStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Plugin-dispatched start_execute_seed must not infer fat-harness on resume."""
+        tracker = SessionTracker.create("exec_missing", "seed-123")
+
+        class FakeSessionRepository:
+            def __init__(self, _event_store: EventStore) -> None:
+                pass
+
+            async def reconstruct_session(self, session_id: str) -> Result:
+                assert session_id == "sess_missing"
+                return Result.ok(tracker)
+
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.SessionRepository",
+            FakeSessionRepository,
+        )
+        handler = StartExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+
+        result = await handler.handle(
+            {
+                "seed_content": VALID_SEED_YAML.replace(
+                    "metadata:", "orchestrator:\n  execution_mode: fat_harness\nmetadata:", 1
+                ),
+                "session_id": "sess_missing",
+            }
+        )
+
+        assert result.is_err
+        assert "without a persisted fat_harness_mode contract" in str(result.error)
+
+    async def test_start_execute_seed_plugin_rejects_resume_without_contract_restore(
+        self,
+        memory_event_store: EventStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """start_execute_seed must apply the same fail-closed plugin resume policy."""
+        tracker = SessionTracker.create("exec_resume", "seed-original").with_progress(
+            {"fat_harness_mode": False}
+        )
+
+        class FakeSessionRepository:
+            def __init__(self, _event_store: EventStore) -> None:
+                pass
+
+            async def reconstruct_session(self, session_id: str) -> Result:
+                assert session_id == "sess_resume"
+                return Result.ok(tracker)
+
+        monkeypatch.setattr(
+            "ouroboros.mcp.tools.execution_handlers.SessionRepository",
+            FakeSessionRepository,
+        )
+        handler = StartExecuteSeedHandler(
+            event_store=memory_event_store,
+            agent_runtime_backend="opencode",
+            opencode_mode="plugin",
+        )
+
+        result = await handler.handle(
+            {"seed_content": VALID_SEED_YAML, "session_id": "sess_resume"}
+        )
+
+        assert result.is_err
+        assert "cannot safely resume an existing execute_seed session" in str(result.error)
 
     def test_job_status_definition_name(self) -> None:
         handler = JobStatusHandler()
@@ -614,8 +2503,18 @@ class TestAsyncJobHandlers:
         handler = JobWaitHandler()
         params = {p.name: p for p in handler.definition.parameters}
         param_names = set(params)
-        assert param_names == {"job_id", "cursor", "timeout_seconds", "view"}
+        assert param_names == {
+            "job_id",
+            "cursor",
+            "timeout_seconds",
+            "view",
+            "stream",
+            "wait_for",
+        }
         assert params["view"].default == "full"
+        assert params["stream"].default == "progress"
+        assert params["wait_for"].default == "raw"
+        assert params["timeout_seconds"].default == 0
 
     def test_job_result_definition_name(self) -> None:
         handler = JobResultHandler()
@@ -635,6 +2534,76 @@ class TestAsyncJobHandlers:
     def test_start_evolve_step_definition_name(self) -> None:
         handler = StartEvolveStepHandler()
         assert handler.definition.name == "ouroboros_start_evolve_step"
+
+    async def test_start_evolve_step_exposes_generation_execution_id(
+        self,
+        memory_event_store: EventStore,
+    ) -> None:
+        """The start receipt, durable job link, and observer share one generation ID."""
+
+        class FakeJobManager:
+            async def allocate_job_id(self) -> str:
+                return "job_evolve"
+
+            async def start_job(self, *, job_type, initial_message, runner, links, job_id=None):
+                runner.close()
+                return SimpleNamespace(
+                    job_id=job_id or "job_evolve",
+                    links=links,
+                    status=SimpleNamespace(value="queued"),
+                    cursor=1,
+                )
+
+        handler = StartEvolveStepHandler(
+            event_store=memory_event_store,
+            job_manager=FakeJobManager(),  # type: ignore[arg-type]
+            agent_runtime_backend="codex",
+        )
+
+        result = await handler.handle({"lineage_id": "lin_signal", "execute": True})
+
+        assert result.is_ok
+        expected = "evolve:lin_signal:generation:1"
+        assert result.value.meta["execution_id"] == expected
+        assert result.value.structured_content["execution_id"] == expected
+        assert result.value.meta["job_observer"]["execution_id"] == expected
+        assert f"Execution ID: {expected}" in result.value.text_content
+
+    def test_start_evolve_step_inherits_seed_yaml_text_schema(self) -> None:
+        evolve_seed = next(
+            parameter
+            for parameter in EvolveStepHandler().definition.parameters
+            if parameter.name == "seed_content"
+        )
+        start_definition = StartEvolveStepHandler().definition
+        start_seed = next(
+            parameter
+            for parameter in start_definition.parameters
+            if parameter.name == "seed_content"
+        )
+
+        assert evolve_seed.type == ToolInputType.STRING
+        assert start_seed.type == ToolInputType.STRING
+        assert start_seed.description == evolve_seed.description
+        assert "YAML-formatted string" in start_seed.description
+        assert "not JSON-shaped text or an object literal" in start_seed.description
+        assert "before Ouroboros receives it" in start_seed.description
+
+    def test_evolve_step_exposes_isolation_gated_benchmark_control(self) -> None:
+        evolve_params = {
+            parameter.name: parameter for parameter in EvolveStepHandler().definition.parameters
+        }
+        start_params = {
+            parameter.name: parameter
+            for parameter in StartEvolveStepHandler().definition.parameters
+        }
+
+        benchmark = evolve_params["benchmark_control"]
+        assert benchmark.type == ToolInputType.BOOLEAN
+        assert benchmark.default is False
+        assert "Gen 2+" in benchmark.description
+        assert "clean baseline" in benchmark.description
+        assert start_params["benchmark_control"] == benchmark
 
     def test_evolve_step_has_no_fixed_mcp_timeout_by_default(self) -> None:
         """evolve_step uses progress-aware controls rather than a hard 2h wall clock."""
@@ -743,6 +2712,17 @@ class TestLateralThinkHandler:
 
 class TestMeasureDriftHandler:
     """Test MeasureDriftHandler class."""
+
+    @pytest.fixture(autouse=True)
+    def use_lexical_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from ouroboros.observability.drift import _calculate_lexical_goal_drift
+
+        async def lexical_fallback(current_output: str, seed: Seed, **_kwargs: object) -> float:
+            return _calculate_lexical_goal_drift(current_output, seed)
+
+        monkeypatch.setattr(
+            "ouroboros.observability.drift.calculate_goal_drift_async", lexical_fallback
+        )
 
     def test_definition_name(self) -> None:
         """MeasureDriftHandler has correct name."""
@@ -920,10 +2900,22 @@ class TestEvaluateHandlerCodeChanges:
     def _make_stage1(self, *, passed: bool):
         from ouroboros.evaluation.models import CheckResult, CheckType, MechanicalResult
 
+        details = (
+            {
+                "command": ["uv", "run", "pytest", "tests/", "-x", "-q"],
+                "working_dir": "/tmp/project",
+                "stdout_tail": "FAILED tests/test_example.py::test_case",
+                "stderr_tail": "AssertionError: boom",
+            }
+            if not passed
+            else {}
+        )
         check = CheckResult(
             check_type=CheckType.TEST,
             passed=passed,
             message="tests passed" if passed else "tests failed",
+            details=details,
+            executed=True,
         )
         return MechanicalResult(passed=passed, checks=(check,), coverage_score=None)
 
@@ -945,6 +2937,10 @@ class TestEvaluateHandlerCodeChanges:
         text = handler._format_evaluation_result(result, code_changes=True)
 
         assert "real build/test failures" in text
+        assert "command: uv run pytest tests/ -x -q" in text
+        assert "cwd: /tmp/project" in text
+        assert "FAILED tests/test_example.py::test_case" in text
+        assert "AssertionError: boom" in text
         assert "No code changes detected" not in text
 
     def test_format_result_stage1_fail_no_code_changes(self) -> None:
@@ -974,6 +2970,28 @@ class TestEvaluateHandlerCodeChanges:
 
         assert "real build/test failures" not in text
         assert "No code changes detected" not in text
+
+    def test_format_result_surfaces_reviewer_independence(self) -> None:
+        """Stage 3 output surfaces the reviewer_independence label when present."""
+        from ouroboros.evaluation.models import ConsensusResult, EvaluationResult, Vote
+
+        handler = self._make_handler()
+        consensus = ConsensusResult(
+            approved=True,
+            votes=(Vote(model="m1", approved=True, confidence=0.9, reasoning="ok"),),
+            majority_ratio=1.0,
+            reviewer_independence="independent",
+        )
+        result = EvaluationResult(
+            execution_id="test-session",
+            stage1_result=self._make_stage1(passed=True),
+            stage2_result=None,
+            stage3_result=consensus,
+            final_approved=True,
+        )
+        text = handler._format_evaluation_result(result, code_changes=None)
+
+        assert "Reviewer Independence: independent" in text
 
     async def test_has_code_changes_true(self) -> None:
         """_has_code_changes returns True when git reports modifications."""
@@ -1035,6 +3053,11 @@ class TestInterviewHandlerCwd:
             ("Correct. No remaining ambiguity. Close the interview.", True),
             ("Yes. Lock it. Documentation-only outcomes. Done.", True),
             ("Not done yet.", False),
+            ("[from-auto][feature_acceptance] no remaining ambiguity; done", False),
+            (
+                "[from-auto][safe-default-synthesis] Mark the interview complete and hand off for seed generation.",
+                True,
+            ),
         ],
     )
     def test_interview_completion_signal_detection(self, answer: str, expected: bool) -> None:
@@ -1052,6 +3075,81 @@ class TestInterviewHandlerCwd:
         cwd_param = next(p for p in defn.parameters if p.name == "cwd")
         assert cwd_param.required is False
         assert cwd_param.type == ToolInputType.STRING
+
+    async def test_safe_default_synthesis_closes_persisted_interview_without_second_done(
+        self,
+    ) -> None:
+        """Safe-default synthesis is the only auto completion signal that bypasses the done streak."""
+        handler = InterviewHandler()
+        handler._emit_event = AsyncMock()
+        state = InterviewState(
+            interview_id="sess-safe-default",
+            status=InterviewStatus.IN_PROGRESS,
+            ambiguity_score=0.12,
+            ambiguity_breakdown={
+                "goal_clarity": {
+                    "name": "Goal Clarity",
+                    "clarity_score": 0.9,
+                    "weight": 0.4,
+                    "justification": "clear",
+                },
+                "constraint_clarity": {
+                    "name": "Constraint Clarity",
+                    "clarity_score": 0.9,
+                    "weight": 0.3,
+                    "justification": "clear",
+                },
+                "success_criteria_clarity": {
+                    "name": "Success Criteria Clarity",
+                    "clarity_score": 0.9,
+                    "weight": 0.3,
+                    "justification": "clear",
+                },
+            },
+            completion_candidate_streak=0,
+            rounds=[
+                InterviewRound(
+                    round_number=1,
+                    question="What else should we know?",
+                    user_response=None,
+                )
+            ],
+        )
+
+        async def complete_interview(
+            current_state: InterviewState,
+        ) -> Result[InterviewState, Exception]:
+            current_state.status = InterviewStatus.COMPLETED
+            return Result.ok(current_state)
+
+        mock_engine = MagicMock()
+        mock_engine.load_state = AsyncMock(return_value=Result.ok(state))
+        mock_engine.complete_interview = AsyncMock(side_effect=complete_interview)
+        mock_engine.save_state = AsyncMock(return_value=MagicMock(is_ok=True, is_err=False))
+
+        with patch(
+            "ouroboros.mcp.tools.authoring_handlers.InterviewEngine",
+            return_value=mock_engine,
+        ):
+            result = await handler.handle(
+                {
+                    "session_id": "sess-safe-default",
+                    "answer": (
+                        "[from-auto][safe-default-synthesis] Mark the interview complete "
+                        "and hand off for seed generation."
+                    ),
+                }
+            )
+
+        assert result.is_ok
+        assert result.value.meta["completed"] is True
+        assert result.value.meta["seed_ready"] is True
+        assert state.status is InterviewStatus.COMPLETED
+        assert len(state.rounds) == 1
+        assert state.rounds[0].question == "[driver safe-default finalization]"
+        assert state.rounds[0].user_response is not None
+        assert "[safe-default-synthesis]" in state.rounds[0].user_response
+        mock_engine.complete_interview.assert_awaited_once()
 
 
 class TestCancelExecutionHandler:
@@ -1442,3 +3540,12 @@ class TestInterviewHandlerDrain:
         assert handler._closed is False
         await handler.close()
         assert handler._closed is True
+
+
+def test_default_tools_include_start_ralph_alias() -> None:
+    from ouroboros.mcp.tools.definitions import get_ouroboros_tools
+
+    names = [handler.definition.name for handler in get_ouroboros_tools(include_auto=False)]
+
+    assert "ouroboros_ralph" in names
+    assert "ouroboros_start_ralph" in names

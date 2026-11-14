@@ -261,6 +261,198 @@ Ouroboros exposes workflow tools as ordinary MCP handlers. The MCP server does
 not parse `ooo` syntax and does not receive channel-specific identifiers for
 skill routing.
 
+### Detached `auto` Jobs
+
+`ouroboros_start_auto` starts detached `auto` work as non-terminal tracked
+background work. A successful start response returns a `job_id` immediately;
+that handle identifies tracked background work, not a completed workflow result.
+The job remains observable through its lifecycle status until it reaches a
+terminal state such as `completed`, `failed`, or `cancelled`. Terminal results
+are read from persisted job events; the in-memory handle TTL only bounds live
+registry cleanup, not completed result retrieval.
+
+MCP clients wait for and retrieve detached `auto` results with the standard job
+tools:
+
+```text
+ouroboros_job_status(job_id="JOB_ID")
+ouroboros_job_wait(job_id="JOB_ID")
+ouroboros_job_result(job_id="JOB_ID")
+```
+
+If a detached start exceeds its acceptance deadline, it returns
+`detached_job_acceptance_pending` with a `job_id` and `status_check` instructions.
+Do not start a duplicate. Until the worker persists its acceptance, status, wait,
+and result reads return `acceptance_pending`,
+`acceptance_confirmed=false`, and `result_available=false`. This records the
+pending start receipt; it does not assert that the worker is still alive.
+Once durable job events appear, normal running or terminal status takes precedence.
+
+The server stores this minimal observation in the existing EventStore, separately
+from the actual job stream. `pending_receipt_persisted=true` means another manager
+or a restarted server using the same database can discover the pending handle.
+The observation does not grant acceptance, ownership, or permission to retry.
+Different databases and genuinely unknown handles retain their not-found errors.
+
+If that storage write fails within its two-second persistence budget,
+`pending_receipt_persisted=false` explicitly
+reports the limitation: the initiating server can still read its memory fallback,
+but a new server cannot recover that observation until the worker registers the
+actual job. A missing handle never revokes the earlier no-duplicate instruction.
+Stored observations are historical evidence; they do not diagnose startup delays,
+prove current worker liveness, or change persisted job recovery.
+
+Pollable background start responses also include
+`meta.job_observer.protocol="ouroboros.job_observer.v1"`. Hosts with independent
+child sessions should delegate that object to exactly one read-only observer.
+The observer exclusively owns the wait cursor and terminal result retrieval;
+the main conversation remains available for user interaction and explicit
+on-demand status checks. Hosts without child sessions use the contract's
+`fallback` fields and keep the bounded polling loop in the main session.
+OpenCode plugin delegation returns `job_id=None` and does not emit a local job
+observer because the plugin child already owns the execution lifecycle. The
+exception is `ouroboros_start_evaluate` with `auto_evolve=true`: that operation
+stays parent-owned and pollable so the server can observe a rejected verdict,
+seed generation 1, and start the configured Ralph successor.
+
+The contract's `relay` section turns job changes into bounded parent-session
+events (`phase_changed`, `progress_advanced`, `attention_required`, `terminal`)
+and suppresses unchanged heartbeats and raw tool output. Its `parent_session`
+section tells the host to show `dashboard_url` or `ouroboros tui open`, keep the
+conversation available for safe concurrent work, and conflict-check writes to
+the active workspace.
+
+Treat `running` or other non-terminal status output as progress only. A
+`running` lifecycle status is non-terminal tracked background work, not a final
+`auto` result. Wait with `ouroboros_job_wait`, then fetch the completed result
+with `ouroboros_job_result` after the job reaches a terminal lifecycle status.
+When MCP status reports `completed`, `ouroboros_job_result(job_id="JOB_ID")`
+retrieves the stable completed `auto` result for that job handle. Unknown or
+otherwise unavailable handles return an MCP error response.
+When MCP status cannot resolve the supplied handle, treat the detached work as
+`invalid` or unavailable rather than as running or completed. The stable
+observable status is the MCP error response for that handle, not a detached
+`auto` result. Next steps are to check the copied `job_id`, inspect any
+surfaced auto session, execution, or lineage handle, then restart the detached
+auto flow when no valid handle can be recovered.
+
+The minimal stable invalid-handle error contract marks the handle as terminally
+unavailable and resultless:
+
+```text
+ouroboros_job_result(job_id="missing_detached_auto")
+
+error.message = "Job handle not found: missing_detached_auto. Result unavailable."
+error.error_code = "job_handle_not_found"
+error.details.job_id = "missing_detached_auto"
+error.details.lifecycle_status = "invalid"
+error.details.is_terminal = true
+error.details.result_available = false
+error.details.reason = "not_found"
+```
+
+A completed detached `auto` result may include text content, metadata, and an
+artifact resource reference. The minimal stable retrieval contract is the job
+handle, terminal lifecycle status, terminal marker, and returned content:
+
+```text
+ouroboros_job_result(job_id="job_auto_docs_done")
+
+content[0].text = "detached auto result artifact: seed.yaml"
+content[1].uri = "file:///tmp/detached-auto-result.json"
+meta.job_id = "job_auto_docs_done"
+meta.status = "completed"
+meta.is_terminal = true
+```
+
+When MCP status reports `failed`, the job is terminal and still observable;
+`ouroboros_job_result(job_id="JOB_ID")` returns the stable failure output or
+error details for that job handle with `is_error=true`, not a successful `auto`
+result. Next steps are to inspect `ouroboros_job_status(job_id="JOB_ID")` and
+`ouroboros_job_result(job_id="JOB_ID")`, then resume or retry from the surfaced
+auto session, execution, or lineage handle when one is present.
+
+```text
+ouroboros_job_result(job_id="job_auto_docs_failed")
+
+is_error = true
+content[0].text = "detached auto failed: seed repair budget exhausted"
+meta.job_id = "job_auto_docs_failed"
+meta.status = "failed"
+meta.is_terminal = true
+meta.error = "seed repair budget exhausted"
+```
+
+When MCP status reports `cancelled`, the job is terminal and still observable;
+`ouroboros_job_result(job_id="JOB_ID")` returns stable cancellation output or
+error details for that job handle with `is_error=true` and the cancellation
+reason when one is available, not a successful `auto` result. Next steps are to
+inspect `ouroboros_job_status(job_id="JOB_ID")` and
+`ouroboros_job_result(job_id="JOB_ID")`, then restart the detached auto flow or
+resume from the surfaced auto session, execution, or lineage handle when one is
+present.
+
+```text
+ouroboros_job_result(job_id="job_auto_docs_cancelled")
+
+is_error = true
+content[0].text = "detached auto cancelled: user requested cancellation"
+meta.job_id = "job_auto_docs_cancelled"
+meta.status = "cancelled"
+meta.lifecycle_status = "cancelled"
+meta.is_terminal = true
+meta.error = "user requested cancellation"
+```
+
+When a terminal job is older than the in-memory handle TTL,
+`ouroboros_job_result(job_id="JOB_ID")` still retrieves the persisted terminal
+result for that job handle. `ouroboros_job_status` reports the stored terminal
+lifecycle status, and result retrieval returns the durable result artifact
+rather than an expiration error.
+
+```text
+ouroboros_job_result(job_id="job_auto_docs_expired")
+
+is_error = false
+content[0].text = "detached auto result artifact: expired seed.yaml"
+meta.job_id = "job_auto_docs_expired"
+meta.status = "completed"
+meta.lifecycle_status = "completed"
+meta.is_terminal = true
+meta.result_available = true
+```
+
+### Read-only Project Status
+
+`ouroboros_project_status` rebuilds a complete cross-run `ProjectRecord` from
+persisted session events. It accepts an optional `project_dir` (the server's
+captured caller directory is the default), an optional canonical
+project-relative `workspace`, and a positive `limit` (default `100`). The
+result's `structuredContent` is the ProjectRecord JSON also emitted by
+`ouroboros status project --json`.
+
+```text
+ouroboros_project_status(
+  project_dir="/work/project",
+  workspace="packages/app",
+  limit=100
+)
+```
+
+The tool is side-effect free and advertises read-only, non-destructive,
+idempotent capability metadata. It opens an owned EventStore in database-level
+read-only mode and never creates schema. Identity conflicts, storage or
+reconstruction failures, and limits below the complete matching population fail
+the request without returning a partial record. Project status is attribution
+only: it cannot authorize execution, alter evidence, or declare acceptance.
+
+The returned `ProjectRecord` includes ambiguity-gate statistics for the Seeds
+associated with the project's recorded runs: `gated_seed_count`,
+`forced_seed_count`, `unknown_seed_count`, and `override_rate`. The rate is
+`forced_seed_count / (forced_seed_count + gated_seed_count)`; it is `null` when
+there are no known decisions, and unknown/legacy entries are excluded from the
+denominator.
+
 ### `ouroboros_brownfield` Scan Boundaries
 
 The brownfield MCP tool registers existing codebases for PM/interview context.
@@ -391,6 +583,11 @@ class MCPClientAdapter:
 ##### `async connect(config: MCPServerConfig) -> Result[MCPServerInfo, MCPClientError]`
 
 Connect to an MCP server.
+
+If the task is cancelled during SDK connection establishment, the adapter clears
+its connection state and attempts to close its SDK client and any HTTP client
+it owns before propagating `asyncio.CancelledError`. Ordinary cleanup errors
+are logged without replacing cancellation or triggering a connection retry.
 
 ```python
 async with MCPClientAdapter() as client:
@@ -539,7 +736,7 @@ await manager.disconnect_all()
 
 ### Class: `MCPServerAdapter`
 
-Concrete implementation of MCPServer protocol using FastMCP.
+Concrete implementation of the Ouroboros `MCPServer` protocol using the MCP SDK v2 server API.
 
 ```python
 class MCPServerAdapter:
@@ -891,7 +1088,7 @@ for server_config in config.servers:
 await manager.connect_all()
 
 # Create runner with MCP integration
-event_store = EventStore("sqlite+aiosqlite:///~/.ouroboros/ouroboros.db")
+event_store = EventStore()
 await event_store.initialize()
 
 adapter = ClaudeAgentAdapter()

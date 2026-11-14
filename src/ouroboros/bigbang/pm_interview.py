@@ -5,8 +5,12 @@ Adds PM-specific behavior on top of the existing InterviewEngine:
 - Reframing technical questions for PM audience
 - Deferred item tracking for dev-only questions
 - PMSeed generation from completed interview
-- Brownfield repo management via ~/.ouroboros/ouroboros.db
-- CodebaseExplorer scan-once semantics (shared context)
+- Brownfield repo management via the configured runtime database
+
+The engine does not read repositories (RFC Q00/ouroboros#1937 decision 9).
+Reading code belongs to the advisory lanes, which run in the session that fans
+out and put their findings beside the question; an engine-side summary would be
+evidence the person judging never receives.
 
 Composition pattern: PMInterviewEngine *wraps* InterviewEngine without
 modifying its internals. The inner engine handles question generation,
@@ -16,6 +20,7 @@ questions for classification and collects PM-specific metadata.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
@@ -23,11 +28,19 @@ from typing import Any
 
 import structlog
 
-from ouroboros.bigbang.ambiguity import AmbiguityScorer
+from ouroboros.bigbang.ambiguity import (
+    AmbiguityScore,
+    AmbiguityScorer,
+    qualifies_for_seed_completion,
+)
+from ouroboros.bigbang.answer_provenance import extraction_rounds
 from ouroboros.bigbang.brownfield import (
     load_brownfield_repos_as_dicts as _load_brownfield_dicts,
 )
-from ouroboros.bigbang.explore import CodebaseExplorer, format_explore_results
+from ouroboros.bigbang.inner_guidance import (
+    compose_steered_prompt,
+    reserve_steering_extension,
+)
 from ouroboros.bigbang.interview import (
     INITIAL_CONTEXT_SUMMARY_QUESTION,
     MIN_ROUNDS_BEFORE_EARLY_EXIT,
@@ -42,9 +55,16 @@ from ouroboros.bigbang.question_classifier import (
     ClassifierOutputType,
     QuestionCategory,
     QuestionClassifier,
+    classification_policy_prompt,
 )
+from ouroboros.bigbang.turn_planner import InterviewTurnPlanner
+from ouroboros.config import get_llm_model_for_role
 from ouroboros.core.errors import ProviderError, ValidationError
+from ouroboros.core.json_utils import extract_json_payload
+from ouroboros.core.owner_only import write_owner_only
+from ouroboros.core.pm_snapshot import refresh_pm_snapshot_worktrees
 from ouroboros.core.types import Result
+from ouroboros.orchestrator.capabilities.question_text import normalize_question_text
 from ouroboros.providers.base import (
     CompletionConfig,
     LLMAdapter,
@@ -54,11 +74,27 @@ from ouroboros.providers.base import (
 
 log = structlog.get_logger()
 
+PM_UNCERTAINTY_GUIDANCE = (
+    "If a product question is not settled, do not invent certainty. "
+    "Treat uncertain answers as explicit PM signal: record assumptions when "
+    "the user is making a tentative claim, or decide-later items when the "
+    "answer depends on missing information, a stakeholder decision, or a "
+    "future product choice."
+)
+
 _SEED_DIR = Path.home() / ".ouroboros" / "seeds"
-_PM_SYSTEM_PROMPT_PREFIX = """\
+_PM_SYSTEM_PROMPT_PREFIX = f"""\
 You are a Product Requirements interviewer helping a PM define their product.
+The PRD will drive autonomous AI planning, implementation, and verification
+downstream — elicit decisions precise enough for that.
+
+A PRD is a contract between the PM and the developers: success criteria are the
+behavior and policy the PM must observe in the delivered feature to accept it
+as built. Post-launch outcomes have no place in this contract.
 
 Focus on: goal, user stories, constraints, success criteria, assumptions.
+
+{PM_UNCERTAINTY_GUIDANCE}
 
 """
 
@@ -70,7 +106,15 @@ _OPENING_QUESTION = (
 
 _EXTRACTION_SYSTEM_PROMPT = """\
 You are a requirements extraction engine. Given a PM interview transcript,
-extract structured product requirements.
+extract structured product requirements. Preserve uncertainty explicitly: do not
+turn uncertain, stakeholder-dependent, or unknown answers into confirmed
+requirements. Put tentative claims in assumptions and unresolved choices in
+decide_later_items.
+
+A PRD is a contract between the PM and the developers: success_criteria are the
+behavior and policy the PM must observe in the delivered feature to accept it as
+built. Post-launch outcomes mentioned in the transcript are the PM's follow-up
+work, not contract terms — record them under assumptions or decide_later_items.
 
 Respond ONLY with valid JSON in this exact format:
 {
@@ -87,8 +131,93 @@ Respond ONLY with valid JSON in this exact format:
 }
 """
 
-# Model for extraction (uses same as interview for consistency)
-_FALLBACK_MODEL = "claude-opus-4-6"
+
+# Identifies the PRD-contract paragraph — the policy #1663 exists to
+# enforce. It is shed last so tight budgets drop the supporting paragraphs
+# before the policy itself.
+_PM_CONTRACT_MARKER = "contract between the PM and the developers"
+
+#: Ceiling on questions per PM turn (RFC #2222 decision 1) — a target the
+#: generator may stay under, never a quota to pad toward.
+MAX_QUESTIONS_PER_TURN = 3
+
+#: Mirrors the planner's closure-mode activation ("Overall ambiguity <= 0.25
+#: activates closure mode ... do not open a new topic"). A companion is by
+#: definition a second topic, so at or below this score the batch is one.
+_CLOSURE_MODE_AMBIGUITY = 0.25
+
+
+def _decision_only_view(state: InterviewState) -> InterviewState:
+    """Project ``state`` as the ambiguity scorer should read it.
+
+    Scoring asks how clear the *requirements* are, and requirements are what
+    the person decided.  What they weighed on the way is neither clearer nor
+    vaguer for having been consulted, so an observation's content must not
+    reach the scorer: a well-researched question would otherwise read as a
+    well-decided one, which is the same confusion ``check_completion`` avoids
+    by counting decisions rather than rounds.
+
+    The answer is dropped, not the round.  This mirrors the per-role rule in
+    ``answer_provenance``: an observation is withheld from the slot that
+    carries authority and left alone in the slot that carries the question.
+    The scorer then sees the grounded question standing unanswered — which is
+    what it is until the person answers it — so the finding raises the
+    remaining ambiguity instead of lowering it.
+
+    The initial-context summary round is passed through untouched.
+    ``prompt_safe_initial_context`` recovers a long context from that answer,
+    and blanking it would make scoring fail closed on exactly the sessions
+    that carry the most context.
+
+    This is a PM-local projection on purpose.  The same gap exists in
+    ``AmbiguityScorer`` for every other caller, but closing it there is an
+    interview-core change this PR does not own; see the Out-of-scope section
+    of the PR body.  When the shared projection lands, this collapses into it.
+    """
+    projected = [
+        round_data
+        if round_data.question == INITIAL_CONTEXT_SUMMARY_QUESTION
+        or round_data.provenance != "observation"
+        else round_data.model_copy(update={"user_response": None})
+        for round_data in state.rounds
+    ]
+    return state.model_copy(update={"rounds": projected})
+
+
+def decision_round_count(state: InterviewState) -> int:
+    """Count authoritative PM decisions eligible for completion."""
+    return sum(
+        1
+        for round_data in state.rounds
+        if round_data.user_response is not None
+        and round_data.question != INITIAL_CONTEXT_SUMMARY_QUESTION
+        and round_data.provenance == "user"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PMInterviewTurnPlan:
+    """Atomic PM question, ambiguity result, and routing classification."""
+
+    question: str
+    ambiguity: AmbiguityScore | None
+    classification: ClassificationResult
+    raw_payload: dict[str, Any]
+
+
+#: What a round holds when the user asked to leave the decision open.
+#:
+#: A skip is recorded, not skipped: the round exists so the question is not
+#: asked again, and it says the decision is open rather than answered. These
+#: are named because two runtimes write them — the engine below, and the
+#: plugin path that has no engine to reach — and a second spelling of one
+#: sentence is a transcript whose meaning depends on which runtime took the
+#: call.
+DECIDE_LATER_PLACEHOLDER = "[Decide later] To be determined — user chose to decide later."
+DEFERRED_PLACEHOLDER = (
+    "[Deferred to development phase] This technical decision will be addressed "
+    "during the development interview."
+)
 
 
 @dataclass
@@ -110,7 +239,7 @@ class PMInterviewEngine:
     - Question classification via QuestionClassifier
     - Deferred item tracking (dev-only questions)
     - PMSeed extraction from completed interviews
-    - Brownfield repo registration (~/.ouroboros/ouroboros.db)
+    - Brownfield repo registration (configured runtime database)
     - Scan-once codebase context sharing
 
     Attributes:
@@ -141,10 +270,13 @@ class PMInterviewEngine:
         engine.save_pm_seed(pm_seed)
     """
 
+    supports_atomic_turn = True
+
     inner: InterviewEngine
     classifier: QuestionClassifier
     llm_adapter: LLMAdapter
-    model: str = _FALLBACK_MODEL
+    model: str | None = None
+    model_is_explicit: bool = field(default=False, init=False)
     deferred_items: list[str] = field(default_factory=list)
     decide_later_items: list[str] = field(default_factory=list)
     """Original question text for questions classified as DECIDE_LATER.
@@ -176,7 +308,7 @@ class PMInterviewEngine:
     def create(
         cls,
         llm_adapter: LLMAdapter,
-        model: str = _FALLBACK_MODEL,
+        model: str | None = None,
         state_dir: Path | None = None,
     ) -> PMInterviewEngine:
         """Factory method to create a PMInterviewEngine with proper wiring.
@@ -203,6 +335,7 @@ class PMInterviewEngine:
 
         classifier = QuestionClassifier(
             llm_adapter=llm_adapter,
+            implicit_model=model,
         )
 
         return cls(
@@ -211,6 +344,12 @@ class PMInterviewEngine:
             llm_adapter=llm_adapter,
             model=model,
         )
+
+    def __post_init__(self) -> None:
+        """Resolve implicit default model while preserving explicit caller pins."""
+        self.model_is_explicit = self.model is not None
+        if self.model is None:
+            self.model = get_llm_model_for_role("pm_interview")
 
     # ──────────────────────────────────────────────────────────────
     # Brownfield repo management
@@ -235,51 +374,31 @@ class PMInterviewEngine:
         self,
         repos: list[dict[str, str]] | None = None,
     ) -> str:
-        """Explore brownfield codebases exactly once.
+        """Return the empty codebase context. The engine no longer reads code.
 
-        Scans selected repositories and stores the context for sharing
-        between the interviewer and classifier. Subsequent calls return
-        the cached result.
+        Retained as a no-op rather than deleted because callers outside this
+        engine still invoke it, and because the empty string it returns is the
+        correct value now: RFC #1937 moved repository reading to the advisory
+        lanes in the host session, which is where the regular interview has
+        always had it -- that engine's prompt forbids exploring files or
+        repositories outright, and its brownfield marking says in a comment
+        that the main session, not MCP, does the exploring.
 
-        Args:
-            repos: Repos to explore. Defaults to registered brownfield repos.
+        What the summary used to do, and where it went:
 
-        Returns:
-            Formatted codebase context string.
+        * *Deciding brownfield.* It gated ``is_brownfield`` and
+          ``codebase_paths``, so a failed summarization silently produced a
+          greenfield Seed. The roster now decides that, which is what
+          registration always meant.
+        * *Priming the question generator and classifier.* Both received a
+          truncated whole-repo blob. The ``code_context`` lane answers the same
+          need per question, with evidence the PM can actually see.
+        * *Filling Seed extraction.* It never reached there from the regular
+          interview either -- that field is empty for every interview-originated
+          Seed -- so the branch reading it is one PM no longer takes.
         """
-        if self._explored:
-            return self.codebase_context
-
-        if repos is None:
-            repos = self.load_brownfield_repos()
-
-        if not repos:
-            self._explored = True
-            return ""
-
-        paths = [{"path": r["path"], "role": r.get("role", "primary")} for r in repos]
-
-        try:
-            explorer = CodebaseExplorer(
-                llm_adapter=self.llm_adapter,
-                model=self.model,
-            )
-            results = await explorer.explore(paths)
-            self.codebase_context = format_explore_results(results)
-
-            # Share context with classifier
-            self.classifier.codebase_context = self.codebase_context
-
-            log.info(
-                "pm.explore_completed",
-                repos_explored=len(results),
-                context_length=len(self.codebase_context),
-            )
-        except (ProviderError, OSError) as e:
-            log.warning("pm.explore_failed", error=str(e), exc_info=e)
-
         self._explored = True
-        return self.codebase_context
+        return ""
 
     # ──────────────────────────────────────────────────────────────
     # Opening question — asked before the interview loop
@@ -369,20 +488,23 @@ class PMInterviewEngine:
         self.classifications = []
         self._reframe_map = {}
 
-        # Explore codebases if brownfield repos are provided
+        # Redirect the repositories at persistent snapshot worktrees pinned to
+        # the remote default branch (created once, then fetch + hard-reset) so a
+        # stale local checkout never leaks into PRD context. The engine does not
+        # read them -- the advisory lanes do, in the host session (RFC #1937) --
+        # but where they read is still decided here, because the snapshot
+        # machinery is engine-side and the roster handed to the lanes is built
+        # from these records.
         if brownfield_repos:
+            brownfield_repos = await asyncio.to_thread(
+                refresh_pm_snapshot_worktrees, list(brownfield_repos)
+            )
             self._selected_brownfield_repos = list(brownfield_repos)
-            await self.explore_codebases(brownfield_repos)
 
         # Store the raw user context for extraction; PM steering goes
         # only into the interview system prompt, not into persisted state.
         self._initial_context = initial_context
         user_context = initial_context
-
-        if self.codebase_context:
-            user_context += (
-                f"\n\n## Existing Codebase Context (BROWNFIELD)\n{self.codebase_context}"
-            )
 
         # Keep PM steering prefix in memory for interview rounds but
         # do NOT persist it as initial_context so extraction sees only
@@ -398,19 +520,27 @@ class PMInterviewEngine:
         )
 
         if result.is_ok:
-            # Mark brownfield state on the returned InterviewState
+            # Mark brownfield state on the returned InterviewState.
+            #
+            # The roster is the whole condition. It used to be the roster *and*
+            # a non-empty engine summary, which made a fact the registration
+            # already states depend on a summarization step succeeding -- and
+            # that step failed silently, so one failed call turned a brownfield
+            # project into a greenfield Seed with nothing to notice.
             state = result.value
-            if brownfield_repos and self.codebase_context:
+            if brownfield_repos:
                 state.is_brownfield = True
-                state.codebase_context = self.codebase_context
+                # Persist the durable source checkout, not an ephemeral
+                # snapshot worktree path, into interview state.
                 state.codebase_paths = [
-                    {"path": r["path"], "role": "primary"} for r in brownfield_repos if "path" in r
+                    {"path": r.get("source_path") or r["path"], "role": "primary"}
+                    for r in brownfield_repos
+                    if "path" in r
                 ]
-                state.explore_completed = True
             log.info(
                 "pm.interview_started",
                 interview_id=state.interview_id,
-                has_brownfield=bool(self.codebase_context),
+                is_brownfield=state.is_brownfield,
             )
 
         return result
@@ -420,8 +550,30 @@ class PMInterviewEngine:
 
         Idempotent — if already installed, replaces previous wrapper to prevent
         stacking across multiple start/resume calls on the same engine instance.
+
+        Budget-extension contract: the PM-owned inner instance gets its
+        system-prompt budgets widened by exactly the steering length (instance
+        attributes only — ``interview.py`` and dev-interview instances are
+        untouched). ``ask_next_question`` therefore computes budgets and trims
+        history against the widened numbers, the wire ceiling
+        (``_MAX_TOTAL_PROMPT_CHARS``) stays enforced by the inner engine
+        itself, and on the normal path the steering rides entirely inside the
+        reserved extension: the inner build keeps the engine's *designed*
+        budget, byte-identical to what a dev interview would produce.
+
+        The interview layer always has priority. When a caller supplies a cap
+        smaller than designed-budget-plus-extension (tests, wire pressure in
+        the history-decline zone), steering falls back to fit-and-shed:
+        paragraphs are included atomically (contract paragraph first, shed
+        last) and dropped one by one until every ``INNER_GUIDANCE_INVARIANTS``
+        marker retained by the unwrapped baseline build also survives the
+        steered build — or no steering remains.
         """
         self._pm_steering = getattr(self, "_pm_steering", _PM_SYSTEM_PROMPT_PREFIX)
+
+        # Reserve the steering extension on the PM-owned inner instance
+        # (idempotent — derived from class attributes, never stacks).
+        reserve_steering_extension(self.inner, self._pm_steering)
 
         # Store the original (unwrapped) build method on first install
         if not hasattr(self, "_original_build_system_prompt"):
@@ -429,92 +581,44 @@ class PMInterviewEngine:
 
         original_build = self._original_build_system_prompt
 
-        def _pm_build_system_prompt(state: InterviewState, *args, **kwargs) -> str:
-            base = original_build(state, *args, **kwargs)
-            return self._pm_steering + "\n\n" + base
+        def _pm_build_system_prompt(
+            state: InterviewState,
+            initial_context: str | None = None,
+            max_chars: int | None = None,
+            **_kwargs: Any,
+        ) -> str:
+            return compose_steered_prompt(
+                inner=self.inner,
+                build=original_build,
+                steering=self._pm_steering,
+                state=state,
+                initial_context=initial_context,
+                max_chars=max_chars,
+                shed_last_marker=_PM_CONTRACT_MARKER,
+            )
 
         self.inner._build_system_prompt = _pm_build_system_prompt  # type: ignore[assignment]
 
-    async def ask_next_question(
-        self,
-        state: InterviewState,
-    ) -> Result[str, ProviderError | ValidationError]:
-        """Generate and classify the next question.
-
-        Delegates question generation to the inner engine, then classifies
-        the question. Planning questions pass through unchanged. Development
-        questions are reframed for PM audience or deferred.
-
-        Args:
-            state: Current interview state.
-
-        Returns:
-            Result containing the (possibly reframed) question or error.
-        """
-        # Generate question via inner engine
-        question_result = await self.inner.ask_next_question(state)
-
-        if question_result.is_err:
-            return question_result
-
-        question = question_result.value
-        if question == INITIAL_CONTEXT_SUMMARY_QUESTION:
-            return Result.ok(question)
-
-        # Classify the question
-        context = self._build_interview_context(state)
-        classify_result = await self.classifier.classify(
-            question=question,
-            interview_context=context,
-        )
-
-        if classify_result.is_err:
-            # Classification failed — return original question (safe fallback)
-            log.warning("pm.classification_failed", question=question[:100])
-            return question_result
-
-        classification = classify_result.value
+    def _apply_classification(self, classification: ClassificationResult) -> str:
+        """Persist one PM routing decision and return the user-facing question."""
         self.classifications.append(classification)
-
         output_type = classification.output_type
-
         if output_type == ClassifierOutputType.DEFERRED:
-            # Return the question to the caller (main session) so the user
-            # can choose to defer it themselves.  The main session detects
-            # classification == "deferred" via response_meta and offers
-            # a "skip / defer to dev" option.  If the user picks it, the
-            # caller calls skip_as_deferred() which records the deferral
-            # and appends to deferred_items.
-            #
-            # Previously this branch auto-answered and recursed, which could
-            # trigger MCP 120s timeouts on consecutive DEFERRED runs.
             log.info(
                 "pm.question_deferred_candidate",
                 question=classification.original_question[:100],
                 reasoning=classification.reasoning,
                 output_type=output_type,
             )
-            return Result.ok(classification.original_question)
-
+            return classification.original_question
         if output_type == ClassifierOutputType.DECIDE_LATER:
-            # Return the question to the caller (main session) so the user
-            # can choose "decide later" themselves.  The main session detects
-            # classification == "decide_later" via response_meta and offers
-            # the option.  If the user picks it, the caller calls
-            # skip_as_decide_later() which records the placeholder and
-            # appends to decide_later_items.
-            #
-            # Previously this branch auto-answered and recursed, which could
-            # trigger MCP 120s timeouts on consecutive DECIDE_LATER runs.
             log.info(
                 "pm.question_decide_later",
                 question=classification.original_question[:100],
                 reasoning=classification.reasoning,
             )
-            return Result.ok(classification.original_question)
-
+            return classification.original_question
         if output_type == ClassifierOutputType.REFRAMED:
-            # Use the reframed version and track the mapping
             reframed = classification.question_for_pm
             self._reframe_map[reframed] = classification.original_question
             log.info(
@@ -523,15 +627,215 @@ class PMInterviewEngine:
                 reframed=reframed[:100],
                 output_type=output_type,
             )
-            return Result.ok(reframed)
-
-        # PASSTHROUGH — planning question forwarded unchanged to the PM
+            return reframed
         log.debug(
             "pm.question_passthrough",
             question=classification.original_question[:100],
             output_type=output_type,
         )
-        return Result.ok(classification.question_for_pm)
+        return classification.question_for_pm
+
+    async def plan_next_turn(
+        self,
+        state: InterviewState,
+    ) -> Result[PMInterviewTurnPlan, ProviderError | ValidationError]:
+        """Plan PM scoring, question generation, and classification in one call."""
+        additional_context = ""
+        if self.decide_later_items:
+            additional_context = "\n".join(f"- {item}" for item in self.decide_later_items)
+        scorer = AmbiguityScorer(llm_adapter=self.llm_adapter, model=self.model)
+        planner = InterviewTurnPlanner(engine=self.inner, scorer=scorer)
+        response_contract = f"""
+Also include these PM routing fields in the same JSON object:
+"category": "planning"|"development"|"decide_later",
+"reframed_question": "string", "reasoning": "string",
+"defer_to_dev": false|true, "decide_later": false|true,
+"placeholder_response": "string".
+
+Optionally add "companion_questions": up to {MAX_QUESTIONS_PER_TURN - 1} extra
+questions asked in the same turn, each an object with the same routing fields
+plus "question". Include one only when it targets a different unresolved
+clarity dimension and no answer to another question in this turn could change
+how it should be asked. In closure mode, or when unsure, include none. Never
+rephrase the primary question as a companion.
+
+Apply this canonical PM routing policy:
+{classification_policy_prompt()}
+"""
+        turn_result = await planner.plan(
+            state,
+            scoring_state=_decision_only_view(state),
+            additional_scoring_context=additional_context,
+            extra_response_contract=response_contract,
+            additional_untrusted_context=self.classifier.codebase_context[:2000],
+        )
+        if turn_result.is_err:
+            return Result.err(turn_result.error)
+        turn = turn_result.value
+        try:
+            classification = self.classifier._parse_response(
+                json.dumps(turn.raw_payload),
+                turn.question,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning("pm.atomic_classification_failed", error=str(exc))
+            classification = ClassificationResult(
+                original_question=turn.question,
+                category=QuestionCategory.PLANNING,
+                reframed_question=turn.question,
+                reasoning="Atomic PM classification unavailable; defaulting to planning.",
+            )
+        question = self._apply_classification(classification)
+        return Result.ok(
+            PMInterviewTurnPlan(
+                question=question,
+                ambiguity=turn.ambiguity,
+                classification=classification,
+                raw_payload=turn.raw_payload,
+            )
+        )
+
+    async def plan_next_turns(
+        self,
+        state: InterviewState,
+    ) -> Result[list[PMInterviewTurnPlan], ProviderError | ValidationError]:
+        """Plan one PM turn of one to three questions (RFC #2222 decision 1).
+
+        One planner call: the primary question travels exactly as
+        :meth:`plan_next_turn` produces it, and companions ride the same JSON
+        payload under ``companion_questions``. Each companion is classified and
+        applied through the same ``_apply_classification`` path as the primary,
+        so reframe tracking and skip routing do not know batch members apart.
+
+        What is enforced here rather than trusted to the generator:
+
+        * **Closure mode is single-question.** At or below the planner's
+          closure threshold the batch is the primary alone — a companion is a
+          second topic, and closure mode forbids opening one.
+        * **No duplicate question identities in one batch.** Fan-out isolation
+          keys on the normalized question text, so a companion that normalizes
+          to an already-included question is dropped, not dispatched.
+        * **The ceiling.** At most ``MAX_QUESTIONS_PER_TURN`` questions leave,
+          however many the payload carried.
+
+        A malformed companion entry is dropped silently: the primary is the
+        turn, and companions are an optimization the turn must not fail on.
+        What counts as malformed is not decided here — the companion's routing
+        fields go through the primary's own classification parser, so a
+        wrong-typed ``decide_later`` is refused by the same rule in both. What
+        follows the refusal differs, because the two questions do: the primary
+        falls back to a plain planning question, since the turn must have one,
+        while a companion is dropped, since the turn is whole without it.
+        """
+        self._begin_turn()
+        turn_result = await self.plan_next_turn(state)
+        if turn_result.is_err:
+            return Result.err(turn_result.error)
+        primary = turn_result.value
+        plans = [primary]
+
+        ambiguity = primary.ambiguity
+        if ambiguity is not None and ambiguity.overall_score <= _CLOSURE_MODE_AMBIGUITY:
+            return Result.ok(plans)
+
+        seen_identities = {
+            normalize_question_text(primary.question),
+            normalize_question_text(primary.classification.original_question),
+        }
+        raw_companions = primary.raw_payload.get("companion_questions")
+        if not isinstance(raw_companions, list):
+            return Result.ok(plans)
+
+        for raw in raw_companions:
+            if len(plans) >= MAX_QUESTIONS_PER_TURN:
+                break
+            if not isinstance(raw, dict):
+                continue
+            question_text = str(raw.get("question") or "").strip()
+            if not question_text:
+                continue
+            if normalize_question_text(question_text) in seen_identities:
+                continue
+            try:
+                classification = self.classifier._parse_response(json.dumps(raw), question_text)
+            except (KeyError, TypeError, ValueError) as exc:
+                # Same parser, same strictness as the primary: a routing field
+                # of the wrong type is malformed, not a value to coerce.
+                # ``bool("false")`` is True, and a companion routed that way
+                # would offer a skip that discards a question the PM must
+                # answer. Dropping loses one companion; coercing loses an answer.
+                log.warning("pm.companion_classification_rejected", error=str(exc))
+                continue
+            reframes_before = dict(self._reframe_map)
+            shown_question = self._apply_classification(classification)
+            shown_identity = normalize_question_text(shown_question)
+            if shown_identity in seen_identities:
+                # _apply_classification already recorded routing state for a
+                # question this batch will not carry — undo both traces. The
+                # map is restored, not popped: a companion whose own text
+                # differs but which reframes onto the primary's shown question
+                # overwrites the primary's entry, and popping that key would
+                # take the primary's original question with it — leaving the
+                # PM's answer to a reframed question with nothing to bundle.
+                self.classifications.pop()
+                self._reframe_map = reframes_before
+                continue
+            seen_identities.add(normalize_question_text(question_text))
+            seen_identities.add(shown_identity)
+            plans.append(
+                PMInterviewTurnPlan(
+                    question=shown_question,
+                    ambiguity=None,
+                    classification=classification,
+                    raw_payload=dict(raw),
+                )
+            )
+
+        log.info(
+            "pm.turn_batch_planned",
+            interview_id=state.interview_id,
+            batch_size=len(plans),
+        )
+        return Result.ok(plans)
+
+    def _begin_turn(self) -> None:
+        """Drop the previous turn's reframe routing before a new one is planned.
+
+        A reframe maps a *shown* question back to the technical one it came
+        from, and that mapping means something only while the turn that
+        produced it is the turn on the wire. A host abandons a turn simply by
+        not answering it (RFC #2222 revision 4) and the next call plans a fresh
+        one — so a mapping that outlived its turn would attach itself to
+        whatever later question happens to be displayed with the same text, and
+        that decision would be recorded under a technical question nobody was
+        asked.
+
+        This is the same removal the pending list got, at the one address it
+        had left: what is persisted describes the turn being planned now, and
+        planning replaces it rather than adding to it.
+        """
+        self._reframe_map = {}
+
+    async def ask_next_question(
+        self,
+        state: InterviewState,
+    ) -> Result[str, ProviderError | ValidationError]:
+        """Generate and classify the next question using the legacy two-call path."""
+        self._begin_turn()
+        question_result = await self.inner.ask_next_question(state)
+        if question_result.is_err:
+            return question_result
+        question = question_result.value
+        if question == INITIAL_CONTEXT_SUMMARY_QUESTION:
+            return Result.ok(question)
+        classify_result = await self.classifier.classify(
+            question=question,
+            interview_context=self._build_interview_context(state),
+        )
+        if classify_result.is_err:
+            log.warning("pm.classification_failed", question=question[:100])
+            return question_result
+        return Result.ok(self._apply_classification(classify_result.value))
 
     async def record_response(
         self,
@@ -545,11 +849,15 @@ class PMInterviewEngine:
         original technical question with the PM's answer so the inner
         InterviewEngine retains full context for follow-up generation.
 
-        The bundled format recorded in the inner engine is::
+        The bundled question recorded in the inner engine is::
 
             [Original technical question: <original>]
             [PM was asked (reframed): <reframed>]
-            PM answer: <response>
+
+        The answer itself is preserved byte-for-byte.  In particular, a
+        leading provenance marker such as ``[from-code]`` must remain leading
+        so ``InterviewState.record_answer`` and persisted-state validation do
+        not accidentally promote an observation into a user decision.
 
         This ensures the LLM generating follow-up questions sees both
         the underlying technical concern and the PM's product-level answer.
@@ -565,12 +873,12 @@ class PMInterviewEngine:
         original_question = self._reframe_map.pop(question, None)
 
         if original_question is not None:
-            # Bundle the original technical question with the PM's answer
+            # Bundle the original and reframed questions, but do not decorate
+            # the response: provenance is encoded by a leading caller marker.
             bundled_question = (
                 f"[Original technical question: {original_question}]\n"
                 f"[PM was asked (reframed): {question}]"
             )
-            bundled_response = f"PM answer: {user_response}"
 
             log.info(
                 "pm.response_bundled",
@@ -578,7 +886,7 @@ class PMInterviewEngine:
                 reframed_question=question[:100],
             )
 
-            return await self.inner.record_response(state, bundled_response, bundled_question)
+            return await self.inner.record_response(state, user_response, bundled_question)
 
         return await self.inner.record_response(state, user_response, question)
 
@@ -614,7 +922,7 @@ class PMInterviewEngine:
 
         return await self.record_response(
             state,
-            user_response="[Decide later] To be determined — user chose to decide later.",
+            user_response=DECIDE_LATER_PLACEHOLDER,
             question=question,
         )
 
@@ -646,9 +954,7 @@ class PMInterviewEngine:
 
         return await self.record_response(
             state,
-            user_response="[Deferred to development phase] "
-            "This technical decision will be addressed during the "
-            "development interview.",
+            user_response=DEFERRED_PLACEHOLDER,
             question=question,
         )
 
@@ -800,6 +1106,13 @@ class PMInterviewEngine:
         pending = meta.get("pending_reframe")
         if pending and isinstance(pending, dict):
             self._reframe_map[pending["reframed"]] = pending["original"]
+        # A batched turn can hold several pending reframes at once (RFC #2222);
+        # the full map is persisted beside the legacy single entry.
+        pending_map = meta.get("pending_reframes")
+        if isinstance(pending_map, dict):
+            for reframed, original in pending_map.items():
+                if isinstance(reframed, str) and isinstance(original, str):
+                    self._reframe_map[reframed] = original
 
         # Reinstall PM steering wrapper for resumed sessions
         self._install_pm_steering()
@@ -840,14 +1153,7 @@ class PMInterviewEngine:
         }
 
     def get_pending_reframe(self) -> dict[str, str] | None:
-        """Return the most recent pending reframe as {reframed, original}, or None.
-
-        Encapsulates access to the internal ``_reframe_map`` so that callers
-        do not need to reach into private state.
-
-        Returns:
-            Dict with 'reframed' and 'original' keys, or None if no pending reframe.
-        """
+        """Return the most recent pending reframe as {reframed, original}, or None."""
         if not self._reframe_map:
             return None
         reframed = next(reversed(self._reframe_map))
@@ -873,27 +1179,11 @@ class PMInterviewEngine:
     ) -> dict[str, Any] | None:
         """Check whether the interview should complete based on ambiguity.
 
-        Completion is determined by ambiguity score only (user controls when
-        to stop, consistent with the regular interview engine):
-
-        After at least ``MIN_ROUNDS_BEFORE_EARLY_EXIT`` answered rounds, the
-        scorer evaluates requirement clarity.  If the score is <= threshold
-        (0.2) the interview is ready for PM generation.
-
-        Args:
-            state: Current interview state.
-
-        Returns:
-            Dict with completion metadata if the interview should end,
-            or ``None`` if the interview should continue.
+        After at least ``MIN_ROUNDS_BEFORE_EARLY_EXIT`` authoritative PM
+        decisions, the scorer evaluates requirement clarity. A score at or below
+        the threshold makes the interview ready for PM generation.
         """
-        # Count only substantive answered rounds (exclude pending and synthetic
-        # initial-context summary recovery rounds).
-        answered_rounds = sum(
-            1
-            for r in state.rounds
-            if r.user_response is not None and r.question != INITIAL_CONTEXT_SUMMARY_QUESTION
-        )
+        answered_rounds = decision_round_count(state)
 
         # ── Ambiguity check (only after minimum rounds) ────────────────
         if answered_rounds < MIN_ROUNDS_BEFORE_EARLY_EXIT:
@@ -912,7 +1202,7 @@ class PMInterviewEngine:
                 model=self.model,
             )
             score_result = await scorer.score(
-                state,
+                _decision_only_view(state),
                 is_brownfield=state.is_brownfield,
                 additional_context=additional_context,
             )
@@ -934,7 +1224,7 @@ class PMInterviewEngine:
                 breakdown=ambiguity.breakdown.model_dump(mode="json"),
             )
 
-            if ambiguity.is_ready_for_seed:
+            if qualifies_for_seed_completion(ambiguity, is_brownfield=state.is_brownfield):
                 log.info(
                     "pm.completion.ambiguity_resolved",
                     session_id=state.interview_id,
@@ -1013,7 +1303,18 @@ class PMInterviewEngine:
                 )
             )
 
-        context = self._build_interview_context(state)
+        from ouroboros.interview_adapters.opening_interpretations import opening_revision
+
+        opening_before = (
+            opening_revision(state.proposed_opening, state.opening_decisions)
+            if state.proposed_opening is not None
+            else None
+        )
+        persisted_before = state.persistence_revision
+        loaded_before = state._loaded_revision
+        status_before = state.status
+        input_before = state.requirement_input_fingerprint()
+        context = self._build_interview_context(state, withhold_observations=True)
 
         messages = [
             Message(role=MessageRole.SYSTEM, content=_EXTRACTION_SYSTEM_PROMPT),
@@ -1023,8 +1324,11 @@ class PMInterviewEngine:
             ),
         ]
 
+        assert self.model is not None
         config = CompletionConfig(
             model=self.model,
+            role="pm_interview",
+            model_is_explicit=self.model_is_explicit,
             temperature=0.2,
             max_tokens=4096,
         )
@@ -1034,11 +1338,42 @@ class PMInterviewEngine:
         if result.is_err:
             return Result.err(result.error)
 
+        opening_after = (
+            opening_revision(state.proposed_opening, state.opening_decisions)
+            if state.proposed_opening is not None
+            else None
+        )
+        if (
+            opening_after != opening_before
+            or state.requirement_input_fingerprint() != input_before
+            or state.status != status_before
+            or state.persistence_revision != persisted_before
+            or state._loaded_revision != loaded_before
+        ):
+            return Result.err(
+                ValidationError(
+                    "Interview changed during PM Seed generation; reload and retry",
+                    field="interview_id",
+                )
+            )
+        if loaded_before is not None:
+            current = await self.inner.load_state(state.interview_id)
+            if current.is_err or current.value.persistence_revision != persisted_before:
+                return Result.err(
+                    ValidationError(
+                        "Interview changed during PM Seed generation; reload and retry",
+                        field="interview_id",
+                    )
+                )
+
         try:
             seed = self._parse_pm_seed(
                 result.value.content,
                 interview_id=state.interview_id,
             )
+            from ouroboros.bigbang.pm_opening import anchor_pm_opening
+
+            seed = anchor_pm_opening(seed, state)
             log.info(
                 "pm.seed_generated",
                 pm_id=seed.pm_id,
@@ -1083,7 +1418,14 @@ class PMInterviewEngine:
             ensure_ascii=False,
             indent=2,
         )
-        filepath.write_text(json_content, encoding="utf-8")
+        durability_confirmed = write_owner_only(filepath, json_content)
+
+        if not durability_confirmed:
+            log.warning(
+                "pm.seed_save_durability_uncertain",
+                path=str(filepath),
+                pm_id=seed.pm_id,
+            )
 
         log.info(
             "pm.seed_saved",
@@ -1116,23 +1458,47 @@ class PMInterviewEngine:
     # Internal helpers
     # ──────────────────────────────────────────────────────────────
 
-    def _build_interview_context(self, state: InterviewState) -> str:
+    def _build_interview_context(
+        self, state: InterviewState, *, withhold_observations: bool = False
+    ) -> str:
         """Build interview context string from state.
 
         Args:
             state: Current interview state.
+            withhold_observations: Render observation answers as a fixed note
+                instead of their content. True only for the requirement
+                extraction prompt — the question classifier reads the same
+                context and has to see observations in full, since informing
+                the next question is what they were collected for (#1755).
 
         Returns:
             Formatted context string.
         """
         parts = [f"Initial Context: {prompt_safe_initial_context(state)}"]
 
-        for round_data in state.rounds:
-            if round_data.question == INITIAL_CONTEXT_SUMMARY_QUESTION:
+        # Question lines are unchanged either way: an observation reaching a
+        # later question is where it was collected to arrive.
+        if withhold_observations:
+            rendered = [(item.question, item.answer) for item in extraction_rounds(state)]
+        else:
+            rendered = [(r.question, r.user_response) for r in state.rounds]
+            from ouroboros.interview_adapters.opening_interpretations import (
+                confirmed_opening_events,
+            )
+
+            rendered = [
+                (event.presented_prompt, event.user_response)
+                for _item, event in confirmed_opening_events(
+                    state.proposed_opening, state.opening_decisions
+                )
+            ] + rendered
+
+        for question, answer in rendered:
+            if question == INITIAL_CONTEXT_SUMMARY_QUESTION:
                 continue
-            parts.append(f"\nQ: {round_data.question}")
-            if round_data.user_response:
-                parts.append(f"A: {round_data.user_response}")
+            parts.append(f"\nQ: {question}")
+            if answer:
+                parts.append(f"A: {answer}")
 
         return "\n".join(parts)
 
@@ -1192,20 +1558,16 @@ Include them as original question text in "decide_later_items":
         Raises:
             ValueError: If response cannot be parsed.
         """
-        import re
 
-        text = response.strip()
-
-        # Extract JSON from markdown code blocks if present
-        json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if json_match:
-            text = json_match.group(1)
-        else:
-            json_match = re.search(r"\{.*\}", text, re.DOTALL)
-            if json_match:
-                text = json_match.group(0)
+        # One authoritative payload or nothing: an echoed schema example
+        # must never become the saved PMSeed (#1838).
+        text = extract_json_payload(response.strip())
+        if text is None:
+            raise ValueError("no unambiguous JSON payload in PM seed response")
 
         data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("PM seed payload must be a JSON object")
 
         # Parse user stories
         stories = tuple(
@@ -1234,8 +1596,17 @@ Include them as original question text in "decide_later_items":
             if item not in all_decide_later:
                 all_decide_later.append(item)
 
-        # Include brownfield repos — use session-stored repos, not DB
-        brownfield_repos = tuple(dict(r) for r in self._selected_brownfield_repos)
+        # Include brownfield repos — use session-stored repos, not DB.
+        # Snapshot worktree paths are working locations only; the seed must
+        # record the durable source checkout (``source_path``) instead.
+        def _durable_repo(repo: dict[str, str]) -> dict[str, str]:
+            entry = dict(repo)
+            source = entry.pop("source_path", None)
+            if source:
+                entry["path"] = source
+            return entry
+
+        brownfield_repos = tuple(_durable_repo(r) for r in self._selected_brownfield_repos)
 
         return PMSeed(
             pm_id=f"pm_seed_{interview_id}",

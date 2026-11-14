@@ -19,7 +19,7 @@ from typing import Any
 
 import structlog
 
-from ouroboros.config import get_context_compression_model
+from ouroboros.config import get_llm_backend_for_role, get_llm_model_for_role
 from ouroboros.core.errors import ProviderError
 from ouroboros.core.types import Result
 from ouroboros.providers.base import CompletionConfig, LLMAdapter, Message, MessageRole
@@ -238,7 +238,13 @@ async def compress_context_with_llm(
     Returns:
         Result containing the compressed summary or a ProviderError.
     """
-    resolved_model = model or get_context_compression_model()
+    model_is_explicit = model is not None
+    backend = get_llm_backend_for_role("context_compression")
+    resolved_model = get_llm_model_for_role(
+        "context_compression",
+        backend=backend,
+        explicit_model=model,
+    )
 
     # Build summarization prompt
     # Exclude recent history items from summarization
@@ -272,6 +278,8 @@ Keep the summary focused and factual. Omit unnecessary details."""
     messages = [Message(role=MessageRole.USER, content=prompt)]
     config = CompletionConfig(
         model=resolved_model,
+        role="context_compression",
+        model_is_explicit=model_is_explicit,
         temperature=0.3,  # Lower temperature for more consistent summaries
         max_tokens=2000,  # Limit summary size
     )
@@ -319,7 +327,12 @@ async def compress_context(
     Returns:
         Result containing CompressionResult or error message.
     """
-    resolved_model = model or get_context_compression_model()
+    backend = get_llm_backend_for_role("context_compression")
+    resolved_model = get_llm_model_for_role(
+        "context_compression",
+        backend=backend,
+        explicit_model=model,
+    )
     before_tokens = count_context_tokens(context, resolved_model)
 
     log.info(

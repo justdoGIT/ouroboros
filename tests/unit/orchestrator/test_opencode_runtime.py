@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from ouroboros.core.types import Result
 from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
-from ouroboros.orchestrator.adapter import AgentMessage, RuntimeHandle
+from ouroboros.orchestrator.adapter import AgentMessage, ParamSupport, RuntimeHandle
 import ouroboros.orchestrator.opencode_runtime as opencode_runtime_module
 from ouroboros.orchestrator.opencode_runtime import OpenCodeRuntime
 from ouroboros.router import Resolved, ResolveRequest
 from ouroboros.router import resolve_skill_dispatch as shared_resolve_skill_dispatch
+
+_EXPECTED_CWD = str(Path("/tmp/project").resolve())
+
+
+async def _collect_async(iterator):
+    return [item async for item in iterator]
 
 
 class _FakeStream:
@@ -33,6 +41,19 @@ class _FakeStream:
         data = bytes(self._buffer[:n])
         del self._buffer[:n]
         return data
+
+
+class _WaitForCleanupStream:
+    def __init__(self, cleanup_started: asyncio.Event) -> None:
+        self._cleanup_started = cleanup_started
+        self._closed = False
+
+    async def read(self, _n: int = -1) -> bytes:
+        if self._closed:
+            return b""
+        await self._cleanup_started.wait()
+        self._closed = True
+        return b""
 
 
 class _FakeStdin:
@@ -118,15 +139,25 @@ class TestOpenCodeRuntimeProperties:
 
     def test_working_directory(self) -> None:
         runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp/project")
-        assert runtime.working_directory == "/tmp/project"
+        assert runtime.working_directory == _EXPECTED_CWD
 
     def test_permission_mode_default(self) -> None:
         runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp")
         assert runtime.permission_mode == "bypassPermissions"
+        assert runtime.permission_mode_requested is False
 
     def test_permission_mode_custom(self) -> None:
         runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp", permission_mode="acceptEdits")
         assert runtime.permission_mode == "acceptEdits"
+        assert runtime.permission_mode_requested is True
+
+    def test_capabilities_report_non_native_params_honestly(self) -> None:
+        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp")
+
+        assert runtime.capabilities.system_prompt_support is ParamSupport.TRANSLATED
+        assert runtime.capabilities.tool_restriction_support is ParamSupport.TRANSLATED
+        assert runtime.capabilities.permission_mode_support is ParamSupport.TRANSLATED
+        assert runtime.capabilities.session_signals.after_turn_delivery is True
 
 
 class TestOpenCodeRuntimeBuildCommand:
@@ -135,8 +166,24 @@ class TestOpenCodeRuntimeBuildCommand:
     def test_basic_command(self) -> None:
         runtime = OpenCodeRuntime(cli_path="/usr/bin/opencode", cwd="/tmp")
         cmd = runtime._build_command(prompt="Hello world")
-        assert cmd == ["/usr/bin/opencode", "run", "--pure", "--format", "json"]
+        assert cmd == [
+            "/usr/bin/opencode",
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--dangerously-skip-permissions",
+        ]
         assert "Hello world" not in cmd  # prompt piped via stdin, not argv
+
+    def test_accept_edits_does_not_enable_full_permission_bypass(self) -> None:
+        runtime = OpenCodeRuntime(
+            cli_path="opencode",
+            cwd="/tmp",
+            permission_mode="acceptEdits",
+        )
+
+        assert "--dangerously-skip-permissions" not in runtime._build_command(prompt="safe")
 
     def test_command_always_includes_pure(self) -> None:
         """`--pure` is mandatory: disables opencode plugins inside the
@@ -209,7 +256,7 @@ class TestOpenCodeRuntimeHandleManagement:
         assert handle is not None
         assert handle.backend == "opencode"
         assert handle.native_session_id == "sess-123"
-        assert handle.cwd == "/tmp"
+        assert handle.cwd == str(Path("/tmp").resolve())
 
     def test_build_runtime_handle_none(self) -> None:
         runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp")
@@ -358,7 +405,7 @@ class TestOpenCodeRuntimeSkillDispatch:
         resolve_request = observed_requests[0]
         assert isinstance(resolve_request, ResolveRequest)
         assert resolve_request.prompt == prompt
-        assert resolve_request.cwd == "/tmp/project"
+        assert resolve_request.cwd == _EXPECTED_CWD
         assert resolve_request.skills_dir == tmp_path
         dispatcher.assert_awaited_once()
         mock_exec.assert_not_called()
@@ -371,9 +418,9 @@ class TestOpenCodeRuntimeSkillDispatch:
         assert intercept.first_argument == expected_argument
         assert intercept.mcp_args == {
             "seed_path": expected_argument,
-            "cwd": "/tmp/project",
-            "label": f"cwd=/tmp/project seed={expected_argument}",
-            "nested": {"values": [expected_argument, "/tmp/project"]},
+            "cwd": _EXPECTED_CWD,
+            "label": f"cwd={_EXPECTED_CWD} seed={expected_argument}",
+            "nested": {"values": [expected_argument, _EXPECTED_CWD]},
         }
         assert messages[-1].content == "Intercepted"
 
@@ -422,7 +469,7 @@ class TestOpenCodeRuntimeSkillDispatch:
         request = mock_resolve.call_args.args[0]
         assert isinstance(request, ResolveRequest)
         assert request.prompt == "ooo run seed.yaml"
-        assert request.cwd == "/tmp/project"
+        assert request.cwd == _EXPECTED_CWD
         assert request.skills_dir == tmp_path
         dispatcher.assert_awaited_once()
         assert dispatcher.await_args.args[0] is resolved
@@ -485,7 +532,7 @@ class TestOpenCodeRuntimeSkillDispatch:
         request = mock_resolve.call_args.args[0]
         assert isinstance(request, ResolveRequest)
         assert request.prompt == "ooo run prompt-derived.yaml"
-        assert request.cwd == "/tmp/project"
+        assert request.cwd == _EXPECTED_CWD
         assert request.skills_dir == tmp_path
         mock_lookup.assert_called_once_with("router_only_tool")
         fake_handler.handle.assert_awaited_once_with(
@@ -1225,6 +1272,223 @@ class TestOpenCodeRuntimeExecuteTask:
         assert len(text_msgs) >= 1
         assert "Task completed" in text_msgs[0].content
 
+    def test_windows_child_cleanup_invokes_wmic_for_parent_pid(self) -> None:
+        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp")
+        process = _FakeProcess(stdout_lines=[], stderr_lines=[], returncode=0)
+        process.pid = 4242
+
+        with (
+            patch.object(opencode_runtime_module.os, "name", "nt"),
+            patch.object(opencode_runtime_module.subprocess, "run") as mock_run,
+        ):
+            runtime._cleanup_windows_child_processes(process)
+
+        mock_run.assert_called_once_with(
+            ["wmic", "process", "where", "(ParentProcessId=4242)", "delete"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+
+    def test_windows_child_cleanup_skips_non_windows(self) -> None:
+        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp")
+        process = _FakeProcess(stdout_lines=[], stderr_lines=[], returncode=0)
+
+        with (
+            patch.object(opencode_runtime_module.os, "name", "posix"),
+            patch.object(opencode_runtime_module.subprocess, "run") as mock_run,
+        ):
+            runtime._cleanup_windows_child_processes(process)
+
+        mock_run.assert_not_called()
+
+    def test_windows_child_cleanup_logs_failures(self) -> None:
+        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp")
+        process = _FakeProcess(stdout_lines=[], stderr_lines=[], returncode=0)
+
+        with (
+            patch.object(opencode_runtime_module.os, "name", "nt"),
+            patch.object(
+                opencode_runtime_module.subprocess, "run", side_effect=TimeoutError("slow")
+            ),
+            patch.object(opencode_runtime_module.log, "warning") as mock_warning,
+        ):
+            runtime._cleanup_windows_child_processes(process)
+
+        mock_warning.assert_called_once()
+        assert mock_warning.call_args.args[0] == "opencode_runtime.windows_child_cleanup_failed"
+
+    @pytest.mark.asyncio
+    async def test_execute_task_windows_child_cleanup_runs_after_success(self) -> None:
+        text_event = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "sess-windows-cleanup",
+                "part": {"type": "text", "text": "Done"},
+            }
+        )
+        process = _FakeProcess(stdout_lines=[text_event], stderr_lines=[], returncode=0)
+        process.pid = 6789
+        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp")
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=process),
+            patch.object(opencode_runtime_module.os, "name", "nt"),
+            patch.object(opencode_runtime_module.subprocess, "run") as mock_run,
+        ):
+            messages = [msg async for msg in runtime.execute_task("Hello")]
+
+        assert any(msg.type == "result" for msg in messages)
+        mock_run.assert_called_once_with(
+            ["wmic", "process", "where", "(ParentProcessId=6789)", "delete"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_task_windows_child_cleanup_runs_before_success_stderr_drain(
+        self,
+    ) -> None:
+        text_event = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "sess-windows-stderr-held",
+                "part": {"type": "text", "text": "Done"},
+            }
+        )
+        cleanup_started = asyncio.Event()
+        process = _FakeProcess(stdout_lines=[text_event], stderr_lines=[], returncode=0)
+        process.stderr = _WaitForCleanupStream(cleanup_started)
+        process.pid = 1357
+        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp")
+
+        def cleanup_children(*_args: object, **_kwargs: object) -> None:
+            cleanup_started.set()
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=process),
+            patch.object(opencode_runtime_module.os, "name", "nt"),
+            patch.object(opencode_runtime_module.subprocess, "run", side_effect=cleanup_children),
+        ):
+            messages = await asyncio.wait_for(
+                _collect_async(runtime.execute_task("Hello")),
+                timeout=1,
+            )
+
+        assert cleanup_started.is_set()
+        assert any(msg.type == "result" for msg in messages)
+
+    @pytest.mark.asyncio
+    async def test_execute_task_windows_cleanup_failure_does_not_block_on_stderr(
+        self,
+    ) -> None:
+        text_event = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "sess-windows-stderr-cleanup-fails",
+                "part": {"type": "text", "text": "Done"},
+            }
+        )
+        cleanup_started = asyncio.Event()
+        process = _FakeProcess(stdout_lines=[text_event], stderr_lines=[], returncode=0)
+        process.stderr = _WaitForCleanupStream(cleanup_started)
+        process.pid = 9753
+        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp")
+
+        def cleanup_children(*_args: object, **_kwargs: object) -> None:
+            cleanup_started.set()
+            raise TimeoutError("wmic hung")
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=process),
+            patch.object(opencode_runtime_module.os, "name", "nt"),
+            patch.object(opencode_runtime_module.subprocess, "run", side_effect=cleanup_children),
+            patch.object(opencode_runtime_module.log, "warning") as mock_warning,
+        ):
+            messages = await asyncio.wait_for(
+                _collect_async(runtime.execute_task("Hello")),
+                timeout=1,
+            )
+
+        assert cleanup_started.is_set()
+        assert any(msg.type == "result" for msg in messages)
+        assert mock_warning.call_args.args[0] == "opencode_runtime.windows_child_cleanup_failed"
+
+    @pytest.mark.asyncio
+    async def test_execute_task_windows_cleanup_nonzero_exit_does_not_block_on_stderr(
+        self,
+    ) -> None:
+        text_event = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "sess-windows-stderr-cleanup-nonzero",
+                "part": {"type": "text", "text": "Done"},
+            }
+        )
+        cleanup_started = asyncio.Event()
+        process = _FakeProcess(stdout_lines=[text_event], stderr_lines=[], returncode=0)
+        process.stderr = _WaitForCleanupStream(cleanup_started)
+        process.pid = 8642
+        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp")
+
+        def cleanup_children(*_args: object, **_kwargs: object) -> SimpleNamespace:
+            cleanup_started.set()
+            return SimpleNamespace(returncode=1)
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=process),
+            patch.object(opencode_runtime_module.os, "name", "nt"),
+            patch.object(opencode_runtime_module.subprocess, "run", side_effect=cleanup_children),
+            patch.object(opencode_runtime_module.log, "warning") as mock_warning,
+        ):
+            messages = await asyncio.wait_for(
+                _collect_async(runtime.execute_task("Hello")),
+                timeout=1,
+            )
+
+        assert cleanup_started.is_set()
+        assert any(msg.type == "result" for msg in messages)
+        assert mock_warning.call_args.args[0] == "opencode_runtime.windows_child_cleanup_failed"
+        assert mock_warning.call_args.kwargs["returncode"] == 1
+
+    @pytest.mark.asyncio
+    async def test_execute_task_windows_child_cleanup_runs_after_aclose_termination(
+        self,
+    ) -> None:
+        text_event = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "sess-windows-aclose",
+                "part": {"type": "text", "text": "Partial"},
+            }
+        )
+        process = _FakeProcess(stdout_lines=[text_event], stderr_lines=[], returncode=0)
+        process.pid = 2468
+        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp")
+        call_order: list[str] = []
+
+        async def terminate_process(proc: _FakeProcess) -> None:
+            call_order.append("terminate")
+            proc.terminate()
+
+        def cleanup_children(*_args: object, **_kwargs: object) -> None:
+            call_order.append("cleanup")
+
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=process),
+            patch.object(opencode_runtime_module.os, "name", "nt"),
+            patch.object(runtime, "_terminate_process", side_effect=terminate_process),
+            patch.object(opencode_runtime_module.subprocess, "run", side_effect=cleanup_children),
+        ):
+            stream = runtime.execute_task("Hello")
+            first_message = await stream.__anext__()
+            await stream.aclose()
+
+        assert first_message.type == "assistant"
+        assert process.terminated
+        assert call_order == ["terminate", "cleanup"]
+
     @pytest.mark.asyncio
     async def test_execute_task_with_session_tracking(self) -> None:
         """Session ID from events is captured into the runtime handle."""
@@ -1252,6 +1516,29 @@ class TestOpenCodeRuntimeExecuteTask:
         # Find a message with a resume handle that has the session ID
         handles = [m.resume_handle for m in messages if m.resume_handle is not None]
         assert any(h.native_session_id == "sess-tracked-123" for h in handles)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "minimax/MiniMax-M3.1-Flash",
+            "minimax-cn/MiniMax-M3.1-Flash",
+            "minimax/MiniMax-M3",
+            "openrouter/minimax/minimax-m3.1-flash:free",
+            "opencode/minimax-m3.1-flash-free",
+            "minimax/MiniMax-M2.7",
+            "custom/MiniMax-M2.7",
+        ],
+    )
+    async def test_minimax_model_ids_reach_cli_unchanged(self, model: str) -> None:
+        """Discovery curation never rewrites an explicit request at dispatch."""
+        process = _FakeProcess(stdout_lines=[], stderr_lines=[], returncode=0)
+        runtime = OpenCodeRuntime(cli_path="opencode", cwd="/tmp", model=model)
+        with patch("asyncio.create_subprocess_exec", return_value=process) as mock_exec:
+            messages = [message async for message in runtime.execute_task("Hello")]
+        assert messages
+        argv = mock_exec.call_args.args
+        assert argv[argv.index("--model") + 1] == model
 
     @pytest.mark.asyncio
     async def test_execute_task_cli_not_found(self) -> None:

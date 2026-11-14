@@ -13,6 +13,23 @@ from ouroboros.orchestrator.runtime_message_projection import project_runtime_me
 class TestRuntimeMessageProjection:
     """Tests for transcript/event projection of runtime messages."""
 
+    def test_message_event_type_precedes_resumed_handle_event_type(self) -> None:
+        message = AgentMessage(
+            type="tool_result",
+            content="completed",
+            tool_name="Bash",
+            data={"runtime_event_type": "tool.completed"},
+            resume_handle=RuntimeHandle(
+                backend="codex",
+                native_session_id="session-1",
+                metadata={"runtime_event_type": "run.completed"},
+            ),
+        )
+
+        projected = project_runtime_message(message)
+
+        assert projected.runtime_metadata["runtime_event_type"] == "tool.completed"
+
     def test_projects_opencode_session_started_metadata_into_standard_signal(self) -> None:
         """Session-start lifecycle updates should stay system-scoped and resumable."""
         message = AgentMessage(
@@ -306,6 +323,50 @@ class TestRuntimeMessageProjection:
         assert projected.runtime_signal == "tool_completed"
         assert projected.runtime_status == "running"
         assert projected.runtime_metadata["tool_result"] == projected.tool_result
+
+    def test_raw_tool_result_without_error_bit_does_not_default_to_success(self) -> None:
+        """Unknown completion status must remain unknown in persisted metadata."""
+        message = AgentMessage(
+            type="assistant",
+            content="unknown result",
+            data={
+                "subtype": "tool_result",
+                "tool_name": "Edit",
+                "tool_call_id": "edit-1",
+                "tool_result": {"text_content": "unknown result"},
+            },
+        )
+
+        projected = project_runtime_message(message)
+
+        assert projected.tool_result is not None
+        assert "is_error" not in projected.tool_result
+        assert "is_error" not in projected.runtime_metadata["tool_result"]
+
+    def test_malformed_tool_result_error_bit_survives_as_invalid_metadata(self) -> None:
+        """A completed lifecycle signal cannot launder malformed error status."""
+        message = AgentMessage(
+            type="assistant",
+            content="unknown result",
+            data={
+                "subtype": "tool_result",
+                "tool_name": "Edit",
+                "tool_call_id": "edit-1",
+                "runtime_event_type": "tool.completed",
+                "is_error": "true",
+                "tool_result": {
+                    "text_content": "unknown result",
+                    "is_error": "true",
+                },
+            },
+        )
+
+        projected = project_runtime_message(message)
+
+        assert projected.tool_result is not None
+        assert projected.tool_result["is_error_invalid"] is True
+        assert projected.runtime_metadata["tool_result"]["is_error_invalid"] is True
+        assert projected.runtime_metadata["is_error_invalid"] is True
 
     def test_projects_structured_content_part_tool_metadata(self) -> None:
         """Structured session-message metadata should survive runtime projection."""

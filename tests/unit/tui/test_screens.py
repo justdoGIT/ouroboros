@@ -2,100 +2,37 @@
 
 from datetime import UTC, datetime
 
-from ouroboros.tui.events import TUIState
-from ouroboros.tui.screens.dashboard import DashboardScreen, StatusPanel
+from ouroboros.tui.events import FrugalityRetrospectiveReported, TUIState
+from ouroboros.tui.screens.dashboard_v3 import DashboardScreenV3, DoubleDiamondBar
 from ouroboros.tui.screens.debug import DebugScreen, JsonViewer, StateInspector
 from ouroboros.tui.screens.execution import ExecutionScreen, PhaseOutputPanel
 from ouroboros.tui.screens.logs import LogEntry, LogFilterBar, LogsScreen
 
 
-class TestStatusPanel:
-    """Tests for StatusPanel widget."""
-
-    def test_create_status_panel(self) -> None:
-        """Test creating status panel."""
-        panel = StatusPanel(
-            execution_id="exec_123",
-            session_id="sess_456",
-            status="running",
-            current_ac="Test AC",
+class TestDashboardFrugalityRetrospective:
+    def test_retrospective_is_visible_in_phase_bar(self) -> None:
+        state = TUIState(frugality_summary="⚖ insufficient data")
+        screen = DashboardScreenV3(state)
+        screen._phase_bar = DoubleDiamondBar()
+        screen._phase_bar.progress_text = "[2/2 AC]"
+        message = FrugalityRetrospectiveReported(
+            execution_id="exec_1",
+            summary={
+                "retry_associated_tokens": 100.0,
+                "retry_associated_attempts": 1,
+                "unaccepted_tokens": 50.0,
+                "unaccepted_attempts": 1,
+                "measured_attempts": 2,
+                "unknown_attempts": 0,
+                "invalid_attempts": 0,
+            },
         )
 
-        assert panel.execution_id == "exec_123"
-        assert panel.session_id == "sess_456"
-        assert panel.status == "running"
-        assert panel.current_ac == "Test AC"
+        screen.on_frugality_retrospective_reported(message)
 
-    def test_format_status(self) -> None:
-        """Test status formatting."""
-        panel = StatusPanel()
-
-        assert "Idle" in panel._format_status("idle")
-        assert "Running" in panel._format_status("running")
-        assert "Paused" in panel._format_status("paused")
-        assert "Completed" in panel._format_status("completed")
-        assert "Failed" in panel._format_status("failed")
-
-    def test_truncate_ac(self) -> None:
-        """Test AC truncation."""
-        panel = StatusPanel()
-
-        short_ac = "Short AC"
-        assert panel._truncate_ac(short_ac) == short_ac
-
-        long_ac = "A" * 100
-        truncated = panel._truncate_ac(long_ac)
-        assert len(truncated) == 50
-        assert truncated.endswith("...")
-
-    def test_update_status(self) -> None:
-        """Test updating status values."""
-        panel = StatusPanel()
-
-        panel.update_status(
-            execution_id="exec_new",
-            session_id="sess_new",
-            status="completed",
-            current_ac="New AC",
-        )
-
-        assert panel.execution_id == "exec_new"
-        assert panel.session_id == "sess_new"
-        assert panel.status == "completed"
-        assert panel.current_ac == "New AC"
-
-
-class TestDashboardScreen:
-    """Tests for DashboardScreen."""
-
-    def test_create_dashboard(self) -> None:
-        """Test creating dashboard screen."""
-        state = TUIState(
-            execution_id="exec_123",
-            session_id="sess_456",
-            status="running",
-        )
-        screen = DashboardScreen(state=state)
-
-        assert screen._state is state
-
-    def test_create_dashboard_no_state(self) -> None:
-        """Test creating dashboard without state."""
-        screen = DashboardScreen()
-
-        assert screen._state is None
-
-    def test_update_state(self) -> None:
-        """Test updating screen state."""
-        screen = DashboardScreen()
-        new_state = TUIState(
-            execution_id="exec_456",
-            status="completed",
-        )
-
-        screen.update_state(new_state)
-
-        assert screen._state is new_state
+        assert "⚖ insufficient data" in screen._phase_bar.progress_text
+        assert "Evidence: retry-associated 100 tok" in screen._phase_bar.progress_text
+        assert "unaccepted 50 tok" in screen._phase_bar.progress_text
 
 
 class TestPhaseOutputPanel:

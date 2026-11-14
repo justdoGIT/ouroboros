@@ -12,17 +12,48 @@ The MechanicalVerifier is stateless and produces immutable results.
 
 import asyncio
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Any
 
 from ouroboros.core.errors import ValidationError
+from ouroboros.core.project_env import with_project_venv
 from ouroboros.core.types import Result
-from ouroboros.evaluation.models import CheckResult, CheckType, MechanicalResult
+from ouroboros.evaluation.command_dispatch import prepare_command
+from ouroboros.evaluation.models import (
+    COMMAND_CHECK_TYPES,
+    CheckResult,
+    CheckType,
+    MechanicalResult,
+)
 from ouroboros.events.base import BaseEvent
 from ouroboros.events.evaluation import (
     create_stage1_completed_event,
     create_stage1_started_event,
 )
+
+_COMMAND_OUTPUT_PREVIEW_CHARS = 500
+
+
+def _output_preview(text: str) -> str:
+    """Return a compact preview from the leading portion of command output.
+
+    The diagnostically useful tail is captured separately by ``_output_tail``.
+    """
+    if not text:
+        return ""
+    if len(text) <= _COMMAND_OUTPUT_PREVIEW_CHARS:
+        return text
+    return text[:_COMMAND_OUTPUT_PREVIEW_CHARS]
+
+
+def _output_tail(text: str) -> str:
+    """Return the tail of command output where test failures usually appear."""
+    if not text:
+        return ""
+    if len(text) <= _COMMAND_OUTPUT_PREVIEW_CHARS:
+        return text
+    return text[-_COMMAND_OUTPUT_PREVIEW_CHARS:]
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,12 +89,14 @@ class CommandResult:
         stdout: Standard output
         stderr: Standard error
         timed_out: Whether the command timed out
+        executed_command: Arguments passed to the subprocess launcher, when attempted
     """
 
     return_code: int
     stdout: str
     stderr: str
     timed_out: bool = False
+    executed_command: tuple[str, ...] | None = None
 
 
 async def run_command(
@@ -81,12 +114,25 @@ async def run_command(
     Returns:
         CommandResult with output and status
     """
+    # The detector accepts a tool the project's virtualenv provides, which a
+    # task worktree reaches only through the main working tree's, so the
+    # command resolves it the same way.
+    env = os.environ.copy() if working_dir is None else with_project_venv(os.environ, working_dir)
+    # The MCP server sets this sentinel to prevent recursive server spawning.
+    # Mechanical verification must test the repository as a fresh process would;
+    # leaking the sentinel makes CLI tests take the nested-server early exit.
+    env.pop("_OUROBOROS_NESTED", None)
+    try:
+        prepared_command = prepare_command(command, env)
+    except ValueError as e:
+        return CommandResult(return_code=-1, stdout="", stderr=str(e))
     try:
         process = await asyncio.create_subprocess_exec(
-            *command,
+            *prepared_command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=working_dir,
+            env=env,
         )
 
         try:
@@ -98,6 +144,7 @@ async def run_command(
                 return_code=process.returncode or 0,
                 stdout=stdout.decode("utf-8", errors="replace"),
                 stderr=stderr.decode("utf-8", errors="replace"),
+                executed_command=prepared_command,
             )
         except TimeoutError:
             process.kill()
@@ -107,18 +154,26 @@ async def run_command(
                 stdout="",
                 stderr="Command timed out",
                 timed_out=True,
+                executed_command=prepared_command,
             )
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            raise
     except FileNotFoundError as e:
         return CommandResult(
             return_code=-1,
             stdout="",
             stderr=f"Command not found: {e}",
+            executed_command=prepared_command,
         )
     except OSError as e:
         return CommandResult(
             return_code=-1,
             stdout="",
             stderr=f"OS error: {e}",
+            executed_command=prepared_command,
         )
 
 
@@ -133,20 +188,159 @@ def parse_coverage_from_output(output: str) -> float | None:
     """
     # Look for "TOTAL ... XX%" pattern
     import re
+    import unicodedata
+
+    # C1 control characters include the single-character CSI (U+009B).
+    # Do not interpret terminal control semantics when approving evidence.
+    # Check before splitlines, which itself consumes some C1 characters.
+    if any("\x80" <= char <= "\x9f" for char in output):
+        return None
 
     # Pattern matches lines like "TOTAL   1234   123  90%"
-    pattern = r"TOTAL\s+\d+\s+\d+\s+(\d+)%"
-    match = re.search(pattern, output)
-    if match:
-        return float(match.group(1)) / 100.0
+    pattern = r"[ \t]*TOTAL[ \t]+\d+[ \t]+\d+[ \t]+(\d+)%[ \t]*"
+    # Alternative pattern: a line that starts with "Coverage: XX%". Anchored so
+    # a requirement such as "Required Coverage: 70%" is not read as a result.
+    alt_pattern = r"[ \t]*Coverage:[ \t]*(\d+(?:\.\d+)?)%[ \t]*"
 
-    # Alternative pattern: "Coverage: XX%"
-    alt_pattern = r"Coverage:\s*(\d+(?:\.\d+)?)%"
-    alt_match = re.search(alt_pattern, output)
-    if alt_match:
-        return float(alt_match.group(1)) / 100.0
+    # Every TOTAL row is a figure from the report. One in a shape the pattern
+    # cannot read (decimals, branch columns) makes the report ambiguous, so no
+    # other row or "Coverage:" line may stand in for it.
+    total_rows = [row for row in output.splitlines() if re.match(r"[ \t]*TOTAL\b", row)]
+    # A numeric, punctuation-led or empty Coverage body is a measurement candidate,
+    # even with missing/malformed separators, numbers or units. Alphabetic prose
+    # remains nonmeasurement; only alt_pattern can grant a supported reading.
+    candidate_pattern = r"[ \t]*Coverage[ \t]*(?:$|\d|[^\w\s]|(?i:nan|inf(?:inity)?|percent)\b)"
+    coverage_rows = [
+        row for row in output.splitlines() if re.match(candidate_pattern, row, re.IGNORECASE)
+    ]
+    # Go test appends its coverage figure to the package result line. This is
+    # not a supported measurement dialect, but it must not be ignored beside
+    # a different supported figure.
+    go_coverage = r"[ \t]*ok[ \t]+\S+[ \t]+\S+[ \t]+coverage:"
+    if any(re.match(go_coverage, row, re.IGNORECASE) for row in output.splitlines()):
+        return None
+    # Detect Jest's aggregate and Node's spec/TAP-prefixed coverage rows
+    # without interpreting their values as supported measurements.
+    jest_coverage = r"[ \t]*(?:[ℹ#][ \t]*)?All[ \t]+files[ \t]*\|"
+    # Tarpaulin reports a percentage before its line-count summary. It is
+    # not a supported dialect and must not be masked by a separate TOTAL.
+    tarpaulin_coverage = (
+        r"[ \t]*\d+(?:\.\d+)?%[ \t]+coverage[ \t]*,[ \t]*"
+        r"\d+[ \t]*/[ \t]*\d+[ \t]+lines[ \t]+covered\b"
+    )
+    # `coverage report --format=total` emits a bare number, optionally with
+    # decimal precision. It cannot safely be assigned to a report when mixed
+    # with another result; the same applies to a bare percentage.
+    bare_coverage = r"[ \t]*\d+(?:\.\d+)?%?[ \t]*"
+    # LCOV contains per-file records rather than a supported aggregate. Treat
+    # recognizable partial records as ambiguous too; their values need not be
+    # complete for a separate TOTAL to mask an unreadable report.
+    lcov = r"[ \t]*(?:(?:TN|SF|VER|FN|FNDA|FNF|FNH|BRDA|BRF|BRH|DA|LF|LH):.*|end_of_record)[ \t]*"
+    # Cobertura XML is not interpreted as a supported aggregate.
+    xml_coverage = r"<(?:[^\s<>/:]+:)?coverage(?:[ \t/>]|$)"
 
-    return None
+    def detection_text(row: str) -> str:
+        # Remove decoration only for refusal detection, never positive proof.
+        uncolored = re.sub(r"\x1b\[[0-9;]{0,32}m", "", row)
+        return "".join(
+            char
+            for char in uncolored
+            if char in "\t\x1b"
+            or (unicodedata.category(char) not in {"Cc", "Cf"} and char != "\ufffd")
+        )
+
+    for row in output.splitlines():
+        uncolored = detection_text(row)
+        if uncolored != row and (
+            re.match(r"[ \t]*TOTAL\b", uncolored)
+            or re.match(candidate_pattern, uncolored, re.IGNORECASE)
+            or re.match(go_coverage, uncolored, re.IGNORECASE)
+            or uncolored.lstrip().startswith("{")
+        ):
+            return None
+        if (
+            re.match(jest_coverage, uncolored, re.IGNORECASE)
+            or re.match(tarpaulin_coverage, uncolored, re.IGNORECASE)
+            or re.fullmatch(bare_coverage, uncolored)
+            or re.fullmatch(lcov, uncolored)
+            or re.search(xml_coverage, uncolored, re.IGNORECASE)
+        ):
+            return None
+        # An unknown control sequence can conceal a measurement in any row,
+        # including a Go package result with no table separator. Do not guess
+        # at its terminal semantics when using output as approval evidence.
+        if "\x1b" in uncolored:
+            return None
+
+    # go test -json wraps the same text in line-delimited output events. Do
+    # not let an unrelated supported row stand in for a wrapped Go report.
+    import json
+
+    streams: dict[str, str] = {}
+    stream_size = 0
+    event_count = 0
+    for row in output.splitlines():
+        if not row.lstrip().startswith("{"):
+            continue
+        # Unparseable or oversized JSON-shaped output must not hide another
+        # coverage dialect beside a seemingly supported measurement.
+        if len(row) > 65536:
+            return None
+        try:
+            event = json.loads(row)
+        except (ValueError, TypeError, RecursionError):
+            return None
+        if not isinstance(event, dict) or event.get("Action") != "output":
+            continue
+        package = event.get("Package")
+        if not isinstance(package, str):
+            # An output event without a package cannot be safely joined to a
+            # stream; it may contain part of a conflicting measurement.
+            return None
+        text = event.get("Output")
+        if not isinstance(text, str):
+            return None
+        # JSON escapes can hide C1 controls until decoding.
+        if any("\x80" <= char <= "\x9f" for char in text):
+            return None
+        event_count += 1
+        stream_size += len(text)
+        if (
+            event_count > 256
+            or stream_size > 65536
+            or (package not in streams and len(streams) >= 64)
+        ):
+            return None
+        streams[package] = streams.get(package, "") + text
+        # Escapes can also conceal Cc/Cf or replacement characters until decoding.
+        if any(
+            "\x1b" in line
+            or re.match(r"[ \t]*TOTAL\b", line)
+            or re.match(candidate_pattern, line, re.IGNORECASE)
+            or re.match(go_coverage, line, re.IGNORECASE)
+            or re.match(jest_coverage, line, re.IGNORECASE)
+            or re.match(tarpaulin_coverage, line, re.IGNORECASE)
+            or re.fullmatch(bare_coverage, line)
+            or re.fullmatch(lcov, line)
+            or re.search(xml_coverage, line, re.IGNORECASE)
+            for row in streams[package].splitlines()
+            for line in (re.sub(r"\x1b\[[0-9;]{0,32}m", "", row), detection_text(row))
+        ):
+            return None
+    matches = [re.fullmatch(pattern, row) for row in total_rows]
+    matches += [re.fullmatch(alt_pattern, row) for row in coverage_rows]
+    if not all(matches):
+        return None
+    readings = [match.group(1) for match in matches if match]
+    values = {float(reading) for reading in readings}
+    # More than one distinct figure, or a figure no tool can report, is not a
+    # measurement: return None so the threshold stays undecided.
+    if len(values) != 1:
+        return None
+    (value,) = values
+    if value > 100.0:
+        return None
+    return value / 100.0
 
 
 class MechanicalVerifier:
@@ -183,7 +377,7 @@ class MechanicalVerifier:
             Result containing MechanicalResult and events, or error
         """
         if checks is None:
-            checks = list(CheckType)
+            checks = list(COMMAND_CHECK_TYPES)
 
         events: list[BaseEvent] = []
         check_results: list[CheckResult] = []
@@ -221,6 +415,7 @@ class MechanicalVerifier:
                             passed=False,
                             message=f"Coverage {coverage_score:.1%} below threshold {self.config.coverage_threshold:.1%}",
                             details=cr.details,
+                            executed=cr.executed,
                         )
                     )
                 else:
@@ -269,6 +464,7 @@ class MechanicalVerifier:
                 passed=True,
                 message=f"Check {check_type.value} skipped (no command configured)",
                 details={"skipped": True},
+                executed=False,
             )
 
         cmd_result = await run_command(
@@ -282,19 +478,59 @@ class MechanicalVerifier:
                 check_type=check_type,
                 passed=False,
                 message=f"Check {check_type.value} timed out after {self.config.timeout_seconds}s",
-                details={"timed_out": True},
+                executed=True,
+                details={
+                    "timed_out": True,
+                    "command": list(command),
+                    **(
+                        {"executed_command": list(cmd_result.executed_command)}
+                        if cmd_result.executed_command is not None
+                        else {}
+                    ),
+                    "working_dir": str(self.config.working_dir)
+                    if self.config.working_dir
+                    else None,
+                },
             )
 
         passed = cmd_result.return_code == 0
         details: dict[str, Any] = {
+            "command": list(command),
+            "working_dir": str(self.config.working_dir) if self.config.working_dir else None,
             "return_code": cmd_result.return_code,
-            "stdout_preview": cmd_result.stdout[:500] if cmd_result.stdout else "",
-            "stderr_preview": cmd_result.stderr[:500] if cmd_result.stderr else "",
+            "stdout_preview": _output_preview(cmd_result.stdout),
+            "stderr_preview": _output_preview(cmd_result.stderr),
+            "stdout_tail": _output_tail(cmd_result.stdout),
+            "stderr_tail": _output_tail(cmd_result.stderr),
         }
+        if cmd_result.executed_command is not None:
+            details["executed_command"] = list(cmd_result.executed_command)
 
         # Extract coverage if this was a coverage check
         if check_type == CheckType.COVERAGE and passed:
             coverage = parse_coverage_from_output(cmd_result.stdout)
+            # Do not let a trusted-looking stdout row mask a conflicting or
+            # unreadable coverage report emitted on stderr. A stderr-only row
+            # does not become new positive evidence through this cross-check.
+            if coverage is not None and cmd_result.stderr:
+                combined = parse_coverage_from_output(cmd_result.stdout + "\n" + cmd_result.stderr)
+                if combined != coverage:
+                    coverage = None
+            if coverage is None and self.config.coverage_threshold != 0.0:
+                # The exit code says the command ran, not that coverage met the
+                # threshold. Without a figure the threshold is undecided: not a
+                # pass, and not an executed failure that would claim a measurement.
+                return CheckResult(
+                    check_type=check_type,
+                    passed=False,
+                    message=(
+                        "Coverage command exited 0 but no coverage figure could be read "
+                        f"from its output; threshold {self.config.coverage_threshold:.1%} "
+                        "not verified"
+                    ),
+                    details={**details, "coverage_unparsed": True},
+                    executed=False,
+                )
             if coverage is not None:
                 details["coverage_score"] = coverage
 
@@ -309,6 +545,7 @@ class MechanicalVerifier:
             passed=passed,
             message=message,
             details=details,
+            executed=True,
         )
 
     def _get_command_for_check(self, check_type: CheckType) -> tuple[str, ...] | None:

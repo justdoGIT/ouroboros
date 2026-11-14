@@ -9,22 +9,44 @@ Event Types:
     - orchestrator.session.failed: Session encountered fatal error
     - orchestrator.session.cancelled: Session was cancelled by user/auto-cleanup
     - orchestrator.session.paused: Session paused for resumption
+    - orchestrator.guidance.injected: Bounded guidance injection audit metadata
     - orchestrator.progress.updated: Progress checkpoint
     - orchestrator.task.started: Individual task started
     - orchestrator.task.completed: Individual task completed
     - orchestrator.tool.called: Tool was invoked by agent
     - orchestrator.policy.capabilities.evaluated: Batched per-capability
       policy decisions for a session-scoped policy evaluation
+    - execution.ac.investment_assessed: Exact AC investment authority used by
+      effort policy
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
+from ouroboros.core.project_identity import ProjectIdentity
 from ouroboros.events.base import BaseEvent
 from ouroboros.orchestrator.capabilities import CapabilityDescriptor, CapabilityGraph
 from ouroboros.orchestrator.policy import PolicyContext, PolicyDecision
+
+_MAX_GUIDANCE_REFS = 16
+_MAX_GUIDANCE_REF_VALUE_LENGTH = 512
+_GUIDANCE_REF_ALLOWED_KEYS = frozenset(
+    {
+        "id",
+        "stable_id",
+        "source",
+        "kind",
+        "stage",
+        "role",
+        "path",
+        "content_hash",
+        "size_bytes",
+    }
+)
+FRUGALITY_RETROSPECTIVE_EVENT_TYPE = "execution.frugality_retrospective.reported"
 
 
 def create_session_started_event(
@@ -32,6 +54,9 @@ def create_session_started_event(
     execution_id: str,
     seed_id: str,
     seed_goal: str,
+    *,
+    project_identity: ProjectIdentity | None = None,
+    gate_forced: bool | None = None,
 ) -> BaseEvent:
     """Create session started event.
 
@@ -40,19 +65,65 @@ def create_session_started_event(
         execution_id: Associated workflow execution ID.
         seed_id: ID of the seed being executed.
         seed_goal: Goal from the seed specification.
+        gate_forced: Whether the Seed bypassed the ambiguity gate. ``None``
+            preserves the legacy event shape when the decision is unknown.
+        project_identity: Canonical Project Map V1 anchor, mandatory for
+            runner-owned new sessions. Historical and contract-free low-level
+            events may omit it.
 
     Returns:
         BaseEvent for session start.
     """
+    data = {
+        "execution_id": execution_id,
+        "seed_id": seed_id,
+        "seed_goal": seed_goal,
+        "start_time": datetime.now(UTC).isoformat(),
+    }
+    if project_identity is not None:
+        data.update(project_identity.to_event_data())
+    if gate_forced is not None:
+        data["gate_forced"] = gate_forced
     return BaseEvent(
         type="orchestrator.session.started",
         aggregate_type="session",
         aggregate_id=session_id,
+        data=data,
+    )
+
+
+def create_guidance_injected_event(
+    *,
+    session_id: str,
+    execution_id: str,
+    guidance_refs: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    fragment_hash: str,
+    fragment_size_bytes: int,
+    delivery_mode: str,
+    injection_key: str = "start",
+) -> BaseEvent:
+    """Create bounded audit metadata for injected implementation guidance.
+
+    The event intentionally records references and content fingerprints only.
+    It must not carry the raw guidance body; ref serialization accepts only
+    the known provenance fields and bounds every scalar value.
+    """
+    return BaseEvent(
+        type="orchestrator.guidance.injected",
+        aggregate_type="session",
+        aggregate_id=session_id,
         data={
+            "session_id": session_id,
             "execution_id": execution_id,
-            "seed_id": seed_id,
-            "seed_goal": seed_goal,
-            "start_time": datetime.now(UTC).isoformat(),
+            "guidance_refs": _serialize_guidance_refs(guidance_refs),
+            "fragment_hash": fragment_hash.strip()[:_MAX_GUIDANCE_REF_VALUE_LENGTH],
+            "fragment_size_bytes": max(fragment_size_bytes, 0),
+            "stage": "execute",
+            "role": "implementation",
+            "delivery_mode": delivery_mode.strip()[:_MAX_GUIDANCE_REF_VALUE_LENGTH],
+            "injection_key": injection_key.strip()[:_MAX_GUIDANCE_REF_VALUE_LENGTH],
+            "provenance_scope": "ouroboros_declared_guidance_only",
+            "injected_at": datetime.now(UTC).isoformat(),
         },
     )
 
@@ -147,6 +218,10 @@ def create_session_paused_event(
     session_id: str,
     reason: str,
     resume_hint: str | None = None,
+    *,
+    pause_seconds: int | None = None,
+    resume_after: datetime | None = None,
+    pause_kind: str | None = None,
 ) -> BaseEvent:
     """Create session paused event.
 
@@ -158,15 +233,23 @@ def create_session_paused_event(
     Returns:
         BaseEvent for session pause.
     """
+    data: dict[str, Any] = {
+        "reason": reason,
+        "resume_hint": resume_hint,
+        "paused_at": datetime.now(UTC).isoformat(),
+    }
+    if pause_seconds is not None:
+        data["pause_seconds"] = pause_seconds
+    if resume_after is not None:
+        data["resume_after"] = resume_after.isoformat()
+    if pause_kind is not None:
+        data["pause_kind"] = pause_kind
+
     return BaseEvent(
         type="orchestrator.session.paused",
         aggregate_type="session",
         aggregate_id=session_id,
-        data={
-            "reason": reason,
-            "resume_hint": resume_hint,
-            "paused_at": datetime.now(UTC).isoformat(),
-        },
+        data=data,
     )
 
 
@@ -359,6 +442,33 @@ def create_mcp_tools_loaded_event(
         aggregate_id=session_id,
         data=data,
     )
+
+
+def _serialize_guidance_refs(
+    guidance_refs: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> list[dict[str, str]]:
+    serialized: list[dict[str, str]] = []
+    for ref in guidance_refs[:_MAX_GUIDANCE_REFS]:
+        if not isinstance(ref, dict):
+            continue
+        item: dict[str, str] = {}
+        for key, value in ref.items():
+            if not isinstance(key, str):
+                continue
+            normalized_key = key.strip()
+            if normalized_key not in _GUIDANCE_REF_ALLOWED_KEYS:
+                continue
+            if isinstance(value, str):
+                normalized_value = value.strip()
+            elif isinstance(value, int | float | bool):
+                normalized_value = str(value)
+            else:
+                continue
+            if normalized_value:
+                item[normalized_key] = normalized_value[:_MAX_GUIDANCE_REF_VALUE_LENGTH]
+        if item:
+            serialized.append(item)
+    return serialized
 
 
 def _serialize_policy_capability_evaluation(
@@ -613,6 +723,10 @@ def create_execution_terminal_event(
     summary: dict[str, Any] | None = None,
     error_message: str | None = None,
     messages_processed: int = 0,
+    pause_seconds: int | None = None,
+    resume_after: datetime | None = None,
+    pause_kind: str | None = None,
+    resume_hint: str | None = None,
 ) -> BaseEvent:
     """Mirror a session terminal state into the execution event stream.
 
@@ -635,6 +749,14 @@ def create_execution_terminal_event(
         data["summary"] = summary
     if error_message is not None:
         data["error_message"] = error_message
+    if pause_seconds is not None:
+        data["pause_seconds"] = pause_seconds
+    if resume_after is not None:
+        data["resume_after"] = resume_after.isoformat()
+    if pause_kind is not None:
+        data["pause_kind"] = pause_kind
+    if resume_hint is not None:
+        data["resume_hint"] = resume_hint
     return BaseEvent(
         type="execution.terminal",
         aggregate_type="execution",
@@ -643,10 +765,47 @@ def create_execution_terminal_event(
     )
 
 
+def create_frugality_retrospective_event(
+    execution_id: str,
+    data: dict[str, Any],
+    *,
+    session_id: str | None = None,
+) -> BaseEvent:
+    """Create a deterministic, session-scoped v1 retrospective event.
+
+    Execution ids can be intentionally shared by multiple orchestration
+    sessions.  Include the session (and, when present, acceptance generation)
+    in the event identity so one session's retrospective cannot deduplicate or
+    overwrite another's.
+    """
+    resolved_session_id = session_id or (
+        data.get("session_id") if isinstance(data.get("session_id"), str) else None
+    )
+    generation = (
+        data.get("acceptance_generation_id")
+        if isinstance(data.get("acceptance_generation_id"), str)
+        else None
+    )
+    identity_scope = "\x00".join((execution_id, resolved_session_id or "", generation or ""))
+    event_id = uuid5(
+        NAMESPACE_URL,
+        f"ouroboros:{FRUGALITY_RETROSPECTIVE_EVENT_TYPE}:v1:{identity_scope}",
+    )
+    return BaseEvent(
+        id=str(event_id),
+        type=FRUGALITY_RETROSPECTIVE_EVENT_TYPE,
+        aggregate_type="execution",
+        aggregate_id=execution_id,
+        data=data,
+    )
+
+
 __all__ = [
+    "FRUGALITY_RETROSPECTIVE_EVENT_TYPE",
     "create_ac_stall_detected_event",
     "create_drift_measured_event",
     "create_execution_terminal_event",
+    "create_frugality_retrospective_event",
     "create_heartbeat_event",
     "create_mcp_tools_loaded_event",
     "create_policy_capabilities_evaluated_event",

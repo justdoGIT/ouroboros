@@ -62,12 +62,9 @@ class _FakeProcess:
 @pytest.mark.asyncio
 async def test_codex_mcp_timeout_falls_back_to_pass_through_cli_flow(tmp_path: Path) -> None:
     """A recoverable MCP failure should fall through to normal Codex execution."""
-    runtime = create_agent_runtime(
-        backend="codex",
-        cli_path="codex",
-        cwd=tmp_path,
-        permission_mode="acceptEdits",
-    )
+    codex = tmp_path / "codex"
+    codex.write_text("#!/bin/sh\necho codex test\n", encoding="utf-8")
+    codex.chmod(0o755)
 
     fake_server = AsyncMock()
     fake_server.call_tool = AsyncMock(
@@ -110,18 +107,24 @@ async def test_codex_mcp_timeout_falls_back_to_pass_through_cli_flow(tmp_path: P
             side_effect=fake_create_subprocess_exec,
         ) as mock_exec,
     ):
+        runtime = create_agent_runtime(
+            backend="codex",
+            cli_path=str(codex),
+            cwd=tmp_path,
+            permission_mode="acceptEdits",
+        )
         messages = [message async for message in runtime.execute_task("ooo run seed.yaml")]
 
     assert captured_processes[0].stdin.written == b"ooo run seed.yaml"
     fake_server.call_tool.assert_awaited_once_with(
-        "ouroboros_execute_seed",
+        "ouroboros_start_execute_seed",
         {"seed_path": "seed.yaml", "cwd": str(tmp_path)},
     )
     mock_exec.assert_called_once()
     mock_warning.assert_called_once()
     assert mock_warning.call_args[0][0] == "codex_cli_runtime.skill_intercept_dispatch_failed"
     assert mock_warning.call_args.kwargs["skill"] == "run"
-    assert mock_warning.call_args.kwargs["tool"] == "ouroboros_execute_seed"
+    assert mock_warning.call_args.kwargs["tool"] == "ouroboros_start_execute_seed"
     assert mock_warning.call_args.kwargs["command_prefix"] == "ooo run"
     assert mock_warning.call_args.kwargs["recoverable"] is True
     assert mock_warning.call_args.kwargs["error_type"] == "MCPTimeoutError"

@@ -8,16 +8,55 @@ from unittest.mock import patch
 
 import pytest
 
+from ouroboros.config.models import OrchestratorConfig, OuroborosConfig
+from ouroboros.core.errors import ConfigError
 from ouroboros.core.worktree import (
     TaskWorkspace,
     WorktreeError,
     _acquire_lock,
     _branch_exists,
+    _run_git,
+    _worktree_cleanup_policy,
+    cleanup_task_workspace,
     maybe_prepare_task_workspace,
     maybe_restore_task_workspace,
     prepare_task_workspace,
+    release_lock,
+    release_task_workspace,
     restore_task_workspace,
 )
+
+
+def test_run_git_decodes_non_ascii_paths_as_utf8(tmp_path: Path) -> None:
+    repo_path = "C:/Users/example/문서/우로보로스"
+    completed = subprocess.CompletedProcess(
+        args=["git", "rev-parse", "--show-toplevel"],
+        returncode=0,
+        stdout=f"{repo_path}\n",
+        stderr="",
+    )
+
+    with patch("ouroboros.core.worktree.subprocess.run", return_value=completed) as run:
+        assert _run_git(["rev-parse", "--show-toplevel"], tmp_path) == repo_path
+
+    assert run.call_args.kwargs["text"] is True
+    assert run.call_args.kwargs["encoding"] == "utf-8"
+    assert run.call_args.kwargs["errors"] == "replace"
+
+
+def test_run_git_round_trips_non_ascii_repository_path(tmp_path: Path) -> None:
+    repo = tmp_path / "문서" / "우로보로스"
+    repo.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "--quiet"],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    )
+
+    resolved = Path(_run_git(["rev-parse", "--show-toplevel"], repo)).resolve()
+
+    assert resolved == repo.resolve()
 
 
 def _workspace(path_root: Path) -> TaskWorkspace:
@@ -46,6 +85,34 @@ class TestMaybePrepareTaskWorkspace:
         assert result is None
         prepare_mock.assert_not_called()
 
+
+class TestWorktreeCleanupPolicy:
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            FileNotFoundError("missing"),
+            PermissionError("unreadable"),
+            ConfigError("invalid"),
+        ],
+    )
+    def test_load_failure_fails_closed_to_keep(self, failure: Exception) -> None:
+        with patch("ouroboros.core.worktree.load_config", side_effect=failure):
+            assert _worktree_cleanup_policy() == "keep"
+
+    def test_explicit_keep_is_preserved(self) -> None:
+        config = OuroborosConfig(orchestrator=OrchestratorConfig(worktree_cleanup="keep"))
+        with patch("ouroboros.core.worktree.load_config", return_value=config):
+            assert _worktree_cleanup_policy() == "keep"
+
+    def test_valid_default_uses_prune_merged(self) -> None:
+        with patch(
+            "ouroboros.core.worktree.load_config",
+            return_value=OuroborosConfig(),
+        ):
+            assert _worktree_cleanup_policy() == "prune-merged"
+
+
+class TestMaybePrepareTaskWorkspaceContinued:
     def test_returns_none_when_source_cwd_is_not_git_repo(self, tmp_path: Path) -> None:
         with (
             patch("ouroboros.core.worktree._worktrees_enabled", return_value=True),
@@ -57,18 +124,21 @@ class TestMaybePrepareTaskWorkspace:
         assert result is None
         prepare_mock.assert_not_called()
 
-    def test_returns_none_for_dirty_delegated_parent_workspace(self, tmp_path: Path) -> None:
+    def test_allows_dirty_delegated_parent_workspace(self, tmp_path: Path) -> None:
         repo_root = tmp_path / "repo"
+        prepared_workspace = _workspace(tmp_path)
         with (
             patch("ouroboros.core.worktree._worktrees_enabled", return_value=True),
             patch("ouroboros.core.worktree._try_resolve_repo_root", return_value=repo_root),
-            patch("ouroboros.core.worktree._checkout_is_dirty", return_value=True),
-            patch("ouroboros.core.worktree.prepare_task_workspace") as prepare_mock,
+            patch(
+                "ouroboros.core.worktree.prepare_task_workspace",
+                return_value=prepared_workspace,
+            ) as prepare_mock,
         ):
             result = maybe_prepare_task_workspace(tmp_path, "orch_test", allow_dirty=True)
 
-        assert result is None
-        prepare_mock.assert_not_called()
+        assert result == prepared_workspace
+        prepare_mock.assert_called_once_with(tmp_path, "orch_test", allow_dirty=True)
 
 
 class TestMaybeRestoreTaskWorkspace:
@@ -177,6 +247,8 @@ class TestRestoreTaskWorkspace:
                 return caller_repo
             if resolved == foreign_worktree.resolve():
                 return foreign_repo
+            if resolved == source_dir.resolve():
+                return caller_repo
             raise AssertionError(f"unexpected path: {path}")
 
         with (
@@ -212,9 +284,15 @@ class TestRestoreTaskWorkspace:
         source_dir.mkdir(parents=True)
         prepared_workspace = _workspace(tmp_path)
 
+        def fake_common_repo_root(path: Path) -> Path:
+            return caller_repo if path.resolve() == source_dir.resolve() else foreign_repo
+
         with (
             patch("ouroboros.core.worktree._worktree_root", return_value=worktree_root),
-            patch("ouroboros.core.worktree._resolve_common_repo_root", return_value=foreign_repo),
+            patch(
+                "ouroboros.core.worktree._resolve_common_repo_root",
+                side_effect=fake_common_repo_root,
+            ),
             patch("ouroboros.core.worktree._resolve_repo_root", return_value=caller_repo),
             patch(
                 "ouroboros.core.worktree.prepare_task_workspace",
@@ -260,6 +338,27 @@ class TestRestoreTaskWorkspace:
 class TestWorktreeHardening:
     """Tests for malformed lock and invalid durable-id handling."""
 
+    @staticmethod
+    def _git(repo: Path, *args: str) -> str:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    @classmethod
+    def _init_repo(cls, repo: Path) -> None:
+        repo.mkdir()
+        cls._git(repo, "init", "-b", "main")
+        cls._git(repo, "config", "user.email", "test@example.com")
+        cls._git(repo, "config", "user.name", "Test User")
+        (repo / "tracked.txt").write_text("initial\n", encoding="utf-8")
+        cls._git(repo, "add", "tracked.txt")
+        cls._git(repo, "commit", "-m", "initial")
+
     def test_acquire_lock_raises_worktree_error_for_malformed_lock_file(
         self, tmp_path: Path
     ) -> None:
@@ -296,3 +395,261 @@ class TestWorktreeHardening:
         ):
             with pytest.raises(WorktreeError, match="Invalid durable task identifier"):
                 prepare_task_workspace(repo_root, "bad id")
+
+    def test_prepare_task_workspace_explains_empty_repository_recovery(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo_root = tmp_path / "repo"
+        worktree_root = tmp_path / "worktrees"
+        repo_root.mkdir()
+        self._git(repo_root, "init", "-b", "main")
+
+        with patch("ouroboros.core.worktree._worktree_root", return_value=worktree_root):
+            with pytest.raises(WorktreeError, match="Create an initial commit first") as exc_info:
+                prepare_task_workspace(repo_root, "orch_test_empty")
+
+        assert "git commit --allow-empty" in exc_info.value.message
+
+    def test_maybe_prepare_creates_clean_worktree_from_dirty_source_by_default(
+        self, tmp_path: Path
+    ) -> None:
+        repo_root = tmp_path / "repo"
+        worktree_root = tmp_path / "worktrees"
+        self._init_repo(repo_root)
+        (repo_root / "dirty.txt").write_text("uncommitted caller work\n", encoding="utf-8")
+
+        with (
+            patch("ouroboros.core.worktree._worktrees_enabled", return_value=True),
+            patch("ouroboros.core.worktree._worktree_root", return_value=worktree_root),
+        ):
+            workspace = maybe_prepare_task_workspace(
+                repo_root,
+                "orch_test_dirty",
+            )
+
+        try:
+            assert workspace is not None
+            assert workspace.worktree_path != str(repo_root)
+            assert Path(workspace.worktree_path).is_dir()
+            assert workspace.effective_cwd == workspace.worktree_path
+            assert self._git(Path(workspace.worktree_path), "status", "--porcelain") == ""
+            assert not (Path(workspace.worktree_path) / "dirty.txt").exists()
+            assert (repo_root / "dirty.txt").read_text(encoding="utf-8") == (
+                "uncommitted caller work\n"
+            )
+        finally:
+            if workspace is not None:
+                release_lock(workspace.lock_path, workspace.lock_owner)
+
+    def test_prune_merged_policy_removes_clean_worktree_branch_and_lock(
+        self, tmp_path: Path
+    ) -> None:
+        repo_root = tmp_path / "repo"
+        worktree_root = tmp_path / "worktrees"
+        self._init_repo(repo_root)
+
+        with (
+            patch("ouroboros.core.worktree._worktree_root", return_value=worktree_root),
+            patch("ouroboros.core.worktree._worktree_cleanup_policy", return_value="prune-merged"),
+        ):
+            workspace = prepare_task_workspace(repo_root, "orch_test_cleanup")
+            release_task_workspace(workspace, cleanup=True)
+
+        assert not Path(workspace.worktree_path).exists()
+        assert not Path(workspace.lock_path).exists()
+        assert not _branch_exists(repo_root, workspace.branch)
+
+    def test_cleanup_prunes_stale_registration_when_directory_deleted_externally(
+        self, tmp_path: Path
+    ) -> None:
+        import shutil as _shutil
+
+        repo_root = tmp_path / "repo"
+        worktree_root = tmp_path / "worktrees"
+        self._init_repo(repo_root)
+
+        with patch("ouroboros.core.worktree._worktree_root", return_value=worktree_root):
+            workspace = prepare_task_workspace(repo_root, "orch_test_stale_reg")
+            release_lock(workspace.lock_path, workspace.lock_owner)
+            # Simulate external deletion: directory gone, .git/worktrees
+            # registration (and branch lock) left behind.
+            _shutil.rmtree(workspace.worktree_path)
+
+            removed = cleanup_task_workspace(workspace, policy="prune-merged")
+
+        assert removed is True
+        # Stale registration dropped and merged branch deleted despite the
+        # leftover .git/worktrees metadata.
+        assert workspace.worktree_path not in self._git(
+            repo_root, "worktree", "list", "--porcelain"
+        )
+        assert not _branch_exists(repo_root, workspace.branch)
+
+    def test_prune_merged_policy_keeps_unmerged_worktree_branch_but_releases_lock(
+        self, tmp_path: Path
+    ) -> None:
+        repo_root = tmp_path / "repo"
+        worktree_root = tmp_path / "worktrees"
+        self._init_repo(repo_root)
+
+        with (
+            patch("ouroboros.core.worktree._worktree_root", return_value=worktree_root),
+            patch("ouroboros.core.worktree._worktree_cleanup_policy", return_value="prune-merged"),
+        ):
+            workspace = prepare_task_workspace(repo_root, "orch_test_unmerged")
+            worktree_path = Path(workspace.worktree_path)
+            (worktree_path / "feature.txt").write_text("feature\n", encoding="utf-8")
+            self._git(worktree_path, "add", "feature.txt")
+            self._git(worktree_path, "commit", "-m", "feature")
+
+            release_task_workspace(workspace, cleanup=True)
+
+        assert Path(workspace.worktree_path).exists()
+        assert not Path(workspace.lock_path).exists()
+        assert _branch_exists(repo_root, workspace.branch)
+
+    def test_remove_policy_removes_clean_unmerged_worktree_but_keeps_branch(
+        self, tmp_path: Path
+    ) -> None:
+        repo_root = tmp_path / "repo"
+        worktree_root = tmp_path / "worktrees"
+        self._init_repo(repo_root)
+
+        with patch("ouroboros.core.worktree._worktree_root", return_value=worktree_root):
+            workspace = prepare_task_workspace(repo_root, "orch_test_remove")
+            worktree_path = Path(workspace.worktree_path)
+            (worktree_path / "feature.txt").write_text("feature\n", encoding="utf-8")
+            self._git(worktree_path, "add", "feature.txt")
+            self._git(worktree_path, "commit", "-m", "feature")
+
+            removed = cleanup_task_workspace(workspace, policy="remove")
+            release_lock(workspace.lock_path, workspace.lock_owner)
+
+        assert removed is True
+        assert not Path(workspace.worktree_path).exists()
+        assert _branch_exists(repo_root, workspace.branch)
+
+    def test_remove_policy_keeps_dirty_worktree_but_releases_lock(self, tmp_path: Path) -> None:
+        repo_root = tmp_path / "repo"
+        worktree_root = tmp_path / "worktrees"
+        self._init_repo(repo_root)
+
+        with (
+            patch("ouroboros.core.worktree._worktree_root", return_value=worktree_root),
+            patch("ouroboros.core.worktree._worktree_cleanup_policy", return_value="remove"),
+        ):
+            workspace = prepare_task_workspace(repo_root, "orch_test_dirty_cleanup")
+            worktree_path = Path(workspace.worktree_path)
+            (worktree_path / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+
+            release_task_workspace(workspace, cleanup=True)
+
+        assert Path(workspace.worktree_path).exists()
+        assert not Path(workspace.lock_path).exists()
+        assert _branch_exists(repo_root, workspace.branch)
+
+
+@pytest.mark.parametrize("contents", ["{broken", "[]", "null", '"owner"'])
+def test_release_preserves_unverifiable_owner_lock(tmp_path: Path, contents: str) -> None:
+    lock_path = tmp_path / "task.json"
+    lock_path.write_text(contents, encoding="utf-8")
+    release_lock(str(lock_path))
+    assert lock_path.read_text(encoding="utf-8") == contents
+
+
+def test_corrupt_lock_stays_blocking_after_release_attempt(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    lock_path = Path(workspace.lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text("{not-json", encoding="utf-8")
+    release_lock(str(lock_path))
+    with pytest.raises(WorktreeError, match="Invalid task workspace lock file"):
+        _acquire_lock(lock_path, workspace)
+
+
+def test_unreadable_lock_is_not_deleted(tmp_path: Path) -> None:
+    lock_path = tmp_path / "task.json"
+    lock_path.write_text("secret owner", encoding="utf-8")
+    with patch.object(Path, "read_text", side_effect=PermissionError("cannot read")):
+        release_lock(str(lock_path))
+    assert lock_path.read_text(encoding="utf-8") == "secret owner"
+
+
+def test_release_waits_for_other_holder_and_preserves_unverifiable_lock(tmp_path: Path) -> None:
+    import threading
+
+    from ouroboros.core.file_lock import file_lock
+
+    lock_path = tmp_path / "task.json"
+    lock_path.write_text("{invalid", encoding="utf-8")
+    started = threading.Event()
+    finished = threading.Event()
+
+    def release() -> None:
+        started.set()
+        release_lock(str(lock_path))
+        finished.set()
+
+    with file_lock(lock_path):
+        thread = threading.Thread(target=release)
+        thread.start()
+        assert started.wait(2)
+        assert not finished.wait(0.1)
+    thread.join(2)
+    assert not thread.is_alive()
+    assert finished.is_set()
+    assert lock_path.read_text(encoding="utf-8") == "{invalid"
+
+
+def test_unknown_lock_object_cannot_be_acquired(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    lock_path = Path(workspace.lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(WorktreeError, match="Invalid task workspace lock file"):
+        _acquire_lock(lock_path, workspace)
+    assert lock_path.read_text(encoding="utf-8") == "{}"
+
+
+def test_release_cleanup_preserves_unknown_owner(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    worktree_root = tmp_path / "worktrees"
+    TestWorktreeHardening._init_repo(repo_root)
+    with (
+        patch("ouroboros.core.worktree._worktree_root", return_value=worktree_root),
+        patch("ouroboros.core.worktree._worktree_cleanup_policy", return_value="remove"),
+    ):
+        workspace = prepare_task_workspace(repo_root, "auto_unknown_owner")
+        Path(workspace.lock_path).write_text("{invalid", encoding="utf-8")
+        release_task_workspace(workspace, cleanup=True)
+    assert Path(workspace.worktree_path).exists()
+    assert Path(workspace.lock_path).read_text(encoding="utf-8") == "{invalid"
+
+
+def test_old_owner_cannot_release_new_lease_from_same_process(tmp_path: Path) -> None:
+    import json
+
+    workspace = _workspace(tmp_path)
+    lock_path = Path(workspace.lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    first = _acquire_lock(lock_path, workspace)
+    release_lock(str(lock_path), first)
+    second = _acquire_lock(lock_path, workspace)
+    assert first["lease_id"] != second["lease_id"]
+
+    release_lock(str(lock_path), first)
+    assert json.loads(lock_path.read_text())["lease_id"] == second["lease_id"]
+    release_lock(str(lock_path), second)
+    assert not lock_path.exists()
+
+
+def test_path_only_release_does_not_release_live_lease(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    lock_path = Path(workspace.lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    owner = _acquire_lock(lock_path, workspace)
+    release_lock(str(lock_path))
+    assert lock_path.exists()
+    release_lock(str(lock_path), owner)
+    assert not lock_path.exists()

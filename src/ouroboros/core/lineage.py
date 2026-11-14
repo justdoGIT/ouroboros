@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
 
+from ouroboros.core.acceptance import AcceptanceState
 from ouroboros.core.seed import OntologyField, OntologySchema
 
 
@@ -52,11 +53,27 @@ class MutationAction(StrEnum):
     REMOVE = "remove"
 
 
+class ACAuthorityState(StrEnum):
+    """Per-AC verdict at the authority boundary.
+
+    Attributes:
+        PASS: An authoritative verdict passed this AC.
+        FAIL: An authoritative verdict failed this AC.
+        UNRESOLVED: No authoritative verdict exists (for example the AC was not
+            evaluated because no executed verification ran). Not a failure.
+    """
+
+    PASS = "pass"
+    FAIL = "fail"
+    UNRESOLVED = "unresolved"
+
+
 class ACResult(BaseModel, frozen=True):
     """Result of evaluating a single acceptance criterion."""
 
-    ac_index: int
+    ac_index: int = Field(strict=True, ge=0)
     ac_content: str
+    semantic_ac_key: str | None = Field(default=None, pattern=r"^ac_[a-f0-9]{16}$")
     passed: bool
     score: float | None = None
     evidence: str = ""
@@ -86,6 +103,35 @@ class ACResult(BaseModel, frozen=True):
         return self.final_verdict.upper()
 
     @property
+    def verdict_is_authoritative(self) -> bool:
+        """Whether this result records a completed evaluator/verifier verdict."""
+        if self.ac_verdict_state == "evaluated":
+            return True
+        if self.ac_verdict_state != "overridden":
+            return False
+        method = self.verification_method.strip().lower()
+        return bool(method and method != "unknown" and self.evidence.strip())
+
+    @property
+    def authoritative_pass(self) -> bool:
+        """Whether this AC may be consumed as proven passing evidence."""
+        return self.passed and self.verdict_is_authoritative
+
+    @property
+    def unresolved(self) -> bool:
+        """Whether this AC must remain in the evolution working set."""
+        return not self.authoritative_pass
+
+    @property
+    def authority_state(self) -> ACAuthorityState:
+        """Return ``pass``, ``fail``, or ``unresolved`` at the authority boundary."""
+        if self.authoritative_pass:
+            return ACAuthorityState.PASS
+        if self.verdict_is_authoritative:
+            return ACAuthorityState.FAIL
+        return ACAuthorityState.UNRESOLVED
+
+    @property
     def provisional_verdict(self) -> str:
         """What the evaluator originally said before any override."""
         # If overridden, the original was the opposite
@@ -106,6 +152,23 @@ class ACResult(BaseModel, frozen=True):
         if self.ac_verdict_state == "overridden":
             return self.evidence
         return None
+
+
+class TaskResult(BaseModel, frozen=True):
+    """Worker execution outcome for a task derived from an acceptance criterion.
+
+    This is intentionally separate from :class:`ACResult`: task completion
+    describes whether execution work finished, while AC results describe formal
+    evaluator/verifier verdicts about the produced artifact.
+    """
+
+    task_index: int
+    task_content: str
+    status: str
+    completed: bool
+    source_ac_index: int | None = None
+    evidence: str = ""
+    execution_method: str = "unknown"
 
 
 class FeedbackMetadata(BaseModel, frozen=True):
@@ -144,12 +207,31 @@ class EvaluationSummary(BaseModel, frozen=True):
         default=None,
         description="Measures goal/constraint/ontology divergence from the seed intent (0.0-1.0). Distinct from reward_hacking_risk.",
     )
+    goal_alignment: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Semantic alignment with the original goal (0.0-1.0). Preserved separately "
+            "from drift_score, which is the aggregate divergence signal."
+        ),
+    )
     reward_hacking_risk: float | None = Field(
         default=None,
         description="Suspicion that the artifact is optimized for evaluator, rubric, or test approval rather than solving the real task (0.0-1.0). Distinct from drift_score.",
     )
     failure_reason: str | None = None
-    ac_results: tuple[ACResult, ...] = ()
+    ac_results: tuple[ACResult, ...] = Field(
+        default_factory=tuple,
+        description="Formal evaluator/verifier verdicts for acceptance criteria.",
+    )
+    task_results: tuple[TaskResult, ...] = Field(
+        default_factory=tuple,
+        description=(
+            "Worker execution outcomes for tasks/subtasks. Distinct from ac_results: "
+            "task completion is not acceptance approval."
+        ),
+    )
     feedback_metadata: tuple[FeedbackMetadata, ...] = Field(
         default_factory=tuple,
         description=(
@@ -180,13 +262,46 @@ class EvaluationSummary(BaseModel, frozen=True):
     def _reconcile_approval_with_ac_results(self) -> EvaluationSummary:
         """Eagerly reconcile approval fields with AC results at construction time."""
         if self.ac_results:
-            ac_passed = all(ac.passed for ac in self.ac_results)
-            expected_status = "approved" if ac_passed else "rejected"
+            ac_passed = all(ac.authoritative_pass for ac in self.ac_results)
+            execution_completed = self.execution_completion_status == "completed"
+            # Detailed AC results may veto approval, never mint it. Final
+            # approval is an independent authority gate (RFC #1888), so an
+            # explicitly rejected consensus cannot be upgraded by AC PASSes.
+            final_approved = (
+                self.final_approved
+                and self.approval_status == "approved"
+                and ac_passed
+                and execution_completed
+            )
+            # A non-approval keeps "not_evaluated" (no executed verification
+            # minted a verdict); every other non-approval reads "rejected".
+            if final_approved:
+                expected_status = "approved"
+            elif self.approval_status == "not_evaluated":
+                expected_status = "not_evaluated"
+            else:
+                expected_status = "rejected"
             if self.approval_status != expected_status:
                 object.__setattr__(self, "approval_status", expected_status)
-            if self.final_approved != ac_passed:
-                object.__setattr__(self, "final_approved", ac_passed)
+            if self.final_approved != final_approved:
+                object.__setattr__(self, "final_approved", final_approved)
         return self
+
+    @property
+    def acceptance_state(self) -> AcceptanceState:
+        """The generation's acceptance outcome; the one tri-state displays read.
+
+        ``approval_status`` is the persisted tri-state (already reconciled with
+        the AC rows at construction). Approval needs both fields to agree;
+        ``not_evaluated`` means no executed verification minted a verdict;
+        every other non-approval, including an unrecognized status, is a
+        rejection, as in the Ralph chain projection.
+        """
+        if self.final_approved and self.approval_status == "approved":
+            return AcceptanceState.APPROVED
+        if self.approval_status == "not_evaluated":
+            return AcceptanceState.UNVERIFIED
+        return AcceptanceState.REJECTED
 
     @property
     def run_verdict_passed(self) -> bool:
@@ -197,11 +312,11 @@ class EvaluationSummary(BaseModel, frozen=True):
         """
         if self.execution_completion_status != "completed":
             return False
-        if self.ac_results:
-            return all(ac.passed for ac in self.ac_results)
-        if self.approval_status == "rejected":
+        if not self.final_approved or self.approval_status != "approved":
             return False
-        return self.final_approved
+        if self.ac_results:
+            return all(ac.authoritative_pass for ac in self.ac_results)
+        return True
 
     @property
     def run_verdict(self) -> str:
@@ -326,6 +441,9 @@ class GenerationRecord(BaseModel, frozen=True):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     seed_json: str | None = None
     execution_output: str | None = None
+    active_ac_indices: tuple[int, ...] = Field(default_factory=tuple)
+    frozen_ac_indices: tuple[int, ...] = Field(default_factory=tuple)
+    verification_handoff_pending: bool = False
     seed_quality_canary_feedback: tuple[FeedbackMetadata, ...] = Field(
         default_factory=tuple,
         description=(
@@ -375,16 +493,24 @@ class ControlDirectiveEmission(BaseModel, frozen=True):
     Captures the audit-level "who/what/why/when" of a control-plane
     decision so it appears in the lineage timeline alongside state events
     (per RFC #476 M2 / sub-RFC #511). The full event row remains in the
-    EventStore; this is the projected view used by callers.
+    EventStore; this projected view preserves the stable ControlContract
+    identity fields callers need for replay, idempotency inspection, and
+    future UI rendering without pretending to be the durable source of truth.
     """
 
     directive: str
     reason: str
     emitted_by: str
     timestamp: datetime
+    schema_version: int | None = None
+    target_type: str | None = None
+    target_id: str | None = None
     generation_number: int | None = None
     phase: str | None = None
     is_terminal: bool = False
+    step_action: str | None = None
+    parent_directive_id: str | None = None
+    idempotency_key: str | None = None
 
 
 class OntologyLineage(BaseModel, frozen=True):
@@ -413,6 +539,31 @@ class OntologyLineage(BaseModel, frozen=True):
     def current_ontology(self) -> OntologySchema | None:
         """Return the latest ontology snapshot, or None if no generations."""
         return self.generations[-1].ontology_snapshot if self.generations else None
+
+    @property
+    def verification_handoff_pending(self) -> bool:
+        """Whether the latest completed generation requested evaluation."""
+        previous = next(
+            (
+                record
+                for record in reversed(self.generations)
+                if record.phase == GenerationPhase.COMPLETED
+            ),
+            None,
+        )
+        if previous is None:
+            return False
+        if previous.verification_handoff_pending:
+            return True
+        # Legacy events stored the handoff only in the audit directive. Keep
+        # that replay fallback while new completions carry atomic authority.
+        for emission in reversed(self.directive_emissions):
+            if emission.generation_number != previous.generation_number:
+                continue
+            if emission.emitted_by != "evolver" or emission.timestamp < previous.created_at:
+                continue
+            return emission.step_action == "ontology_stable"
+        return False
 
     def with_generation(self, record: GenerationRecord) -> OntologyLineage:
         """Return new lineage with appended or replaced generation.

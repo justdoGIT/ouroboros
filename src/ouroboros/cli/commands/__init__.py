@@ -2,9 +2,11 @@
 
 This module contains the command group implementations:
 - init: Start interactive interview
+- seed: Generate Seed specifications from interviews
 - run: Execute workflows
 - config: Manage configuration
 - status: Check system status
+- qa: General-purpose QA verdicts
 - mcp: MCP server management
 - pm: Generate Product Requirements Documents
 - setup: Brownfield repository scanning and registration

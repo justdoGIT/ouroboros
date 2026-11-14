@@ -126,6 +126,15 @@ class TestOpenCodeLLMAdapter:
         assert "--model" in cmd
         assert "anthropic/claude-sonnet-4-20250514" in cmd
 
+    def test_build_command_maps_bypass_permissions_to_native_flag(self) -> None:
+        adapter = OpenCodeLLMAdapter(
+            cli_path="opencode",
+            cwd="/tmp",
+            permission_mode="bypassPermissions",
+        )
+
+        assert "--dangerously-skip-permissions" in adapter._build_command("Hello")
+
     def test_normalize_model_default(self) -> None:
         """Default model returns None."""
         adapter = OpenCodeLLMAdapter(cli_path="opencode", cwd="/tmp")
@@ -268,6 +277,71 @@ class TestOpenCodeLLMAdapter:
             )
 
         assert result.is_err, "Top-level error must override exit code"
+        assert "Session crashed" in result.error.message
+
+    @pytest.mark.parametrize(
+        "payload",
+        [None, "", 0, [], {}],
+        ids=["null", "empty-string", "zero", "empty-list", "empty-dict"],
+    )
+    @pytest.mark.asyncio
+    async def test_complete_error_frame_with_empty_payload_still_fails(
+        self, payload: object
+    ) -> None:
+        """A terminal error frame stays terminal however thin its payload is.
+
+        The frame's own ``type`` declares the failure; the payload only carries
+        the reason. Reading emptiness as "no error" let a failed run return the
+        partial text it had produced as a success.
+        """
+        stdout = (
+            json.dumps({"type": "error", "sessionID": "sess-1", "error": payload})
+            + "\n"
+            + json.dumps({"type": "text", "part": {"type": "text", "text": "partial answer"}})
+            + "\n"
+        )
+        process = _FakeProcess(stdout=stdout, returncode=0)
+        adapter = OpenCodeLLMAdapter(cli_path="opencode", cwd="/tmp")
+
+        with patch("asyncio.create_subprocess_exec", return_value=process):
+            result = await adapter.complete(
+                messages=[Message(role=MessageRole.USER, content="Calculate")],
+                config=CompletionConfig(model="default"),
+            )
+
+        assert result.is_err, f"error frame with payload {payload!r} must not report success"
+        assert "partial answer" not in result.error.message
+
+    @pytest.mark.asyncio
+    async def test_complete_empty_error_frame_does_not_mask_a_later_one(self) -> None:
+        """An early thin frame must not answer for the frames behind it.
+
+        ``_extract_error_from_events`` returned from inside its own loop, so the
+        first error frame decided the whole stream — and a null one decided it
+        was clean, discarding the populated frame that followed.
+        """
+        stdout = "".join(
+            json.dumps(event) + "\n"
+            for event in (
+                {"type": "error", "sessionID": "sess-1", "error": None},
+                {
+                    "type": "error",
+                    "sessionID": "sess-1",
+                    "error": {"name": "RuntimeError", "data": {"message": "Session crashed"}},
+                },
+                {"type": "text", "part": {"type": "text", "text": "partial answer"}},
+            )
+        )
+        process = _FakeProcess(stdout=stdout, returncode=0)
+        adapter = OpenCodeLLMAdapter(cli_path="opencode", cwd="/tmp")
+
+        with patch("asyncio.create_subprocess_exec", return_value=process):
+            result = await adapter.complete(
+                messages=[Message(role=MessageRole.USER, content="Calculate")],
+                config=CompletionConfig(model="default"),
+            )
+
+        assert result.is_err
         assert "Session crashed" in result.error.message
 
     def test_extract_error_tool_use_not_terminal(self) -> None:
@@ -453,6 +527,7 @@ class TestOpenCodeLLMAdapter:
         with patch.dict(
             "os.environ",
             {"OUROBOROS_AGENT_RUNTIME": "opencode", "OUROBOROS_LLM_BACKEND": "opencode"},
+            clear=True,
         ):
             env = adapter._build_child_env()
         assert "OUROBOROS_AGENT_RUNTIME" not in env
@@ -518,7 +593,7 @@ class TestOpenCodeLLMAdapter:
 class TestOpenCodeToolEnvelopeSoftEnforcement:
     """OpenCode enforces ``allowed_tools`` softly (prompt + post-hoc audit).
 
-    The ``opencode run`` CLI has no ``--allowed-tools`` or
+    The ``opencode run`` CLI has no ``--allowed-tools`` or multi-value
     ``--permission-mode`` flag, so the adapter must (a) make the
     envelope visible to the model via a prompt directive and (b)
     surface ``tool_use`` events outside the envelope as structured
@@ -556,8 +631,6 @@ class TestOpenCodeToolEnvelopeSoftEnforcement:
         """A ``tool_use`` event for a tool outside the envelope triggers
         the violation warning; an in-envelope event does not.
         """
-        import structlog
-
         adapter = OpenCodeLLMAdapter(
             cli_path="opencode",
             cwd="/tmp",
@@ -569,30 +642,25 @@ class TestOpenCodeToolEnvelopeSoftEnforcement:
             {"type": "text", "part": {"type": "text", "text": "done"}},
         ]
 
-        with structlog.testing.capture_logs() as captured:
+        with patch("ouroboros.providers.opencode_adapter.log.warning") as warning:
             adapter._audit_tool_envelope_violations(events)
 
-        violations = [
-            e for e in captured if e.get("event") == "opencode_adapter.tool_envelope_violation"
-        ]
-        assert len(violations) == 1
-        assert violations[0]["tool"] == "Edit"
-        assert violations[0]["allowed_tools"] == ["Read"]
+        warning.assert_called_once_with(
+            "opencode_adapter.tool_envelope_violation",
+            tool="Edit",
+            allowed_tools=["Read"],
+        )
 
     def test_no_envelope_means_no_audit(self) -> None:
         """With no envelope declared, the audit is a no-op even when
         ``tool_use`` events are present.
         """
-        import structlog
-
         adapter = OpenCodeLLMAdapter(cli_path="opencode", cwd="/tmp")
         events = [
             {"type": "tool_use", "part": {"tool": "Edit", "state": {"status": "completed"}}},
         ]
 
-        with structlog.testing.capture_logs() as captured:
+        with patch("ouroboros.providers.opencode_adapter.log.warning") as warning:
             adapter._audit_tool_envelope_violations(events)
 
-        assert not [
-            e for e in captured if e.get("event") == "opencode_adapter.tool_envelope_violation"
-        ]
+        warning.assert_not_called()

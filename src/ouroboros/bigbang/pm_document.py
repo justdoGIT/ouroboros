@@ -11,13 +11,20 @@ Two generation modes:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import structlog
 
+from ouroboros.bigbang.answer_provenance import (
+    WITHHELD_ANSWER_NOTE,
+    classify_answer_provenance,
+    extraction_rounds,
+)
+from ouroboros.bigbang.pm_opening import anchor_pm_opening, opening_confirmation_markdown
 from ouroboros.bigbang.pm_seed import PMSeed
+from ouroboros.config import get_llm_model_for_role
 from ouroboros.core.errors import ProviderError
 from ouroboros.core.types import Result
 from ouroboros.providers.base import (
@@ -34,8 +41,6 @@ log = structlog.get_logger()
 
 _DEFAULT_PM_DIR = ".ouroboros"
 _PM_FILENAME = "pm.md"
-
-_FALLBACK_MODEL = "claude-opus-4-6"
 
 _PM_GENERATION_SYSTEM_PROMPT = """\
 You are a Product Requirements Document (PM) writer. Given a full interview \
@@ -61,6 +66,8 @@ Guidelines:
 - Write for a PM audience — avoid technical jargon unless necessary
 - Be specific and actionable — avoid vague statements
 - Preserve all information from the interview — do not invent requirements
+- Preserve uncertainty explicitly: keep tentative claims in Assumptions and
+  unresolved/stakeholder-dependent/unknown items in Decide Later
 - Use the interview conversation to add context and nuance beyond the \
 structured seed data
 - Keep the tone professional but accessible
@@ -176,6 +183,11 @@ def generate_pm_markdown(seed: PMSeed) -> str:
             lines.append(item)
         lines.append("")
 
+    confirmation_section = opening_confirmation_markdown(
+        seed.opening_confirmations, seed.opening_state_revision
+    )
+    if confirmation_section:
+        lines.extend([confirmation_section, ""])
     return "\n".join(lines)
 
 
@@ -249,7 +261,14 @@ class PMDocumentGenerator:
     """
 
     llm_adapter: LLMAdapter
-    model: str = _FALLBACK_MODEL
+    model: str | None = None
+    model_is_explicit: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        """Resolve implicit default model while preserving explicit caller pins."""
+        self.model_is_explicit = self.model is not None
+        if self.model is None:
+            self.model = get_llm_model_for_role("pm_interview")
 
     async def generate(
         self,
@@ -275,9 +294,44 @@ class PMDocumentGenerator:
         Returns:
             Result containing the generated Markdown string or ProviderError.
         """
-        # Extract Q&A from interview state if not provided directly
-        if qa_pairs is None and interview_state is not None:
-            qa_pairs = [(r.question, r.user_response or "") for r in interview_state.rounds]
+        if interview_state is not None:
+            anchored = anchor_pm_opening(seed, interview_state)
+            if anchored.opening_confirmations:
+                if seed.interview_id != interview_state.interview_id:
+                    return Result.err(ProviderError("PM Seed belongs to a different interview"))
+                if (
+                    seed.opening_confirmations != anchored.opening_confirmations
+                    or seed.opening_state_revision != anchored.opening_state_revision
+                ):
+                    return Result.err(ProviderError("PM Seed opening confirmations are stale"))
+            elif seed.opening_confirmations:
+                return Result.err(ProviderError("PM Seed opening confirmations are stale"))
+            seed = anchored
+
+        # A confirmation-bearing PM is a deterministic snapshot. Do not await
+        # an unconstrained model rewrite while the underlying decision may change.
+        if seed.opening_confirmations:
+            if qa_pairs is not None:
+                return Result.err(
+                    ProviderError("Raw Q&A cannot be combined with opening confirmations")
+                )
+            return Result.ok(generate_pm_markdown(seed))
+
+        # The PRD is a requirement-producing artifact. Typed state uses the
+        # shared projection; the public raw-pair ingress settles the same
+        # caller-facing marker before it enters the prompt.
+        if qa_pairs is not None:
+            qa_pairs = [
+                (
+                    question,
+                    WITHHELD_ANSWER_NOTE
+                    if classify_answer_provenance(answer) == "observation"
+                    else answer,
+                )
+                for question, answer in qa_pairs
+            ]
+        elif interview_state is not None:
+            qa_pairs = [(r.question, r.answer or "") for r in extraction_rounds(interview_state)]
 
         user_prompt = self._build_generation_prompt(seed, qa_pairs)
 
@@ -286,8 +340,11 @@ class PMDocumentGenerator:
             Message(role=MessageRole.USER, content=user_prompt),
         ]
 
+        assert self.model is not None
         config = CompletionConfig(
             model=self.model,
+            role="pm_document",
+            model_is_explicit=self.model_is_explicit,
             temperature=0.3,
             max_tokens=8192,
         )

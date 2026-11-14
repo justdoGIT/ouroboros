@@ -10,15 +10,22 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
-from unittest.mock import MagicMock, patch
+import sysconfig
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from typer.testing import CliRunner
 
 from ouroboros.cli.commands.mcp_doctor import (
     CheckResult,
+    _probe_local_stdio,
     check_claude_agent_sdk_import,
+    check_codex_oauth_auth,
     check_event_store,
     check_litellm_import,
     check_mcp_import,
@@ -27,6 +34,9 @@ from ouroboros.cli.commands.mcp_doctor import (
     check_platform,
     check_python_version,
 )
+from ouroboros.core.types import Result
+from ouroboros.mcp.types import TransportType
+from ouroboros.package_profiles import UNSUPPORTED_CLAUDE_SDK_MCP_MESSAGE
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,6 +52,11 @@ def _make_app():
     from ouroboros.cli.commands.mcp_doctor import register_doctor_command
 
     app = typer.Typer()
+
+    @app.callback()
+    def command_group() -> None:
+        """Keep command invocation stable when doctor commands are added."""
+
     register_doctor_command(app)
     return app
 
@@ -127,11 +142,21 @@ class TestCheckMcpImport:
         mock_mcp = MagicMock()
         with (
             patch.dict("sys.modules", {"mcp": mock_mcp}),
-            patch("importlib.metadata.version", return_value="1.26.0"),
+            patch("importlib.metadata.version", return_value="2.0.0"),
         ):
             result = check_mcp_import()
         assert result.status == "pass"
-        assert "1.26.0" in result.message
+        assert "2.0.0" in result.message
+
+    def test_fails_for_legacy_mcp_major(self):
+        mock_mcp = MagicMock()
+        with (
+            patch.dict("sys.modules", {"mcp": mock_mcp}),
+            patch("importlib.metadata.version", return_value="1.28.1"),
+        ):
+            result = check_mcp_import()
+        assert result.status == "fail"
+        assert "separate server process" in result.remediation
 
     def test_fails_when_not_importable(self):
         with patch.dict("sys.modules", {"mcp": None}):
@@ -139,14 +164,23 @@ class TestCheckMcpImport:
             with patch("builtins.__import__", side_effect=_import_error_for("mcp")):
                 result = check_mcp_import()
         assert result.status == "fail"
-        assert result.remediation != ""
+        assert "ouroboros-ai[mcp]" in result.remediation
 
-    def test_passes_when_installed_returns_version(self):
-        # mcp is installed — check that version string is included in the message
+    def test_reports_the_installed_profile_version(self):
+        from importlib.metadata import version
+
         result = check_mcp_import()
-        # mcp is an actual dependency of this project, so it should pass
-        assert result.status == "pass"
+        installed = version("mcp")
+
+        assert installed in result.message
         assert result.name == "mcp_import"
+        if installed.startswith("2."):
+            assert result.status == "pass"
+        else:
+            # The standalone Claude profile intentionally carries MCP 1.x;
+            # doctor must direct MCP serving to the isolated MCP 2 process.
+            assert result.status == "fail"
+            assert "separate server process" in result.remediation
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +190,14 @@ class TestCheckMcpImport:
 
 class TestCheckClaudeAgentSdkImport:
     """Tests for check_claude_agent_sdk_import — backend-aware behaviour."""
+
+    @pytest.fixture(autouse=True)
+    def _supported_profile_environment(self):
+        with patch(
+            "ouroboros.cli.commands.mcp_doctor.has_unsupported_claude_sdk_mcp_mix",
+            return_value=False,
+        ):
+            yield
 
     def test_passes_when_importable(self):
         mock_sdk = MagicMock()
@@ -177,33 +219,73 @@ class TestCheckClaudeAgentSdkImport:
         ):
             result = check_claude_agent_sdk_import()
         assert result.status == "fail"
-        assert result.remediation != ""
+        assert "--runtime claude" in result.remediation
+        assert "[claude-sdk]" in result.remediation
 
     def test_warns_when_not_importable_on_codex_backend(self):
-        """Missing SDK on a Codex runtime is only a warning, not a failure."""
+        """Missing SDK on a Codex runtime is expected."""
         with (
             patch(
                 "ouroboros.cli.commands.mcp_doctor._get_runtime_backend",
                 return_value="codex",
             ),
+            patch(
+                "ouroboros.cli.commands.mcp_doctor._get_llm_backend",
+                return_value="codex",
+            ),
             patch("builtins.__import__", side_effect=_import_error_for("claude_agent_sdk")),
         ):
             result = check_claude_agent_sdk_import()
-        assert result.status == "warn"
+        assert result.status == "pass"
         assert "codex" in result.message
+        assert "ouroboros-ai[claude]" in result.remediation
 
     def test_warns_when_not_importable_on_opencode_backend(self):
-        """Missing SDK on an OpenCode runtime is only a warning."""
+        """Missing SDK on an OpenCode runtime is expected."""
         with (
             patch(
                 "ouroboros.cli.commands.mcp_doctor._get_runtime_backend",
                 return_value="opencode",
             ),
+            patch(
+                "ouroboros.cli.commands.mcp_doctor._get_llm_backend",
+                return_value="opencode",
+            ),
             patch("builtins.__import__", side_effect=_import_error_for("claude_agent_sdk")),
         ):
             result = check_claude_agent_sdk_import()
-        assert result.status == "warn"
+        assert result.status == "pass"
         assert "opencode" in result.message
+        assert "ouroboros-ai[claude]" in result.remediation
+
+    def test_claude_llm_on_non_sdk_runtime_uses_cli_without_sdk(self):
+        """The Claude completion adapter has a CLI fallback and needs no SDK."""
+        with (
+            patch(
+                "ouroboros.cli.commands.mcp_doctor._get_runtime_backend",
+                return_value="codex",
+            ),
+            patch(
+                "ouroboros.cli.commands.mcp_doctor._get_llm_backend",
+                return_value="claude_code",
+            ),
+            patch("builtins.__import__", side_effect=_import_error_for("claude_agent_sdk")),
+        ):
+            result = check_claude_agent_sdk_import()
+        assert result.status == "pass"
+        assert "not installed" in result.message
+
+    def test_forced_mcp2_and_claude_sdk_mix_fails_with_canonical_message(self):
+        with patch(
+            "ouroboros.cli.commands.mcp_doctor.has_unsupported_claude_sdk_mcp_mix",
+            return_value=True,
+        ):
+            result = check_claude_agent_sdk_import()
+
+        assert result.status == "fail"
+        assert "Unsupported package profiles" in result.message
+        assert "ouroboros-ai[mcp]" in result.message
+        assert "ouroboros-ai[claude-sdk]" in result.message
 
     def test_passes_with_unknown_version(self):
         mock_sdk = MagicMock()
@@ -265,12 +347,100 @@ class TestCheckLitellmImport:
         with patch("builtins.__import__", side_effect=_import_error_for("litellm")):
             result = check_litellm_import()
         assert result.status == "warn"
-        assert result.remediation != ""
+        assert "ouroboros-ai[litellm]" in result.remediation
 
     def test_does_not_fail_when_missing(self):
         with patch("builtins.__import__", side_effect=_import_error_for("litellm")):
             result = check_litellm_import()
         assert result.status != "fail"
+
+    def test_warns_with_python_313_remediation_on_python_314(self):
+        """Doctor should not recommend installing LiteLLM into Python 3.14."""
+        with (
+            patch("builtins.__import__", side_effect=_import_error_for("litellm")),
+            patch.object(sys, "version_info", (3, 14, 0, "final", 0)),
+        ):
+            result = check_litellm_import()
+
+        assert result.status == "warn"
+        assert "Python >=3.12,<3.14" in result.remediation
+        assert "Python 3.13" in result.remediation
+        assert "python3.13 -m pip install 'ouroboros-ai[litellm]'" in result.remediation
+        assert "uv tool install --python 3.13 --force" in result.remediation
+        assert "ouroboros-ai[litellm]" in result.remediation
+        assert "python3.14" not in result.remediation.lower()
+
+
+# ---------------------------------------------------------------------------
+# check_codex_oauth_auth
+# ---------------------------------------------------------------------------
+
+
+class TestCheckCodexOauthAuth:
+    def test_passes_when_codex_auth_json_exists_without_openai_key(self, tmp_path, monkeypatch):
+        codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
+        (codex_home / "auth.json").write_text("{}", encoding="utf-8")
+        (codex_home / "config.toml").write_text('model = "gpt-5.5"\n', encoding="utf-8")
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        with (
+            patch("ouroboros.cli.commands.mcp_doctor._get_runtime_backend", return_value="codex"),
+            patch("ouroboros.cli.commands.mcp_doctor._get_llm_backend", return_value="codex"),
+        ):
+            result = check_codex_oauth_auth()
+
+        assert result.status == "pass"
+        assert "auth.json" in result.message
+        assert "OPENAI_API_KEY not required" in result.message
+
+    def test_fails_when_codex_backend_active_without_auth_json(self, tmp_path, monkeypatch):
+        codex_home = tmp_path / "codex-home"
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        with (
+            patch("ouroboros.cli.commands.mcp_doctor._get_runtime_backend", return_value="hermes"),
+            patch("ouroboros.cli.commands.mcp_doctor._get_llm_backend", return_value="codex"),
+        ):
+            result = check_codex_oauth_auth()
+
+        assert result.status == "fail"
+        assert "Codex backend active" in result.message
+        assert "CODEX_HOME/HOME" in result.remediation
+        assert "OPENAI_API_KEY" in result.remediation
+
+    def test_passes_when_codex_backend_uses_openai_api_key_without_auth_json(
+        self, tmp_path, monkeypatch
+    ):
+        codex_home = tmp_path / "codex-home"
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+
+        with (
+            patch("ouroboros.cli.commands.mcp_doctor._get_runtime_backend", return_value="hermes"),
+            patch("ouroboros.cli.commands.mcp_doctor._get_llm_backend", return_value="codex"),
+        ):
+            result = check_codex_oauth_auth()
+
+        assert result.status == "pass"
+        assert "OPENAI_API_KEY is present" in result.message
+        assert "API-key-backed Codex profile" in result.message
+        assert "codex login" in result.remediation
+
+    def test_warns_when_codex_backend_inactive_without_auth_json(self, tmp_path, monkeypatch):
+        codex_home = tmp_path / "codex-home"
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        with (
+            patch("ouroboros.cli.commands.mcp_doctor._get_runtime_backend", return_value="claude"),
+            patch("ouroboros.cli.commands.mcp_doctor._get_llm_backend", return_value="claude_code"),
+        ):
+            result = check_codex_oauth_auth()
+
+        assert result.status == "warn"
+        assert "Codex backend not active" in result.message
 
 
 # ---------------------------------------------------------------------------
@@ -325,18 +495,29 @@ class TestCheckEventStore:
 
 
 class TestCheckPidFile:
+    def _patch_paths(self, tmp_path):
+        """Isolate both the legacy PID file and the per-instance registry."""
+        return (
+            patch("ouroboros.cli.commands.mcp_doctor._PID_FILE", tmp_path / "mcp-server.pid"),
+            patch(
+                "ouroboros.cli.commands.mcp_doctor._PID_REGISTRY_DIR",
+                tmp_path / "mcp-servers",
+            ),
+        )
+
     def test_passes_when_no_pid_file(self, tmp_path):
-        fake_pid = tmp_path / "mcp-server.pid"
-        with patch("ouroboros.cli.commands.mcp_doctor._PID_FILE", fake_pid):
+        pid_patch, registry_patch = self._patch_paths(tmp_path)
+        with pid_patch, registry_patch:
             result = check_pid_file()
         assert result.status == "pass"
         assert "not running" in result.message.lower() or "no pid" in result.message.lower()
 
     def test_passes_when_pid_alive(self, tmp_path):
-        fake_pid = tmp_path / "mcp-server.pid"
-        fake_pid.write_text("12345", encoding="utf-8")
+        (tmp_path / "mcp-server.pid").write_text("12345", encoding="utf-8")
+        pid_patch, registry_patch = self._patch_paths(tmp_path)
         with (
-            patch("ouroboros.cli.commands.mcp_doctor._PID_FILE", fake_pid),
+            pid_patch,
+            registry_patch,
             patch("ouroboros.cli.commands.mcp_doctor._pid_is_alive", return_value=True),
         ):
             result = check_pid_file()
@@ -344,10 +525,11 @@ class TestCheckPidFile:
         assert "12345" in result.message
 
     def test_warns_when_pid_stale(self, tmp_path):
-        fake_pid = tmp_path / "mcp-server.pid"
-        fake_pid.write_text("99999", encoding="utf-8")
+        (tmp_path / "mcp-server.pid").write_text("99999", encoding="utf-8")
+        pid_patch, registry_patch = self._patch_paths(tmp_path)
         with (
-            patch("ouroboros.cli.commands.mcp_doctor._PID_FILE", fake_pid),
+            pid_patch,
+            registry_patch,
             patch("ouroboros.cli.commands.mcp_doctor._pid_is_alive", return_value=False),
         ):
             result = check_pid_file()
@@ -355,12 +537,44 @@ class TestCheckPidFile:
         assert result.remediation != ""
 
     def test_warns_when_pid_file_unreadable(self, tmp_path):
-        fake_pid = tmp_path / "mcp-server.pid"
-        fake_pid.write_text("not_a_number", encoding="utf-8")
-        with patch("ouroboros.cli.commands.mcp_doctor._PID_FILE", fake_pid):
+        (tmp_path / "mcp-server.pid").write_text("not_a_number", encoding="utf-8")
+        pid_patch, registry_patch = self._patch_paths(tmp_path)
+        with pid_patch, registry_patch:
             result = check_pid_file()
         assert result.status == "warn"
         assert result.remediation != ""
+
+    def test_registry_live_instances_pass(self, tmp_path):
+        registry = tmp_path / "mcp-servers"
+        registry.mkdir()
+        (registry / "111.pid").write_text("111 1700000000.0", encoding="utf-8")
+        (registry / "222.pid").write_text("222 None", encoding="utf-8")
+        pid_patch, registry_patch = self._patch_paths(tmp_path)
+        with (
+            pid_patch,
+            registry_patch,
+            patch("ouroboros.cli.commands.mcp_doctor._pid_is_alive", return_value=True),
+        ):
+            result = check_pid_file()
+        assert result.status == "pass"
+        assert "2 MCP server instance(s)" in result.message
+        assert "111" in result.message
+        assert "222" in result.message
+
+    def test_registry_stale_records_warn_without_kill_advice(self, tmp_path):
+        registry = tmp_path / "mcp-servers"
+        registry.mkdir()
+        (registry / "333.pid").write_text("333 1700000000.0", encoding="utf-8")
+        pid_patch, registry_patch = self._patch_paths(tmp_path)
+        with (
+            pid_patch,
+            registry_patch,
+            patch("ouroboros.cli.commands.mcp_doctor._pid_is_alive", return_value=False),
+        ):
+            result = check_pid_file()
+        assert result.status == "warn"
+        assert "stale instance record" in result.message
+        assert "kill" not in result.remediation.lower() or "do not kill" in result.remediation
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +617,279 @@ class TestPidIsAlive:
 # ---------------------------------------------------------------------------
 
 
+def _fake_probe_client(
+    adapter,
+    captured: dict[str, object],
+    *,
+    enter_error: Exception | None = None,
+    exit_error: Exception | None = None,
+):
+    """Return an adapter factory with explicit connection and cleanup results."""
+
+    def create_client(*, max_retries, include_cleanup_error_details):
+        assert include_cleanup_error_details is False
+        captured["max_retries"] = max_retries
+
+        async def connect(config):
+            captured["config"] = config
+            if enter_error is not None:
+                adapter.transport_entered = False
+                return Result.err(enter_error)
+            adapter.transport_entered = True
+            return Result.ok(None)
+
+        async def disconnect():
+            captured["cleaned_up"] = True
+            return Result.err(exit_error) if exit_error else Result.ok(None)
+
+        adapter.connect = AsyncMock(side_effect=connect)
+        adapter.disconnect = AsyncMock(side_effect=disconnect)
+        return adapter
+
+    return create_client
+
+
+def _successful_probe_adapter(*tool_names: str):
+    adapter = MagicMock()
+    adapter.server_snapshot = SimpleNamespace(protocol_version="2025-06-18")
+    adapter.protocol_version = "2025-06-18"
+    adapter.list_tools = AsyncMock(
+        return_value=Result.ok(tuple(SimpleNamespace(name=tool_name) for tool_name in tool_names))
+    )
+    adapter.call_tool = AsyncMock()
+    return adapter
+
+
+class TestLocalStdioProbe:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("host_platform", ["darwin", "win32"])
+    async def test_uses_exact_local_stdio_command_on_supported_host_families(
+        self, host_platform, monkeypatch
+    ):
+        captured: dict[str, object] = {}
+        adapter = _successful_probe_adapter("ouroboros_interview", "ouroboros_run")
+        monkeypatch.setenv("OUROBOROS_MCP_COMMAND", "do-not-execute --configured-command")
+
+        with (
+            patch.object(sys, "platform", host_platform),
+            patch(
+                "ouroboros.cli.commands.mcp_doctor.MCPClientAdapter",
+                _fake_probe_client(adapter, captured),
+            ),
+            patch(
+                "ouroboros.cli.commands.mcp_doctor._expected_ouroboros_tool_names",
+                return_value=frozenset({"ouroboros_interview", "ouroboros_run"}),
+            ),
+        ):
+            results = await _probe_local_stdio()
+
+        config = captured["config"]
+        assert config.command == sys.executable
+        assert config.args[:4] == ("-I", "-S", "-B", "-c")
+        assert "os.chdir(" in config.args[4]
+        assert "_serve_local_stdio_probe" in config.args[4]
+        assert "do-not-execute" not in config.args[4]
+        assert config.transport is TransportType.STDIO
+        assert config.url is None
+        assert "OUROBOROS_MCP_COMMAND" not in config.env
+        assert config.env["HOME"] == config.env["USERPROFILE"]
+        assert captured["max_retries"] == 1
+        assert captured["cleaned_up"] is True
+        assert [result.status for result in results] == ["pass", "pass", "pass"]
+        adapter.list_tools.assert_awaited_once_with()
+        adapter.call_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_startup_failure_is_staged_and_fail_closed(self):
+        captured: dict[str, object] = {}
+        adapter = _successful_probe_adapter("ouroboros_interview")
+        with patch(
+            "ouroboros.cli.commands.mcp_doctor.MCPClientAdapter",
+            _fake_probe_client(
+                adapter,
+                captured,
+                enter_error=OSError("child could not start"),
+            ),
+        ):
+            results = await _probe_local_stdio()
+
+        assert [result.name for result in results] == [
+            "local_stdio_startup_transport",
+            "local_stdio_protocol_discovery",
+            "local_stdio_tool_recognition",
+        ]
+        assert [result.status for result in results] == ["fail", "fail", "fail"]
+        assert "startup or stdio transport failed" in results[0].message
+        assert all(result.remediation for result in results)
+        adapter.list_tools.assert_not_awaited()
+        adapter.call_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_discovery_snapshot_stops_before_tool_listing(self):
+        captured: dict[str, object] = {}
+        adapter = _successful_probe_adapter("ouroboros_interview")
+        adapter.server_snapshot = None
+        with patch(
+            "ouroboros.cli.commands.mcp_doctor.MCPClientAdapter",
+            _fake_probe_client(adapter, captured),
+        ):
+            results = await _probe_local_stdio()
+
+        assert [result.status for result in results] == ["pass", "fail", "fail"]
+        assert results[1].name == "local_stdio_protocol_discovery"
+        assert "no snapshot" in results[1].message
+        assert captured["cleaned_up"] is True
+        adapter.list_tools.assert_not_awaited()
+        adapter.call_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_list_tools_failure_is_distinct_and_cleans_up(self):
+        captured: dict[str, object] = {}
+        adapter = _successful_probe_adapter()
+        adapter.list_tools.return_value = Result.err(RuntimeError("tools/list unavailable"))
+        with patch(
+            "ouroboros.cli.commands.mcp_doctor.MCPClientAdapter",
+            _fake_probe_client(adapter, captured),
+        ):
+            results = await _probe_local_stdio()
+
+        assert [result.status for result in results] == ["pass", "pass", "fail"]
+        assert results[2].name == "local_stdio_tool_recognition"
+        assert "tools/list failed" in results[2].message
+        assert results[2].remediation
+        assert captured["cleaned_up"] is True
+        adapter.call_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_expected_tool_fails_without_invoking_any_tool(self):
+        captured: dict[str, object] = {}
+        adapter = _successful_probe_adapter("ouroboros_interview")
+        with (
+            patch(
+                "ouroboros.cli.commands.mcp_doctor.MCPClientAdapter",
+                _fake_probe_client(adapter, captured),
+            ),
+            patch(
+                "ouroboros.cli.commands.mcp_doctor._expected_ouroboros_tool_names",
+                return_value=frozenset({"ouroboros_interview", "ouroboros_run"}),
+            ),
+        ):
+            results = await _probe_local_stdio()
+
+        assert [result.status for result in results] == ["pass", "pass", "fail"]
+        assert "ouroboros_run" in results[2].message
+        assert captured["cleaned_up"] is True
+        adapter.call_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_failure_turns_probe_into_lifecycle_failure(self):
+        captured: dict[str, object] = {}
+        adapter = _successful_probe_adapter("ouroboros_interview")
+        with (
+            patch(
+                "ouroboros.cli.commands.mcp_doctor.MCPClientAdapter",
+                _fake_probe_client(
+                    adapter,
+                    captured,
+                    exit_error=RuntimeError("child reap failed"),
+                ),
+            ),
+            patch(
+                "ouroboros.cli.commands.mcp_doctor._expected_ouroboros_tool_names",
+                return_value=frozenset({"ouroboros_interview"}),
+            ),
+        ):
+            results = await _probe_local_stdio()
+
+        assert captured["cleaned_up"] is True
+        assert [result.status for result in results] == ["pass", "pass", "pass", "fail"]
+        assert results[-1].name == "local_stdio_cleanup"
+        assert "teardown failed" in results[-1].message
+        adapter.call_tool.assert_not_awaited()
+
+
 class TestDoctorCommand:
+    def test_default_does_not_launch_local_probe(self):
+        app = _make_app()
+        passing = CheckResult(name="existing", status="pass", message="ok")
+        probe = AsyncMock()
+        with (
+            patch(
+                "ouroboros.cli.commands.mcp_doctor._ALL_CHECKS",
+                [lambda: passing],
+            ),
+            patch("ouroboros.cli.commands.mcp_doctor._probe_local_stdio", probe),
+        ):
+            result = runner.invoke(app, ["doctor"])
+
+        assert result.exit_code == 0
+        assert "local_stdio" not in result.output
+        probe.assert_not_awaited()
+
+    def test_exact_opt_in_flag_adds_probe_results_and_preserves_json(self):
+        app = _make_app()
+        passing = CheckResult(name="existing", status="pass", message="ok")
+        probe_results = [
+            CheckResult(
+                name="local_stdio_startup_transport",
+                status="pass",
+                message="connected",
+            ),
+            CheckResult(
+                name="local_stdio_protocol_discovery",
+                status="pass",
+                message="negotiated",
+            ),
+            CheckResult(
+                name="local_stdio_tool_recognition",
+                status="pass",
+                message="recognized",
+            ),
+        ]
+        probe = AsyncMock(return_value=probe_results)
+        with (
+            patch(
+                "ouroboros.cli.commands.mcp_doctor._ALL_CHECKS",
+                [lambda: passing],
+            ),
+            patch("ouroboros.cli.commands.mcp_doctor._probe_local_stdio", probe),
+        ):
+            result = runner.invoke(app, ["doctor", "--probe-local-stdio", "--json"])
+
+        assert result.exit_code == 0
+        assert [item["name"] for item in json.loads(result.output)] == [
+            "existing",
+            "local_stdio_startup_transport",
+            "local_stdio_protocol_discovery",
+            "local_stdio_tool_recognition",
+        ]
+        probe.assert_awaited_once_with()
+
+    def test_probe_failure_uses_existing_exit_one_behavior(self):
+        app = _make_app()
+        passing = CheckResult(name="existing", status="pass", message="ok")
+        probe = AsyncMock(
+            return_value=[
+                CheckResult(
+                    name="local_stdio_startup_transport",
+                    status="fail",
+                    message="broken",
+                    remediation="repair it",
+                )
+            ]
+        )
+        with (
+            patch(
+                "ouroboros.cli.commands.mcp_doctor._ALL_CHECKS",
+                [lambda: passing],
+            ),
+            patch("ouroboros.cli.commands.mcp_doctor._probe_local_stdio", probe),
+        ):
+            result = runner.invoke(app, ["doctor", "--probe-local-stdio", "--json"])
+
+        assert result.exit_code == 1
+        assert json.loads(result.output)[-1]["status"] == "fail"
+
     def test_exits_0_when_all_pass(self):
         app = _make_app()
         all_pass = CheckResult(name="x", status="pass", message="ok")
@@ -411,7 +897,7 @@ class TestDoctorCommand:
             "ouroboros.cli.commands.mcp_doctor._ALL_CHECKS",
             [lambda: all_pass],
         ):
-            result = runner.invoke(app, [])
+            result = runner.invoke(app, ["doctor"])
         assert result.exit_code == 0
 
     def test_exits_1_when_any_fail(self):
@@ -422,7 +908,7 @@ class TestDoctorCommand:
             "ouroboros.cli.commands.mcp_doctor._ALL_CHECKS",
             [lambda: failing, lambda: passing],
         ):
-            result = runner.invoke(app, [])
+            result = runner.invoke(app, ["doctor"])
         assert result.exit_code == 1
 
     def test_exits_0_when_only_warn(self):
@@ -432,8 +918,38 @@ class TestDoctorCommand:
             "ouroboros.cli.commands.mcp_doctor._ALL_CHECKS",
             [lambda: warning],
         ):
-            result = runner.invoke(app, [])
+            result = runner.invoke(app, ["doctor"])
         assert result.exit_code == 0
+
+    def test_machine_snapshot_json_is_structured_and_opt_in(self):
+        app = _make_app()
+        check = CheckResult(name="x", status="pass", message="ok")
+        snapshot = MagicMock()
+        snapshot.to_dict.return_value = {"os": {"status": "ok", "value": {"system": "Linux"}}}
+        with (
+            patch("ouroboros.cli.commands.mcp_doctor._ALL_CHECKS", [lambda: check]),
+            patch("ouroboros.mcp.machine_snapshot.collect_machine_snapshot", return_value=snapshot),
+        ):
+            result = runner.invoke(app, ["doctor", "--machine-snapshot", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["checks"][0]["name"] == "x"
+        assert data["machine_snapshot"]["os"]["value"]["system"] == "Linux"
+
+    def test_machine_snapshot_human_output_is_readable(self):
+        app = _make_app()
+        check = CheckResult(name="x", status="pass", message="ok")
+        snapshot = MagicMock()
+        snapshot.to_dict.return_value = {"python": {"status": "ok", "value": {"version": "3.13"}}}
+        with (
+            patch("ouroboros.cli.commands.mcp_doctor._ALL_CHECKS", [lambda: check]),
+            patch("ouroboros.mcp.machine_snapshot.collect_machine_snapshot", return_value=snapshot),
+        ):
+            result = runner.invoke(app, ["doctor", "--machine-snapshot"])
+        assert result.exit_code == 0
+        assert "Static machine snapshot" in result.output
+        assert "python" in result.output
+        assert "3.13" in result.output
 
     def test_json_flag_emits_valid_json(self):
         app = _make_app()
@@ -443,7 +959,7 @@ class TestDoctorCommand:
             "ouroboros.cli.commands.mcp_doctor._ALL_CHECKS",
             [lambda: check_a, lambda: check_b],
         ):
-            result = runner.invoke(app, ["--json"])
+            result = runner.invoke(app, ["doctor", "--json"])
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert isinstance(data, list)
@@ -459,7 +975,7 @@ class TestDoctorCommand:
             "ouroboros.cli.commands.mcp_doctor._ALL_CHECKS",
             [lambda: check_result],
         ):
-            result = runner.invoke(app, ["--json"])
+            result = runner.invoke(app, ["doctor", "--json"])
         data = json.loads(result.output)
         for item in data:
             assert "name" in item
@@ -469,12 +985,12 @@ class TestDoctorCommand:
 
     def test_human_output_shows_symbols(self):
         app = _make_app()
-        check_result = CheckResult(name="mcp", status="pass", message="mcp 1.26.0")
+        check_result = CheckResult(name="mcp", status="pass", message="mcp 2.2.0")
         with patch(
             "ouroboros.cli.commands.mcp_doctor._ALL_CHECKS",
             [lambda: check_result],
         ):
-            result = runner.invoke(app, [])
+            result = runner.invoke(app, ["doctor"])
         assert "mcp" in result.output
 
     def test_human_output_shows_remediation(self):
@@ -489,8 +1005,32 @@ class TestDoctorCommand:
             "ouroboros.cli.commands.mcp_doctor._ALL_CHECKS",
             [lambda: check_result],
         ):
-            result = runner.invoke(app, [])
+            result = runner.invoke(app, ["doctor"])
         assert "pip install mcp" in result.output
+
+    def test_human_output_preserves_literal_package_profiles(self):
+        app = _make_app()
+        check_result = CheckResult(
+            name="claude_agent_sdk_import",
+            status="fail",
+            message=UNSUPPORTED_CLAUDE_SDK_MCP_MESSAGE,
+            remediation="Use ouroboros-ai[mcp,claude-cli] in the MCP 2 process.",
+        )
+        with patch(
+            "ouroboros.cli.commands.mcp_doctor._ALL_CHECKS",
+            [lambda: check_result],
+        ):
+            result = runner.invoke(app, ["doctor"])
+
+        assert result.exit_code == 1
+        for profile in (
+            "ouroboros-ai[mcp]",
+            "ouroboros-ai[claude]",
+            "[claude-sdk]",
+            "[claude-cli]",
+            "ouroboros-ai[mcp,claude-cli]",
+        ):
+            assert profile in result.output
 
     def test_json_fail_still_exits_1(self):
         app = _make_app()
@@ -499,7 +1039,7 @@ class TestDoctorCommand:
             "ouroboros.cli.commands.mcp_doctor._ALL_CHECKS",
             [lambda: failing],
         ):
-            result = runner.invoke(app, ["--json"])
+            result = runner.invoke(app, ["doctor", "--json"])
         assert result.exit_code == 1
         data = json.loads(result.output)
         assert data[0]["status"] == "fail"
@@ -512,12 +1052,12 @@ class TestDoctorCommand:
             status="warn",
             message="claude-agent-sdk not installed (not required for codex runtime)",
         )
-        pass_result = CheckResult(name="mcp_import", status="pass", message="mcp 1.26.0")
+        pass_result = CheckResult(name="mcp_import", status="pass", message="mcp 2.2.0")
         with patch(
             "ouroboros.cli.commands.mcp_doctor._ALL_CHECKS",
             [lambda: pass_result, lambda: warn_result],
         ):
-            result = runner.invoke(app, [])
+            result = runner.invoke(app, ["doctor"])
         assert result.exit_code == 0
 
 
@@ -555,3 +1095,463 @@ def _import_error_for(module_name: str):
         return real_import(name, *args, **kwargs)
 
     return _side_effect
+
+
+def test_machine_snapshot_actual_collector_through_cli(tmp_path: Path):
+    config = tmp_path / ".ouroboros" / "config.yaml"
+    config.parent.mkdir()
+    config.write_text("PRIVATE_CONFIG_SENTINEL")
+    app = _make_app()
+    with (
+        patch("ouroboros.cli.commands.mcp_doctor._ALL_CHECKS", []),
+        patch("ouroboros.mcp.machine_snapshot.Path.home", return_value=tmp_path),
+        patch(
+            "ouroboros.mcp.machine_snapshot.shutil.disk_usage",
+            side_effect=PermissionError("PRIVATE_EXCEPTION_SENTINEL"),
+        ),
+    ):
+        for args in (["--machine-snapshot", "--json"], ["--machine-snapshot"]):
+            result = runner.invoke(app, ["doctor", *args])
+            assert result.exit_code == 0, result.output
+            assert "PRIVATE_CONFIG_SENTINEL" not in result.output
+            assert "PRIVATE_EXCEPTION_SENTINEL" not in result.output
+            assert "permission_denied" in result.output
+        result = runner.invoke(app, ["doctor", "--machine-snapshot", "--json"])
+    snapshot = json.loads(result.output)["machine_snapshot"]
+    assert snapshot["config_path"]["value"]["kind"] == "regular_file"
+    assert snapshot["python"]["status"] == "ok"
+    assert snapshot["disk"]["reason"] == "permission_denied"
+
+
+def test_default_doctor_does_not_collect_machine_snapshot():
+    with (
+        patch("ouroboros.cli.commands.mcp_doctor._ALL_CHECKS", []),
+        patch("ouroboros.mcp.machine_snapshot.collect_machine_snapshot") as collect,
+    ):
+        result = runner.invoke(_make_app(), ["doctor", "--json"])
+    assert result.exit_code == 0
+    assert json.loads(result.output) == []
+    collect.assert_not_called()
+
+
+def test_doctor_runtime_json_uses_owner_path_without_exposing_home(tmp_path: Path, monkeypatch):
+    from ouroboros.cli.commands.mcp import app
+
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    (registry / "123.pid").write_bytes(b"opaque")
+    private_home = tmp_path / "PRIVATE_HOME_SENTINEL"
+    monkeypatch.setenv("HOME", str(private_home))
+
+    with patch("ouroboros.cli.commands.mcp._PID_REGISTRY_DIR", registry):
+        result = runner.invoke(app, ["doctor-runtime", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert set(payload) == {"path", "loopback", "registry"}
+    assert payload["registry"]["directory"] == "~/.ouroboros/mcp-servers"
+    assert payload["registry"]["records"][0]["pid"] == 123
+    assert str(private_home) not in json.dumps(payload)
+    assert all(
+        item["status"] in {"available", "unavailable", "not_checked"}
+        for item in payload["loopback"]
+    )
+
+
+def test_doctor_runtime_human_output_includes_bounded_path_and_registry_details(
+    tmp_path: Path, monkeypatch
+):
+    from ouroboros.cli.commands.mcp import app
+
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    registry = tmp_path / "registry"
+    for directory in (first, second):
+        directory.mkdir()
+        executable = directory / "ouroboros"
+        executable.write_text("unused", encoding="utf-8")
+        executable.chmod(0o755)
+    registry.mkdir()
+    (registry / "456.pid").write_bytes(b"opaque")
+    monkeypatch.setenv("PATH", os.pathsep.join((str(first), str(second))))
+
+    with patch("ouroboros.cli.commands.mcp._PID_REGISTRY_DIR", registry):
+        result = runner.invoke(app, ["doctor-runtime"])
+
+    assert result.exit_code == 0
+    assert "Ouroboros MCP Runtime Facts" in result.output
+    output = " ".join(result.output.split())
+    assert "PATH candidate: ouroboros ->" in output
+    assert f"{first.name}/ouroboros" in output
+    assert f"{second.name}/ouroboros" in output
+    assert "PATH collision: ouroboros ->" in output
+    assert "registry: available at ~/.ouroboros/mcp-servers" in output
+    assert "registry record: pid=456, name=456.pid" in output
+    assert str(registry) not in output
+
+
+def test_doctor_runtime_human_output_includes_unavailable_reason(capsys):
+    from types import SimpleNamespace
+
+    app = _make_app()
+    callback = next(
+        command.callback
+        for command in app.registered_commands
+        if command.callback.__name__ == "doctor_runtime"
+    )
+    snapshot = SimpleNamespace(
+        path=SimpleNamespace(
+            status="not_checked",
+            reason="missing",
+            entries_seen=0,
+            entries_limit=128,
+            candidates=(),
+            collisions={},
+            truncated=False,
+        ),
+        loopback=(
+            SimpleNamespace(family="ipv4", status="unavailable", port=None, reason="denied"),
+        ),
+        registry=SimpleNamespace(
+            directory="~/.ouroboros/mcp-servers",
+            entries_seen=0,
+            entries_limit=128,
+            records=(),
+            status="not_checked",
+            truncated=False,
+            reason="owner_unavailable",
+        ),
+    )
+    with patch(
+        "ouroboros.mcp.machine_runtime.collect_runtime_snapshot",
+        return_value=snapshot,
+    ):
+        callback()
+
+    output = capsys.readouterr().out
+    assert "loopback ipv4: unavailable (port -, denied)" in output
+    assert "PATH unavailable reason: missing" in output
+    assert "registry unavailable reason: owner_unavailable" in output
+
+
+def test_doctor_runtime_human_output_escapes_terminal_controls(tmp_path: Path, monkeypatch):
+    from ouroboros.cli.commands.mcp import app
+
+    first = tmp_path / "line\nbreak\x1b[31m"
+    second = tmp_path / "second"
+    registry = tmp_path / "registry"
+    for directory in (first, second):
+        directory.mkdir()
+        executable = directory / "ouroboros"
+        executable.write_text("unused", encoding="utf-8")
+        executable.chmod(0o755)
+    registry.mkdir()
+    monkeypatch.setenv("PATH", os.pathsep.join((str(first), str(second))))
+
+    with patch("ouroboros.cli.commands.mcp._PID_REGISTRY_DIR", registry):
+        result = runner.invoke(app, ["doctor-runtime"])
+
+    assert result.exit_code == 0
+    rendered_path = str(first / "ouroboros").replace("\n", "\\x0a").replace("\x1b", "\\x1b")
+    assert "line\\x0abreak\\x1b[31m" in result.output
+    assert rendered_path in result.output
+    assert str(first / "ouroboros") not in result.output
+    assert "\x1b[31m" not in result.output
+
+
+def test_doctor_runtime_command_is_registered():
+    from ouroboros.cli.commands.mcp import app
+
+    callback_names = [cmd.callback.__name__ for cmd in app.registered_commands]
+
+    assert "doctor_runtime" in callback_names
+
+
+def test_public_doctor_runtime_skips_config_telemetry_and_logging_bootstrap(tmp_path: Path):
+    repo_root = Path(__file__).resolve().parents[3]
+    home = tmp_path / "fresh-home"
+    home.mkdir()
+    script = """
+import sys
+from ouroboros import telemetry
+
+def forbidden(*_args, **_kwargs):
+    raise AssertionError("doctor-runtime must skip telemetry startup")
+
+telemetry.show_first_run_notice = forbidden
+telemetry.capture_cli_command = forbidden
+from ouroboros import main
+main()
+assert "ouroboros.config.loader" not in sys.modules
+"""
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["PYTHONPATH"] = str(repo_root / "src")
+    env["PATH"] = ""
+    env.pop("OUROBOROS_TELEMETRY", None)
+    result = subprocess.run(
+        [sys.executable, "-c", script, "mcp", "doctor-runtime", "--json"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert set(payload) == {"path", "loopback", "registry"}
+    assert payload["registry"]["directory"] == "~/.ouroboros/mcp-servers"
+    assert str(home) not in result.stdout
+    assert not (home / ".ouroboros").exists()
+
+
+@pytest.mark.parametrize("command_name", ["ouroboros", "ooo"])
+def test_public_console_scripts_skip_config_telemetry_and_logging_bootstrap(
+    tmp_path: Path, command_name: str
+):
+    repo_root = Path(__file__).resolve().parents[3]
+    home = tmp_path / f"fresh-home-{command_name}"
+    home.mkdir()
+    probe_dir = tmp_path / f"probe-{command_name}"
+    probe_dir.mkdir()
+    probe_result = probe_dir / "imports.json"
+    (probe_dir / "sitecustomize.py").write_text(
+        """import atexit
+import builtins
+import importlib.abc
+import json
+import os
+from pathlib import Path
+import sys
+
+class ConfigLoaderGuard(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "ouroboros.config.loader":
+            raise AssertionError("runtime doctor must not import config loader")
+
+sys.meta_path.insert(0, ConfigLoaderGuard())
+original_import = builtins.__import__
+
+def forbidden(*_args, **_kwargs):
+    raise AssertionError("runtime doctor must skip telemetry startup")
+
+def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    module = original_import(name, globals, locals, fromlist, level)
+    telemetry = sys.modules.get("ouroboros.telemetry")
+    if telemetry is not None:
+        telemetry.show_first_run_notice = forbidden
+        telemetry.capture_cli_command = forbidden
+    return module
+
+builtins.__import__ = guarded_import
+
+def record_imports():
+    Path(os.environ["ENTRYPOINT_PROBE_RESULT"]).write_text(
+        json.dumps({
+            "config_loader": "ouroboros.config.loader" in sys.modules,
+            "telemetry": "ouroboros.telemetry" in sys.modules,
+        }),
+        encoding="utf-8",
+    )
+
+atexit.register(record_imports)
+""",
+        encoding="utf-8",
+    )
+    script_name = command_name + (".exe" if os.name == "nt" else "")
+    executable = Path(sysconfig.get_path("scripts")) / script_name
+    assert executable.is_file(), f"expected installed console script at {executable}"
+
+    env = os.environ.copy()
+    env["HOME"] = str(home)
+    env["PATH"] = ""
+    env["PYTHONPATH"] = os.pathsep.join((str(probe_dir), str(repo_root / "src")))
+    env["ENTRYPOINT_PROBE_RESULT"] = str(probe_result)
+    env.pop("OUROBOROS_TELEMETRY", None)
+    result = subprocess.run(
+        [str(executable), "mcp", "doctor-runtime", "--json"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert set(payload) == {"path", "loopback", "registry"}
+    assert payload["registry"]["directory"] == "~/.ouroboros/mcp-servers"
+    assert str(home) not in result.stdout
+    assert not home.exists() or not any(home.iterdir())
+    assert json.loads(probe_result.read_text(encoding="utf-8")) == {
+        "config_loader": False,
+        "telemetry": False,
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="HOME overrides the POSIX server location")
+@pytest.mark.parametrize("route", ["module", "ouroboros", "ooo"])
+@pytest.mark.parametrize("as_json", [False, True])
+@pytest.mark.parametrize("parent_alias", [False, True])
+@pytest.mark.parametrize("relative_home", [False, True])
+@pytest.mark.parametrize("absolute_path", [False, True])
+def test_public_runtime_masks_home_in_path_candidates_and_collisions(
+    tmp_path, route, as_json, parent_alias, relative_home, absolute_path
+):
+    home = tmp_path.resolve() / "PRIVATE_HOME_PATH_SENTINEL"
+    registry = home / ".ouroboros" / "mcp-servers"
+    registry.mkdir(parents=True)
+    (registry / "123.pid").write_text("PRIVATE_PID_CONTENT_SENTINEL")
+    (home / ".ouroboros" / "config.yaml").write_text("PRIVATE_CONFIG_SENTINEL")
+    first, second = home / "bin", home / "tools"
+    outside = tmp_path.resolve() / "public-bin"
+    for directory in (first, second, outside):
+        directory.mkdir()
+        executable = directory / "ouroboros"
+        executable.write_text("unused")
+        executable.chmod(0o755)
+    files_before = {path: path.read_bytes() for path in home.rglob("*") if path.is_file()}
+    environment = os.environ.copy()
+    location_home = Path(home.name) if relative_home else home
+    path_home = home if absolute_path else location_home
+    path_home = path_home / ".." / home.name if parent_alias else path_home
+    environment.update(
+        HOME=str(location_home),
+        PATH=os.pathsep.join(map(str, (path_home / "bin", path_home / "tools", outside))),
+        PYTHONDONTWRITEBYTECODE="1",
+    )
+    if route == "module":
+        command = [sys.executable, "-B", "-m", "ouroboros"]
+    else:
+        command = [str(Path(sysconfig.get_path("scripts")) / route)]
+    command.extend(["mcp", "doctor-runtime"])
+    if as_json:
+        command.append("--json")
+    result = subprocess.run(
+        command,
+        cwd=tmp_path.resolve(),
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    for sentinel in (
+        "PRIVATE_HOME_PATH_SENTINEL",
+        "PRIVATE_PID_CONTENT_SENTINEL",
+        "PRIVATE_CONFIG_SENTINEL",
+    ):
+        assert sentinel not in result.stdout
+    assert str(home) not in result.stdout
+    expected_paths = ["~/bin/ouroboros", "~/tools/ouroboros", str(outside / "ouroboros")]
+    if as_json:
+        payload = json.loads(result.stdout)
+        assert [value["path"] for value in payload["path"]["candidates"]] == expected_paths
+        assert payload["path"]["collisions"]["ouroboros"] == expected_paths
+        if relative_home:
+            assert payload["registry"]["reason"] == "owner_unavailable"
+            assert payload["registry"]["records"] == []
+        else:
+            assert [record["pid"] for record in payload["registry"]["records"]] == [123]
+    else:
+        assert "PATH collision: ouroboros ->" in result.stdout
+        assert all(value in result.stdout for value in expected_paths)
+    assert files_before == {path: path.read_bytes() for path in home.rglob("*") if path.is_file()}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX absolute and root-home path cases")
+def test_runtime_home_mask_preserves_other_locations_and_root_home():
+    from ouroboros.cli.runtime_doctor import _private_home_path
+
+    home = Path("/private/home")
+    assert _private_home_path("/private/home/bin/python", home) == "~/bin/python"
+    assert _private_home_path("/private/home-other/bin/python", home) == (
+        "/private/home-other/bin/python"
+    )
+    assert _private_home_path("relative/bin/python", home) == "relative/bin/python"
+    assert _private_home_path("/bin/python", Path("/")) == "~/bin/python"
+    assert _private_home_path("/private/home", home) == "~"
+    assert _private_home_path("/private/home/../home/bin/python", home) == "~/bin/python"
+    assert _private_home_path("/private/home/../public/bin/python", home) == (
+        "/private/public/bin/python"
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX absolute HOME paths")
+@pytest.mark.parametrize("as_json", [False, True])
+def test_registered_runtime_command_masks_the_same_home_prefix(tmp_path, monkeypatch, as_json):
+    from ouroboros.cli.commands.mcp import app
+
+    home = tmp_path.resolve() / "PRIVATE_REGISTERED_HOME_SENTINEL"
+    registry = home / ".ouroboros" / "mcp-servers"
+    registry.mkdir(parents=True)
+    (registry / "123.pid").write_text("unused")
+    candidates = [home / "bin", home / "tools"]
+    for directory in candidates:
+        directory.mkdir()
+        executable = directory / "ouroboros"
+        executable.write_text("unused")
+        executable.chmod(0o755)
+    monkeypatch.setenv("PATH", os.pathsep.join(map(str, candidates)))
+    with patch("ouroboros.cli.commands.mcp._PID_REGISTRY_DIR", registry):
+        result = runner.invoke(app, ["doctor-runtime"] + (["--json"] if as_json else []))
+    assert result.exit_code == 0
+    assert "PRIVATE_REGISTERED_HOME_SENTINEL" not in result.output
+    if as_json:
+        payload = json.loads(result.output)
+        assert payload["path"]["collisions"]["ouroboros"] == [
+            "~/bin/ouroboros",
+            "~/tools/ouroboros",
+        ]
+    else:
+        assert "~/bin/ouroboros" in result.output
+        assert "~/tools/ouroboros" in result.output
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize("stage", ["startup", "discovery", "tools", "cleanup"])
+def test_local_probe_does_not_echo_untrusted_errors(stage: str, json_output: bool) -> None:
+    adapter = _successful_probe_adapter("ouroboros_interview")
+    adapter.transport_entered = stage != "startup"
+    error = RuntimeError("SYNTHETIC_PRIVATE_VALUE")
+    adapter.connect = AsyncMock(
+        return_value=Result.err(error) if stage in {"startup", "discovery"} else Result.ok(None)
+    )
+    if stage == "tools":
+        adapter.list_tools.return_value = Result.err(error)
+    adapter.disconnect = AsyncMock(
+        return_value=Result.err(error) if stage == "cleanup" else Result.ok(None)
+    )
+    args = ["doctor", "--probe-local-stdio"] + (["--json"] if json_output else [])
+    with (
+        patch("ouroboros.cli.commands.mcp_doctor._ALL_CHECKS", []),
+        patch("ouroboros.cli.commands.mcp_doctor.MCPClientAdapter", return_value=adapter),
+        patch(
+            "ouroboros.cli.commands.mcp_doctor._expected_ouroboros_tool_names",
+            return_value=frozenset({"ouroboros_interview"}),
+        ),
+    ):
+        result = runner.invoke(_make_app(), args)
+    assert result.exit_code == 1
+    assert "SYNTHETIC_PRIVATE_VALUE" not in result.output
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_local_probe_does_not_echo_unexpected_exception(json_output: bool) -> None:
+    args = ["doctor", "--probe-local-stdio"] + (["--json"] if json_output else [])
+    with (
+        patch("ouroboros.cli.commands.mcp_doctor._ALL_CHECKS", []),
+        patch(
+            "ouroboros.cli.commands.mcp_doctor.tempfile.TemporaryDirectory",
+            side_effect=OSError("SYNTHETIC_PRIVATE_VALUE"),
+        ),
+    ):
+        result = runner.invoke(_make_app(), args)
+    assert result.exit_code == 1
+    assert "SYNTHETIC_PRIVATE_VALUE" not in result.output
+    assert "Local probe failed unexpectedly" in result.output

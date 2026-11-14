@@ -13,7 +13,8 @@ import asyncio
 from pathlib import Path
 from typing import Annotated, Any
 
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Confirm
+import structlog
 import typer
 
 from ouroboros.bigbang.interview import InterviewRound
@@ -21,15 +22,19 @@ from ouroboros.bigbang.pm_completion import (
     build_pm_completion_summary,
     maybe_complete_pm_interview,
 )
+from ouroboros.bigbang.pm_interview import PM_UNCERTAINTY_GUIDANCE
 from ouroboros.cli.formatters import console
 from ouroboros.cli.formatters.panels import print_error, print_info, print_success, print_warning
 from ouroboros.cli.formatters.prompting import multiline_prompt_async
+from ouroboros.cli.logging_setup import configure_cli_logging
+from ouroboros.cli.model_options import ModelOption, PinModelsOption, model_options
 from ouroboros.config import get_clarification_model, get_llm_backend
+from ouroboros.core.owner_only import secure_directory, write_owner_only
 from ouroboros.core.types import Result
-from ouroboros.observability import LoggingConfig, configure_logging
 from ouroboros.pm.handoff import build_pm_dev_handoff_command
 from ouroboros.providers.factory import (
     create_llm_adapter,
+    litellm_missing_dependency_message,
     resolve_llm_backend,
     resolve_llm_permission_mode,
 )
@@ -40,6 +45,9 @@ app = typer.Typer(
     no_args_is_help=False,
     invoke_without_command=True,
 )
+
+log = structlog.get_logger()
+_LITELLM_OPTIONAL_IMPORT_ROOTS = frozenset({"httpx", "litellm", "openai"})
 
 
 def _create_pm_litellm_adapter() -> Any:
@@ -52,25 +60,17 @@ def _create_pm_litellm_adapter() -> Any:
     try:
         from ouroboros.providers.litellm_adapter import LiteLLMAdapter
     except ModuleNotFoundError as exc:
-        if exc.name == "litellm":
-            msg = (
-                "PM interviews require the optional LiteLLM dependency. "
-                "Reinstall with `ouroboros-ai[litellm]`, or if you use uv tool: "
-                "`uv tool install --force --with litellm ouroboros-ai`."
-            )
-            raise RuntimeError(msg) from exc
-        raise
+        _raise_missing_litellm_dependency(exc)
 
     return LiteLLMAdapter()
 
 
 def _raise_missing_litellm_dependency(exc: ModuleNotFoundError) -> None:
     """Convert a missing optional LiteLLM import into install guidance."""
-    if exc.name == "litellm" or "litellm" in str(exc):
-        msg = (
-            "PM interviews require the optional LiteLLM dependency. "
-            "Reinstall with `ouroboros-ai[litellm]`, or if you use uv tool: "
-            "`uv tool install --force --with litellm ouroboros-ai`."
+    missing_root = (exc.name or "").split(".", 1)[0]
+    if missing_root in _LITELLM_OPTIONAL_IMPORT_ROOTS or "litellm" in str(exc):
+        msg = litellm_missing_dependency_message(
+            "PM interviews require the optional LiteLLM dependency."
         )
         raise RuntimeError(msg) from exc
     raise exc
@@ -95,14 +95,8 @@ def pm_command(
             help="Output directory for the generated PM document (default: .ouroboros/).",
         ),
     ] = None,
-    model: Annotated[
-        str | None,
-        typer.Option(
-            "--model",
-            "-m",
-            help="LLM model to use for the PM interview.",
-        ),
-    ] = None,
+    model: ModelOption = None,
+    pin_models: PinModelsOption = None,
     debug: Annotated[
         bool,
         typer.Option(
@@ -129,8 +123,8 @@ def pm_command(
     if ctx.invoked_subcommand is not None:
         return
 
+    configure_cli_logging(debug=debug)
     if debug:
-        configure_logging(LoggingConfig(log_level="DEBUG"))
         print_info("Debug mode enabled - showing verbose logs")
 
     console.print("\n[bold cyan]Ouroboros PM Generator[/] - Product Requirements Document\n")
@@ -141,29 +135,30 @@ def pm_command(
         print_info("Starting new PM interview session...")
 
     try:
-        resolved_backend = resolve_llm_backend(get_llm_backend())
-        resolved_model = model or get_clarification_model(resolved_backend)
-        permission_mode = resolve_llm_permission_mode(
-            backend=resolved_backend,
-            use_case="interview",
-        )
-
-        console.print(f"  Model: [dim]{resolved_model}[/]\n")
-        if permission_mode == "bypassPermissions":
-            print_warning(
-                "Interview backend "
-                f"'{resolved_backend}' uses bypassPermissions for question generation."
-            )
-
-        asyncio.run(
-            _run_pm_interview(
-                resume_id=resume,
-                model=resolved_model,
+        with model_options(model, pin_models):
+            resolved_backend = resolve_llm_backend(get_llm_backend())
+            resolved_model = get_clarification_model(resolved_backend)
+            permission_mode = resolve_llm_permission_mode(
                 backend=resolved_backend,
-                debug=debug,
-                output_dir=output,
+                use_case="interview",
             )
-        )
+
+            console.print(f"  Model: [dim]{resolved_model}[/]\n")
+            if permission_mode == "bypassPermissions":
+                print_warning(
+                    "Interview backend "
+                    f"'{resolved_backend}' uses bypassPermissions for question generation."
+                )
+
+            asyncio.run(
+                _run_pm_interview(
+                    resume_id=resume,
+                    model=resolved_model,
+                    backend=resolved_backend,
+                    debug=debug,
+                    output_dir=output,
+                )
+            )
     except ValueError as exc:
         print_error(str(exc))
         raise typer.Exit(code=1) from exc
@@ -175,22 +170,72 @@ def pm_command(
         raise typer.Exit(code=0)
 
 
-def _load_brownfield_from_db() -> list[dict[str, str]]:
-    """Load brownfield repos from DB for PM interview context.
+#: Shown when a brownfield roster meets the direct CLI. One text for both the
+#: start and the resume edge, because they are the same refusal.
+_BROWNFIELD_IS_AN_MCP_ENTRANCE = (
+    "Brownfield PM interviews run through `ooo pm` (MCP), which carries the "
+    "code and data evidence lanes.\n"
+    "This direct CLI has no lanes: it would generate every question from "
+    "memory while the PRD claimed the repositories as grounding.\n\n"
+    "Start or resume the interview with `ooo pm` instead. To run a greenfield "
+    "PM interview here, unregister the repositories first (`ooo brownfield`)."
+)
 
-    Loads all registered brownfield repos and lets the user select
-    which ones to include via ``_select_repos()``.
-    No cwd-based detection — repos come from the DB only.
+
+def _load_brownfield_from_db() -> list[dict[str, str]]:
+    """Load the registered brownfield roster.
+
+    Read here to *decide the entrance*, not to feed the interview. A non-empty
+    roster means this command is the wrong door — see
+    :func:`_refuse_brownfield_in_direct_cli`.
 
     Returns:
         List of brownfield repo dicts from the database.
     """
     from ouroboros.bigbang.brownfield import load_brownfield_repos_as_dicts
 
-    repos = load_brownfield_repos_as_dicts()
-    if repos:
-        print_info(f"Loaded {len(repos)} brownfield repo(s) from registry.")
-    return repos
+    return load_brownfield_repos_as_dicts()
+
+
+def _refuse_brownfield_in_direct_cli(repos: list[dict[str, str]]) -> None:
+    """Stop a direct-CLI PM interview when a brownfield roster is registered.
+
+    RFC #1937 moved repository reading out of the PM engine and into the
+    advisory lanes, which run in the host session that fans out. This command
+    does not fan out — it calls ``ask_next_question`` directly — so a brownfield
+    interview started here would produce questions from memory alone while the
+    Seed carried ``is_brownfield=True`` and the repository paths. That claim is
+    the harm: an ungrounded PRD that reads as a grounded one.
+
+    Two repairs were available and this is the second. Re-grounding the CLI
+    would leave two grounding mechanisms to keep in step permanently; removing
+    the entrance leaves one. The entrance was never a documented user path —
+    ``README.md`` lists ``ooo pm`` as *(via MCP)* with no CLI equivalent — so
+    what is withdrawn is a way to reach a bad state, not a way of working.
+
+    Greenfield is untouched. With no roster registered there is nothing this
+    command could have been grounded against, and it starts as before.
+    """
+    if not repos:
+        return
+    print_error(
+        f"{len(repos)} brownfield repo(s) are registered.\n\n{_BROWNFIELD_IS_AN_MCP_ENTRANCE}"
+    )
+    raise typer.Exit(code=1)
+
+
+def _resume_covers_repositories(state: Any, meta: dict[str, Any] | None) -> bool:
+    """Whether the session being resumed covers a codebase.
+
+    Asked of the repositories each time rather than kept as a flag beside them.
+    A PM session records its roster in two places depending on how it started —
+    ``codebase_paths`` on the state, ``brownfield_repos`` in ``pm_meta`` — and a
+    boolean maintained alongside them is one more thing that can disagree with
+    both. It did: the plugin selection path wrote only ``pm_meta``.
+    """
+    if getattr(state, "is_brownfield", False) or getattr(state, "codebase_paths", None):
+        return True
+    return bool((meta or {}).get("brownfield_repos"))
 
 
 def _check_existing_pm_seeds() -> bool:
@@ -231,109 +276,6 @@ def _check_existing_pm_seeds() -> bool:
     return should_overwrite
 
 
-def _select_repos(repos: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Multi-select UI for choosing which brownfield repos to use as reference.
-
-    Displays a numbered list of registered repos and lets the user pick
-    which ones to include in the PM interview context. Supports
-    comma-separated numbers, ranges (e.g. ``1-3``), and ``all``.
-
-    Behaviour:
-    - If *repos* is empty, returns ``[]`` immediately.
-    - If only one repo is registered, auto-selects it.
-    - Otherwise presents the numbered list and prompts for selection.
-
-    Args:
-        repos: All registered brownfield repo dicts.
-
-    Returns:
-        Subset of *repos* selected by the user.
-    """
-    if not repos:
-        return []
-
-    # Auto-select when only one repo is available
-    if len(repos) == 1:
-        name = repos[0].get("name", repos[0].get("path", "repo"))
-        print_info(f"Auto-selected single brownfield repo: {name}")
-        return list(repos)
-
-    # Display numbered list
-    console.print("\n[bold cyan]Registered brownfield repos:[/]\n")
-    for idx, repo in enumerate(repos, 1):
-        name = repo.get("name", "unnamed")
-        path = repo.get("path", "")
-        desc = repo.get("desc", "")
-        desc_part = f" — {desc}" if desc else ""
-        console.print(f"  [bold]{idx}[/]) [cyan]{name}[/] [dim]{path}{desc_part}[/]")
-
-    console.print(
-        "\n[dim]Enter numbers separated by commas (e.g. 1,3), a range (1-3), "
-        "or 'all'. Leave blank to select all.[/]"
-    )
-
-    raw = Prompt.ask("[yellow]Select repos[/]", default="all")
-    selection = _parse_selection(raw, len(repos))
-
-    if not selection:
-        print_warning("No valid selection — using all repos.")
-        return list(repos)
-
-    selected = [repos[i] for i in sorted(selection)]
-
-    names = ", ".join(r.get("name", "?") for r in selected)
-    print_info(f"Selected {len(selected)} repo(s): {names}")
-    return selected
-
-
-def _parse_selection(raw: str, total: int) -> set[int]:
-    """Parse a user selection string into a set of 0-based indices.
-
-    Supports:
-    - ``all`` or empty string → all indices
-    - Comma-separated numbers: ``1,3,5``
-    - Ranges: ``2-4`` (inclusive, 1-based)
-    - Combinations: ``1,3-5,7``
-
-    Invalid tokens are silently ignored.  Out-of-range numbers are
-    clipped to valid bounds.
-
-    Args:
-        raw: Raw user input string.
-        total: Total number of repos available.
-
-    Returns:
-        Set of valid 0-based indices.
-    """
-    stripped = raw.strip().lower()
-    if not stripped or stripped == "all":
-        return set(range(total))
-
-    indices: set[int] = set()
-    for token in stripped.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        if "-" in token:
-            parts = token.split("-", 1)
-            try:
-                start = int(parts[0].strip())
-                end = int(parts[1].strip())
-            except ValueError:
-                continue
-            # 1-based inclusive → 0-based
-            for i in range(max(1, start), min(total, end) + 1):
-                indices.add(i - 1)
-        else:
-            try:
-                num = int(token)
-            except ValueError:
-                continue
-            if 1 <= num <= total:
-                indices.add(num - 1)
-    return indices
-
-
 def _save_cli_pm_meta(session_id: str, engine: Any) -> None:
     """Persist PM-specific metadata so ``--resume`` can restore it.
 
@@ -343,7 +285,7 @@ def _save_cli_pm_meta(session_id: str, engine: Any) -> None:
     import json
 
     data_dir = Path.home() / ".ouroboros" / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
+    secure_directory(data_dir)
     meta_path = data_dir / f"pm_meta_{session_id}.json"
 
     # Build pending_reframe from the engine's reframe map (mirrors MCP _save_pm_meta)
@@ -371,7 +313,17 @@ def _save_cli_pm_meta(session_id: str, engine: Any) -> None:
         "classifications": [c.output_type.value for c in getattr(engine, "classifications", [])],
     }
 
-    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    durability_confirmed = write_owner_only(
+        meta_path,
+        json.dumps(meta, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    if not durability_confirmed:
+        log.warning(
+            "pm.meta_save_durability_unconfirmed",
+            session_id=session_id,
+            path=str(meta_path),
+        )
 
 
 def _make_message_callback(debug: bool):
@@ -385,6 +337,8 @@ def _make_message_callback(debug: bool):
             display = first_line[:100] + "..." if len(first_line) > 100 else first_line
             if display:
                 console.print(f"  [dim]thinking:[/] {display}")
+        elif msg_type == "tool_started":
+            console.print(f"  [cyan]tool started:[/] {content}")
         elif msg_type == "tool":
             console.print(f"  [yellow]tool:[/] {content}")
 
@@ -458,11 +412,10 @@ async def _run_pm_interview(
         if not _check_existing_pm_seeds():
             raise typer.Exit(code=0)
 
-    # Load brownfield repos from DB (registered via ooo setup)
-    brownfield_repos: list[dict[str, str]] = []
+    # Brownfield is not an entrance here. Checked before anything is created so
+    # no state exists to abandon.
     if not resume_id:
-        brownfield_repos = _load_brownfield_from_db()
-        brownfield_repos = _select_repos(brownfield_repos)
+        _refuse_brownfield_in_direct_cli(_load_brownfield_from_db())
 
     if resume_id:
         # Resume existing session
@@ -471,27 +424,53 @@ async def _run_pm_interview(
             print_error(f"Failed to resume session: {state_result.error}")
             raise typer.Exit(code=1)
         state = state_result.value
+        from ouroboros.interview_adapters.independent_batch import has_pending_batch
+
+        if has_pending_batch(state):
+            print_error("This interview has a pending question batch; resume it in the MCP host.")
+            raise typer.Exit(code=1)
 
         # Restore PM-specific metadata (deferred items, decide-later, etc.)
         data_dir = Path.home() / ".ouroboros" / "data"
         pm_meta_path = data_dir / f"pm_meta_{resume_id}.json"
+        meta: dict[str, Any] | None = None
         if pm_meta_path.exists():
             import json
 
             try:
                 meta = json.loads(pm_meta_path.read_text(encoding="utf-8"))
-                engine.restore_meta(meta)
             except (json.JSONDecodeError, OSError):
-                print_warning("Could not load PM metadata; continuing without it.")
-                # Still install PM steering even without full meta
-                engine._install_pm_steering()
+                meta = None
+
+        # The other edge of the same rule. A session started through MCP may
+        # cover repositories, and continuing it here would generate the rest of
+        # its questions ungrounded under a Seed that still claims them. Refusing
+        # at both edges is what makes the property total: this command can
+        # neither create nor continue a PM interview over a codebase.
+        #
+        # Asked of the repositories rather than of a flag beside them. The two
+        # disagreed: a session that selected its roster through the plugin path
+        # held it in ``pm_meta`` alone, so a resume read ``is_brownfield`` as
+        # false, passed here, and restored the roster on the next line.
+        if _resume_covers_repositories(state, meta):
+            print_error(
+                f"Session {resume_id} is a brownfield PM interview.\n\n"
+                f"{_BROWNFIELD_IS_AN_MCP_ENTRANCE}"
+            )
+            raise typer.Exit(code=1)
+
+        if meta is not None:
+            engine.restore_meta(meta)
         else:
-            # No pm_meta file — still install PM steering for resumed session
+            if pm_meta_path.exists():
+                print_warning("Could not load PM metadata; continuing without it.")
+            # Still install PM steering without full meta, as when there is none.
             engine._install_pm_steering()
 
         print_success(f"Resumed session: {resume_id}")
     else:
-        # New session — ask the opening question first
+        # New session — show uncertainty guidance before the first PM answer
+        print_info(PM_UNCERTAINTY_GUIDANCE)
         opening = engine.get_opening_question()
         console.print(f"\n[bold yellow]?[/] {opening}\n")
 
@@ -502,10 +481,10 @@ async def _run_pm_interview(
             raise typer.Exit(code=1)
 
         print_info("Starting interview...")
-        state_result = await engine.ask_opening_and_start(
-            user_response=user_answer,
-            brownfield_repos=brownfield_repos if brownfield_repos else None,
-        )
+        # No ``brownfield_repos``: a registered roster was refused above, so
+        # there is never one to pass. ``is_brownfield`` is therefore not a state
+        # this command can reach rather than one it is trusted not to set.
+        state_result = await engine.ask_opening_and_start(user_response=user_answer)
         if state_result.is_err:
             print_error(f"Failed to start interview: {state_result.error}")
             raise typer.Exit(code=1)
@@ -564,7 +543,7 @@ async def _run_pm_interview(
         save_result = await engine.save_state(state)
         if isinstance(save_result, Result) and save_result.is_err:
             print_error(f"Failed to save state: {save_result.error}")
-            break
+            raise typer.Exit(code=1)
         _save_cli_pm_meta(state.interview_id, engine)
 
         user_response = await multiline_prompt_async("Your response")
@@ -587,7 +566,7 @@ async def _run_pm_interview(
             save_result = await engine.save_state(state)
             if save_result.is_err:
                 print_error(f"Failed to save completed state: {save_result.error}")
-                break
+                raise typer.Exit(code=1)
             _save_cli_pm_meta(state.interview_id, engine)
 
             decide_later_summary = engine.format_decide_later_summary()
@@ -621,7 +600,7 @@ async def _run_pm_interview(
             save_result = await engine.save_state(state)
             if isinstance(save_result, Result) and save_result.is_err:
                 print_error(f"Failed to save state: {save_result.error}")
-                break
+                raise typer.Exit(code=1)
             _save_cli_pm_meta(state.interview_id, engine)
             continue
         if classification == "deferred" and _lower in (
@@ -636,7 +615,7 @@ async def _run_pm_interview(
             save_result = await engine.save_state(state)
             if isinstance(save_result, Result) and save_result.is_err:
                 print_error(f"Failed to save state: {save_result.error}")
-                break
+                raise typer.Exit(code=1)
             _save_cli_pm_meta(state.interview_id, engine)
             continue
 
@@ -658,7 +637,7 @@ async def _run_pm_interview(
             save_result = await engine.save_state(state)
             if save_result.is_err:
                 print_error(f"Failed to save completed state: {save_result.error}")
-                break
+                raise typer.Exit(code=1)
             _save_cli_pm_meta(state.interview_id, engine)
 
             decide_later_summary = engine.format_decide_later_summary()
@@ -676,7 +655,7 @@ async def _run_pm_interview(
         save_result = await engine.save_state(state)
         if isinstance(save_result, Result) and save_result.is_err:
             print_error(f"Failed to save state: {save_result.error}")
-            break
+            raise typer.Exit(code=1)
         _save_cli_pm_meta(state.interview_id, engine)
 
     # Show decide-later summary at interview end

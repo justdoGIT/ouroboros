@@ -51,6 +51,7 @@ from ouroboros.orchestrator.gemini_cli_runtime import GeminiCLIRuntime
 from ouroboros.orchestrator.opencode_runtime import (
     OpenCodeRuntime,
 )
+from ouroboros.orchestrator.zcode_cli_runtime import ZcodeCLIRuntime
 
 try:
     from ouroboros.orchestrator.dependency_analyzer import (
@@ -59,6 +60,7 @@ try:
         ACSharedRuntimeResource,
         DependencyAnalysisError,
         DependencyAnalyzer,
+        DependencyCycleError,
         DependencyGraph,
         ExecutionPlanningError,
         ExecutionStage,
@@ -71,6 +73,7 @@ except ModuleNotFoundError:  # pragma: no cover - compatibility for partial inst
     ACSharedRuntimeResource = None
     DependencyAnalysisError = None
     DependencyAnalyzer = None
+    DependencyCycleError = None
     DependencyGraph = None
     ExecutionPlanningError = None
     ExecutionStage = None
@@ -96,6 +99,11 @@ from ouroboros.orchestrator.execution_strategy import (
     get_strategy,
     register_strategy,
 )
+
+try:
+    from ouroboros.orchestrator.kiro_adapter import KiroAgentAdapter
+except (ImportError, ModuleNotFoundError):  # pragma: no cover
+    KiroAgentAdapter = None  # type: ignore[assignment,misc]
 from ouroboros.orchestrator.level_context import (
     ACContextSummary,
     LevelContext,
@@ -136,6 +144,8 @@ from ouroboros.orchestrator.runner import (
 )
 from ouroboros.orchestrator.runtime_factory import (
     create_agent_runtime,
+    create_agent_runtime_async,
+    preflight_agent_runtime,
     resolve_agent_runtime_backend,
 )
 from ouroboros.orchestrator.session import (
@@ -152,11 +162,15 @@ __all__ = [
     "ClaudeCodeRuntime",
     "CodexCliRuntime",
     "GeminiCLIRuntime",
+    "KiroAgentAdapter",
     "OpenCodeRuntime",
+    "ZcodeCLIRuntime",
     "DEFAULT_TOOLS",
     "RuntimeHandle",
     "TaskResult",
     "create_agent_runtime",
+    "create_agent_runtime_async",
+    "preflight_agent_runtime",
     "resolve_agent_runtime_backend",
     # Session
     "SessionRepository",
@@ -195,6 +209,7 @@ __all__ = [
     "ACSharedRuntimeResource",
     "DependencyAnalyzer",
     "DependencyAnalysisError",
+    "DependencyCycleError",
     "DependencyGraph",
     "ExecutionPlanningError",
     "ExecutionStage",

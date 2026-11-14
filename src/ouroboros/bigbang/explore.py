@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from ouroboros.config import get_clarification_model
+from ouroboros.config import get_llm_model_for_role
 
 if TYPE_CHECKING:
     from ouroboros.providers.base import LLMAdapter
@@ -45,6 +45,8 @@ _CONFIG_FILES: dict[str, str] = {
     "CMakeLists.txt": "C/C++",
     "Makefile": "Make-based",
 }
+_GITDIR_PREFIX = "gitdir: "
+_MAX_GIT_POINTER_BYTES = 4096
 
 # File extensions for type discovery
 _TYPE_PATTERNS: dict[str, list[str]] = {
@@ -149,9 +151,16 @@ class CodebaseExplorer:
     """
 
     llm_adapter: LLMAdapter
-    model: str = field(default_factory=get_clarification_model)
+    model: str | None = None
+    model_is_explicit: bool = field(default=False, init=False)
     max_files_per_scan: int = 200
     max_type_defs: int = 100
+
+    def __post_init__(self) -> None:
+        """Resolve implicit default model while preserving explicit caller pins."""
+        self.model_is_explicit = self.model is not None
+        if self.model is None:
+            self.model = get_llm_model_for_role("brownfield")
 
     async def explore(
         self,
@@ -452,8 +461,11 @@ Output a structured summary with sections: Tech Stack, Key Types, Patterns, Conv
             Message(role=MessageRole.USER, content=user_prompt),
         ]
 
+        assert self.model is not None
         config = CompletionConfig(
             model=self.model,
+            role="brownfield_explore",
+            model_is_explicit=self.model_is_explicit,
             temperature=0.2,
             max_tokens=1024,
         )
@@ -477,21 +489,55 @@ Output a structured summary with sections: Tech Stack, Key Types, Patterns, Conv
         return result.value.content.strip()
 
 
+def _has_git_metadata(root: Path) -> bool:
+    marker = root / ".git"
+    if marker.is_dir():
+        return (marker / "HEAD").is_file()
+    if not marker.is_file():
+        return False
+    try:
+        if marker.stat().st_size > _MAX_GIT_POINTER_BYTES:
+            return False
+        pointer = marker.read_bytes().decode("utf-8")
+    except (OSError, UnicodeError):
+        return False
+    if pointer.endswith("\r\n"):
+        pointer = pointer[:-2]
+    elif pointer.endswith(("\n", "\r")):
+        pointer = pointer[:-1]
+    if "\n" in pointer or "\r" in pointer:
+        return False
+    if not pointer.startswith(_GITDIR_PREFIX):
+        return False
+    normalized_path = pointer.removeprefix(_GITDIR_PREFIX)
+    if not normalized_path or normalized_path != normalized_path.strip():
+        return False
+    target = Path(normalized_path)
+    if not target.is_absolute():
+        target = root / target
+    try:
+        git_dir = target.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return git_dir.is_dir() and (git_dir / "HEAD").is_file()
+
+
 def detect_brownfield(cwd: str | Path) -> bool:
     """Detect whether a directory is a brownfield project.
 
-    Checks for the presence of any recognised config file from ``_CONFIG_FILES``.
+    Checks for valid Git metadata or a recognised config file from ``_CONFIG_FILES``.
 
     Args:
         cwd: Directory to inspect.
 
     Returns:
-        ``True`` if at least one config file is found, ``False`` otherwise.
+        ``True`` if valid Git metadata or at least one config file is found,
+        ``False`` otherwise.
     """
     try:
         root = Path(cwd)
-        return any((root / name).exists() for name in _CONFIG_FILES)
-    except Exception:
+        return _has_git_metadata(root) or any((root / name).exists() for name in _CONFIG_FILES)
+    except OSError:
         return False
 
 

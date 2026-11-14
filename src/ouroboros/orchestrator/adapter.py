@@ -18,16 +18,24 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import StrEnum
+import hashlib
+import importlib.util
+import math
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ouroboros.core.errors import ProviderError
+from ouroboros.core.retry import BASE_TRANSIENT_PATTERNS, is_transient_error
+from ouroboros.core.session_signal import SessionSignalCapabilities
 from ouroboros.core.types import Result
 from ouroboros.observability.logging import get_logger
+from ouroboros.orchestrator.backend_limits import resolve_backend_limits
+from ouroboros.orchestrator.claude_model_observation import claude_init_data
 from ouroboros.orchestrator.rate_limit import (
     DEFAULT_ANTHROPIC_RPM_CEILING,
     DEFAULT_ANTHROPIC_TPM_CEILING,
@@ -37,6 +45,7 @@ from ouroboros.orchestrator.rate_limit import (
     SharedRateLimitBucket,
     estimate_runtime_request_tokens,
 )
+from ouroboros.orchestrator.runtime_handle_aliases import RUNTIME_HANDLE_BACKEND_ALIASES
 from ouroboros.router.types import Resolved
 
 if TYPE_CHECKING:
@@ -65,6 +74,9 @@ _OPENCODE_PERSISTED_METADATA_KEYS = frozenset(
     {
         "ac_id",
         "ac_index",
+        "ac_capsule_fingerprint",
+        "ac_dispatch_id",
+        "ac_session_origin",
         "attempt_number",
         "depth",
         "display_path",
@@ -85,6 +97,7 @@ _OPENCODE_PERSISTED_METADATA_KEYS = frozenset(
         "parent_ac_index",
         "parent_node_id",
         "path",
+        "process_local_resume_nonce",
         "recovery_discontinuity",
         "retry_attempt",
         "root_ac_index",
@@ -167,6 +180,66 @@ def _format_tool_detail(tool_name: str, tool_input: dict[str, Any]) -> str:
     return f"{tool_name}: {detail}" if detail else tool_name
 
 
+_USAGE_TOKEN_KEYS: tuple[str, ...] = (
+    "input_tokens",
+    "output_tokens",
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "total_tokens",
+)
+
+
+class _InvalidUsage:
+    """Sentinel type preserving malformed usage across message normalization."""
+
+
+_INVALID_USAGE = _InvalidUsage()
+
+
+def _normalized_usage(obj: object) -> dict[str, int | float] | _InvalidUsage | None:
+    """Extract an all-or-nothing dict of valid token counts from usage.
+
+    Reads only the known token keys (:data:`_USAGE_TOKEN_KEYS`) from either a
+    ``Mapping`` or an attribute-bearing object. If any *present* recognized key
+    is non-numeric, boolean, negative, non-finite, or too large to convert to a
+    finite float, the whole payload is rejected. Silently dropping one malformed
+    component would undercount spend and can manufacture a false frugality PASS.
+    Returns :data:`_INVALID_USAGE` for malformed recognized telemetry and
+    ``None`` for an absent/empty measurement. Keeping those states distinct lets
+    the leaf-level harvester invalidate the whole attempt even when a later
+    message carries valid counters. Never raises.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, (str, bytes, bool, int, float, list, tuple, set)):
+        return _INVALID_USAGE
+    result: dict[str, int | float] = {}
+    missing = object()
+    for key in _USAGE_TOKEN_KEYS:
+        if isinstance(obj, Mapping):
+            if key not in obj:
+                continue
+            value = obj[key]
+        else:
+            try:
+                value = getattr(obj, key, missing)
+            except Exception:
+                return _INVALID_USAGE
+            if value is missing:
+                continue
+        if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+            return _INVALID_USAGE
+        try:
+            normalized = float(value)
+        except (OverflowError, TypeError, ValueError):
+            return _INVALID_USAGE
+        if not math.isfinite(normalized) or normalized < 0:
+            return _INVALID_USAGE
+        result[key] = value
+    return result or None
+
+
 def _optional_str(value: object) -> str | None:
     """Return a string value when present, otherwise None."""
     return value if isinstance(value, str) and value else None
@@ -238,18 +311,7 @@ def _clone_runtime_handle_data(value: object) -> Any:
     return value
 
 
-# Keep this boundary map limited to canonical selectors and legacy spellings
-# already exercised by current runtimes or persisted RuntimeHandle payloads.
-_RUNTIME_HANDLE_BACKEND_ALIASES = {
-    "claude": "claude",
-    "claude_code": "claude",
-    "codex": "codex_cli",
-    "codex_cli": "codex_cli",
-    "opencode": "opencode",
-    "opencode_cli": "opencode",
-    "hermes": "hermes_cli",
-    "hermes_cli": "hermes_cli",
-}
+_RUNTIME_HANDLE_BACKEND_ALIASES = RUNTIME_HANDLE_BACKEND_ALIASES
 
 
 def _normalize_runtime_handle_selector(
@@ -568,13 +630,13 @@ class RuntimeHandle:
         }
 
     def to_persisted_dict(self) -> dict[str, Any]:
-        """Serialize the handle for event/session persistence.
+        """Persist resumable runtime state without conversation-local calibration."""
+        from ouroboros.orchestrator.interview_session import INTERVIEW_CALIBRATION_METADATA_KEY
 
-        OpenCode runtime sessions persist only the reconnectable session handle
-        plus AC ownership metadata so stored events remain minimal and resume-safe.
-        """
         if self.backend != "opencode":
-            return self.to_dict()
+            metadata = dict(self.metadata)
+            metadata.pop(INTERVIEW_CALIBRATION_METADATA_KEY, None)
+            return {**self.to_dict(), "metadata": metadata}
 
         metadata = {
             key: value
@@ -684,6 +746,213 @@ class TaskResult:
     resume_handle: RuntimeHandle | None = None
 
 
+class ParamSupport(StrEnum):
+    """How a runtime honors a given execution parameter.
+
+    Used for observability only: the orchestrator surfaces non-``NATIVE``
+    handling so an operator can see when a parameter is not honored in the form
+    they supplied it. It does **not** change what is passed to the runtime.
+
+    Values:
+        NATIVE: The runtime honors the parameter directly (e.g. a separate
+            system-prompt field, a real tool allow-list, a permission flag).
+        TRANSLATED: The runtime honors it only through a lossy adaptation —
+            e.g. embedding the system prompt into the user message, or mapping
+            a permission mode onto coarser CLI flags. The intent is partially
+            preserved but the supplied form is not.
+        IGNORED: The runtime silently drops the parameter.
+    """
+
+    NATIVE = "native"
+    TRANSLATED = "translated"
+    IGNORED = "ignored"
+
+
+class SubagentOrchestration(StrEnum):
+    """How (and whether) the orchestrator can fan work out to sub-agents.
+
+    This is a property of the (runtime × backend) PAIR, declared per
+    ``AgentRuntime`` instance via ``RuntimeCapabilities`` — NOT of the backend
+    name alone. The same backend can present different modes under different
+    runtimes: ``codex`` driven by ``codex exec`` is INTERNAL, but the same
+    ``codex`` driven as ``codex mcp-server`` (``codex``/``codex-reply`` →
+    addressable threads) is EXTERNAL_LEADER_DRIVEN.
+
+    The two EXTERNAL modes are distinguished by *who drives the child*, because
+    that determines the dispatch mechanism and is the seam that generalizes
+    across providers:
+
+    Values:
+        NONE: No sub-agent mechanism the orchestrator can use. Work runs
+            in-process (ouroboros's own ``anyio`` parallel AC executor). Default.
+        INTERNAL: The backend self-parallelizes *inside its own session* but
+            exposes no child-orchestration surface to an external driver.
+            Verified for ``codex exec`` / ``codex mcp-server``: the native
+            ``multi_agent_v1`` / ``codex_app`` team tools live only inside the
+            interactive session, so a delegated call may spin up its own helpers
+            but ouroboros cannot drive those children. In-process fan-out; may
+            *nudge* internal parallelism via developer-instructions.
+        EXTERNAL_HOST_BRIDGE: A host bridge spawns native sub-agents on the
+            orchestrator's behalf, driven OUT-OF-BAND via the ``_subagent``
+            envelope — ouroboros emits a payload and the host (the OpenCode
+            plugin) spawns a child session. ouroboros does NOT call the child
+            directly. Feeds ``should_dispatch_via_plugin``; eligible only when
+            the per-deployment bridge is enabled (``opencode_mode=plugin``).
+        EXTERNAL_LEADER_DRIVEN: ouroboros IS the leader and drives addressable
+            worker sessions DIRECTLY through the runtime's own resumable-session
+            surface — it spawns N sessions, holds their handles, and continues
+            each. This is the provider-NEUTRAL worker-pool mode: any runtime that
+            yields a resumable, addressable session qualifies. Verified surfaces:
+            Codex (``codex``→threadId→``codex-reply`` via ``codex mcp-server``);
+            Claude (``claude --resume <id>`` / ``claude mcp serve`` /
+            ``--print --output-format stream-json``); future Gemini etc. The
+            worker pool reads this mode via :func:`is_leader_driven_worker` and
+            drives the runtime through the ``AgentRuntime`` seam + the threaded
+            ``RuntimeHandle.native_session_id`` — NO ``_subagent`` envelope, so
+            it must NEVER reach ``should_dispatch_via_plugin``.
+    """
+
+    NONE = "none"
+    INTERNAL = "internal"
+    EXTERNAL_HOST_BRIDGE = "external_host_bridge"
+    EXTERNAL_LEADER_DRIVEN = "external_leader_driven"
+
+
+# Canonical backend → sub-agent-orchestration mapping. Single source of truth so
+# the per-runtime ``capabilities`` declarations and the static dispatch gate
+# (``should_dispatch_via_plugin``) can never drift. This map is the COARSE
+# backend-name fallback; the authoritative value is each runtime's declared
+# ``capabilities.subagent_orchestration`` (which can be finer — e.g. a
+# ``codex mcp-server`` worker runtime declares EXTERNAL_LEADER_DRIVEN even though
+# the backend name ``codex`` maps to INTERNAL here). Backends absent default to
+# NONE. Leader-driven worker runtimes deliberately stay ABSENT (→ NONE) so they
+# never trip the host-bridge plugin gate; they are recognized at the runtime
+# layer via :func:`is_leader_driven_worker`.
+_OPENCODE_BACKENDS: frozenset[str] = frozenset({"opencode", "opencode_cli"})
+_CODEX_BACKENDS: frozenset[str] = frozenset({"codex", "codex_cli"})
+
+
+def subagent_orchestration_for_backend(backend: str | None) -> SubagentOrchestration:
+    """Return the coarse backend-name :class:`SubagentOrchestration` fallback.
+
+    Prefer a runtime's declared ``capabilities.subagent_orchestration`` where a
+    runtime instance is available; this name-keyed map cannot distinguish
+    ``codex exec`` from ``codex mcp-server`` and is only the static fallback for
+    the envelope dispatch gate.
+    """
+    normalized = (backend or "").strip().lower()
+    if normalized in _OPENCODE_BACKENDS:
+        return SubagentOrchestration.EXTERNAL_HOST_BRIDGE
+    if normalized in _CODEX_BACKENDS:
+        return SubagentOrchestration.INTERNAL
+    return SubagentOrchestration.NONE
+
+
+def is_leader_driven_worker(capabilities: RuntimeCapabilities) -> bool:
+    """Return whether ouroboros can drive this runtime as a direct worker-pool member.
+
+    Provider-neutral seam: any runtime declaring
+    ``SubagentOrchestration.EXTERNAL_LEADER_DRIVEN`` is eligible to be spawned and
+    addressed directly by the leader (via ``execute_task`` + a resumable
+    ``RuntimeHandle``), regardless of backend name. This is what a future
+    worker-pool scheduler reads — NOT a backend-name check — so adding Claude,
+    Gemini, or a codex-mcp runtime is "declare the mode + supply a thin
+    transport", never a bespoke dispatch path.
+    """
+    return capabilities.subagent_orchestration is SubagentOrchestration.EXTERNAL_LEADER_DRIVEN
+
+
+def is_host_bridge_dispatch(capabilities: RuntimeCapabilities) -> bool:
+    """Return whether this runtime dispatches sub-agents via the host-bridge envelope."""
+    return capabilities.subagent_orchestration is SubagentOrchestration.EXTERNAL_HOST_BRIDGE
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeCapabilities:
+    """Declarative feature contract surfaced by an ``AgentRuntime``.
+
+    Added to move backend differences from implicit "silent degradation" to
+    explicit metadata the orchestrator can branch on. Upstream code should
+    prefer ``runtime.capabilities.<feature>`` over backend-name checks.
+
+    Attributes:
+        skill_dispatch: Runtime honors ``ooo <skill>`` / ``/ouroboros:<skill>``
+            prefixes by invoking the matching MCP tool instead of passing
+            the prompt through to the underlying CLI.
+        targeted_resume: Runtime can resume a specific session by id
+            (as opposed to "resume most recent" or no-resume).
+        structured_output: Runtime emits structured JSONL events
+            (tool calls, thread ids, per-item events). ``False`` means
+            plain-text stdout lines only.
+        system_prompt_support: How the runtime honors the ``system_prompt``
+            execution parameter (see :class:`ParamSupport`).
+        tool_restriction_support: Support for non-empty ``tools`` allow-lists.
+        empty_tool_restriction_support: Independent support for ``tools=[]``.
+        permission_mode_support: How the runtime honors ``permission_mode``.
+        session_signals: Ouroboros Synapse capabilities. Every field defaults to
+            unsupported; resumability never implies live signal delivery.
+
+    Execution-parameter supports default to :attr:`ParamSupport.NATIVE`; runtimes
+    opt out only when handling is demonstrably lossy.
+    """
+
+    skill_dispatch: bool
+    targeted_resume: bool
+    structured_output: bool
+    system_prompt_support: ParamSupport = ParamSupport.NATIVE
+    tool_restriction_support: ParamSupport = ParamSupport.NATIVE
+    empty_tool_restriction_support: ParamSupport = ParamSupport.NATIVE
+    permission_mode_support: ParamSupport = ParamSupport.NATIVE
+    # The effort-first investment lever (RFC #1405): how the runtime honors the
+    # ``reasoning_effort`` execution parameter. Unlike the four fields above it
+    # defaults to IGNORED, because most agent runtimes have no per-call effort
+    # knob — a runtime must opt in to NATIVE (or TRANSLATED) only when it can
+    # actually route the level to its backend (e.g. Claude Agent SDK ``effort``,
+    # Codex ``-c model_reasoning_effort``). This lets the orchestrator tell
+    # enforced rows apart from advised ones instead of assuming uniform support.
+    reasoning_effort_support: ParamSupport = ParamSupport.IGNORED
+    # The reasoning-effort vocabulary this runtime actually enforces. A NATIVE
+    # runtime still only honors the levels its backend accepts (Codex drops
+    # anything outside ``model_reasoning_effort``'s allow-list; Claude has no
+    # ``minimal``), so a level outside this set is recorded as *advised*, not
+    # enforced — keeping the proof's enforced rows truthful. ``None`` means "no
+    # per-level restriction" (any level is enforced when support is NATIVE).
+    enforceable_reasoning_efforts: frozenset[str] | None = None
+    # The per-call model-tier lever for frugality routing (RFC #1405 sibling): how
+    # the runtime honors a ``model`` override handed to ``execute_task`` for a
+    # single call. Like ``reasoning_effort_support`` it defaults to IGNORED — most
+    # runtimes pin one model at construction and cannot re-target per call. A
+    # runtime opts in to NATIVE only when it can verifiably route a per-call model
+    # id to its backend (Claude SDK ``model`` option, claude-worker/codex
+    # ``--model`` argv). This lets the orchestrator route a cheaper model to an
+    # explicitly trusted decomposed child and escalate on retry only where the
+    # choice is enforced.
+    model_override_support: ParamSupport = ParamSupport.IGNORED
+    # How the orchestrator may fan work out to sub-agents on this backend (see
+    # :class:`SubagentOrchestration`). Defaults to NONE so a backend opts in to
+    # INTERNAL/EXTERNAL only when its surface demonstrably supports it — this is
+    # the capability the sub-agent dispatch gate reads instead of a backend name.
+    subagent_orchestration: SubagentOrchestration = SubagentOrchestration.NONE
+    # Synapse is independently capability-gated.  Existing runtimes must remain
+    # unchanged until a transport proves and tests each delivery boundary.
+    session_signals: SessionSignalCapabilities = field(default_factory=SessionSignalCapabilities)
+
+
+# Default capability profile for first-class backends (Claude, Codex).
+# New backends should declare capabilities explicitly; silently inheriting
+# this default would recreate the gap this dataclass exists to prevent.
+FULL_CAPABILITIES = RuntimeCapabilities(
+    skill_dispatch=True,
+    targeted_resume=True,
+    structured_output=True,
+)
+
+# Reasoning-effort levels the Claude Agent SDK ``effort`` option accepts. Used to
+# declare Claude's enforceable vocabulary so a level it cannot honor (e.g. the
+# Codex-only ``minimal``) is recorded as advised rather than falsely enforced.
+CLAUDE_REASONING_EFFORT_LEVELS = frozenset({"low", "medium", "high", "xhigh", "max"})
+
+
 class AgentRuntime(Protocol):
     """Protocol for autonomous agent runtimes used by the orchestrator."""
 
@@ -691,6 +960,21 @@ class AgentRuntime(Protocol):
     def runtime_backend(self) -> str:
         """Canonical backend identifier (e.g. ``"claude"``, ``"codex_cli"``)."""
         ...
+
+    @property
+    def capabilities(self) -> RuntimeCapabilities:
+        """Feature contract surfaced by this runtime.
+
+        Default: ``FULL_CAPABILITIES`` (skill_dispatch + targeted_resume +
+        structured_output all True). Runtimes override this property to
+        declare a narrower surface — see ``KiroAgentAdapter`` for the
+        canonical example. Providing a default implementation keeps
+        pre-existing runtime adapters (Codex, Hermes, OpenCode, Gemini)
+        structurally compatible with the Protocol without forcing a
+        change to each one in this PR; callers can still branch on
+        capability flags rather than backend names.
+        """
+        return FULL_CAPABILITIES
 
     @property
     def llm_backend(self) -> str | None:
@@ -758,19 +1042,88 @@ MAX_RETRIES: int = 3
 RETRY_WAIT_INITIAL: float = 1.0  # seconds
 RETRY_WAIT_MAX: float = 10.0  # seconds
 
-# Error patterns that indicate transient failures worth retrying
-TRANSIENT_ERROR_PATTERNS: tuple[str, ...] = (
-    "concurrency",
-    "rate limit",
-    "429",
-    "500",
-    "502",
-    "503",
-    "504",
-    "timeout",
-    "connection",
+# Error patterns that indicate transient failures worth retrying.
+#
+# Derived from the canonical transient core in ``core.retry`` plus the one
+# execution-specific signal (``"exit code 1"`` — the SDK CLI process failing).
+# Adopting the shared core fixes a real divergence: this adapter previously did
+# NOT retry on ``"overloaded"`` (Anthropic 529), the most common transient error
+# under load, even though the completion adapters did. The shared tuple closes
+# that gap without dropping any pattern this adapter already matched.
+_CLAUDE_EXECUTION_RETRYABLE_EXTRA_PATTERNS = (
     "exit code 1",  # SDK CLI process failed
 )
+TRANSIENT_ERROR_PATTERNS: tuple[str, ...] = (
+    *BASE_TRANSIENT_PATTERNS,
+    *_CLAUDE_EXECUTION_RETRYABLE_EXTRA_PATTERNS,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedWorkerCwd:
+    """One cwd-resolution result that downstream consumers must not reinterpret."""
+
+    value: str | None
+
+    def __post_init__(self) -> None:
+        if self.value is None:
+            return
+        if not isinstance(self.value, str) or not self.value:
+            raise ValueError("resolved worker cwd must be a canonical absolute path")
+        path = Path(self.value).expanduser()
+        if not path.is_absolute():
+            raise ValueError("resolved worker cwd must be a canonical absolute path")
+        try:
+            canonical = str(path.resolve(strict=False))
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError("resolved worker cwd must be a canonical absolute path") from exc
+        if canonical != self.value:
+            raise ValueError("resolved worker cwd must be a canonical absolute path")
+
+
+WORKER_CWD_UNAVAILABLE_MESSAGE = (
+    "Worker working directory was unavailable when the runtime was created; "
+    "refusing to execute without a stable resolved cwd."
+)
+
+
+def worker_cwd_failure_message(
+    cwd: str | None,
+    *,
+    runtime_backend: str,
+    resume_handle: RuntimeHandle | None = None,
+) -> AgentMessage | None:
+    """Return the shared fail-closed result when construction resolved no cwd."""
+    if cwd is not None:
+        return None
+    log.error(
+        "orchestrator.adapter.worker_cwd_unavailable",
+        runtime_backend=runtime_backend,
+    )
+    return AgentMessage(
+        type="result",
+        content=WORKER_CWD_UNAVAILABLE_MESSAGE,
+        data={
+            "subtype": "error",
+            "error_type": "WorkerCwdUnavailable",
+            "runtime_backend": runtime_backend,
+        },
+        resume_handle=resume_handle,
+    )
+
+
+def resolve_worker_cwd(
+    cwd: str | os.PathLike[str] | ResolvedWorkerCwd | None,
+) -> str | None:
+    """Resolve one stable cwd; only an unavailable omitted cwd remains absent."""
+    if isinstance(cwd, ResolvedWorkerCwd):
+        return cwd.value
+    if cwd is not None:
+        return str(Path(cwd).expanduser().resolve(strict=False))
+    try:
+        return os.getcwd()
+    except OSError:
+        return None
 
 
 class ClaudeAgentAdapter:
@@ -798,13 +1151,21 @@ class ClaudeAgentAdapter:
     _runtime_handle_backend = "claude"
     _runtime_backend = "claude"
     _provider_name = "claude"
+    #: Extra CLI ``(flag, value)`` pairs; ``_log_message_text=False`` logs text as length, SHA-256.
+    _session_cli_args: tuple[tuple[str, str | None], ...] = ()
+    _log_message_text = True
+
+    #: This adapter runs its own shared RPM/TPM bucket
+    #: (:meth:`_build_rate_limit_bucket`), so the parallel executor must NOT add a
+    #: second dispatch-level rate gate for it (that would double-limit Claude).
+    self_governs_rate_limit = True
 
     def __init__(
         self,
         api_key: str | None = None,
         permission_mode: str = "acceptEdits",
         model: str | None = None,
-        cwd: str | Path | None = None,
+        cwd: str | Path | ResolvedWorkerCwd | None = None,
         cli_path: str | Path | None = None,
     ) -> None:
         """Initialize Claude Agent adapter.
@@ -824,7 +1185,7 @@ class ClaudeAgentAdapter:
         self._api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         self._permission_mode = permission_mode
         self._model = model
-        self._cwd = str(Path(cwd).expanduser()) if cwd is not None else os.getcwd()
+        self._cwd = resolve_worker_cwd(cwd)
         self._cli_path = str(Path(cli_path).expanduser()) if cli_path is not None else None
         self._rate_limit_bucket = self._build_rate_limit_bucket()
 
@@ -836,6 +1197,23 @@ class ClaudeAgentAdapter:
             cli_path=self._cli_path,
             shared_rate_limit_enabled=self._rate_limit_bucket.enabled,
         )
+
+    def preflight(self) -> str | None:
+        """Return why this runtime cannot execute yet, or ``None`` when it can.
+
+        The SDK import happens lazily inside ``execute_task``; without this
+        check a missing ``claude-agent-sdk`` surfaces only as a per-AC error
+        result, which the executor then retries and route-escalates for every
+        AC before giving up. Checked once, before any dispatch, it is a single
+        actionable configuration error instead.
+        """
+        if importlib.util.find_spec("claude_agent_sdk") is None:
+            return (
+                "Claude Agent SDK is not installed for the 'claude' runtime. "
+                "Install it (pip install claude-agent-sdk, or the ouroboros-ai[claude] "
+                "extra) or use the dependency-free CLI worker: --runtime claude-cli."
+            )
+        return None
 
     # -- AgentRuntime protocol properties ----------------------------------
 
@@ -855,6 +1233,24 @@ class ClaudeAgentAdapter:
     def permission_mode(self) -> str | None:
         return self._permission_mode
 
+    @property
+    def capabilities(self) -> RuntimeCapabilities:
+        # The Claude runtime drives the Claude Agent SDK, which honors the
+        # per-call ``effort`` and ``model`` options natively (see execute_task),
+        # so it opts in to NATIVE reasoning-effort AND model-override support.
+        # Other capabilities match the first-class default.
+        return replace(
+            FULL_CAPABILITIES,
+            reasoning_effort_support=ParamSupport.NATIVE,
+            enforceable_reasoning_efforts=CLAUDE_REASONING_EFFORT_LEVELS,
+            model_override_support=ParamSupport.NATIVE,
+            session_signals=SessionSignalCapabilities(
+                inform_delivery=True,
+                background_reply=True,
+                after_turn_delivery=True,
+            ),
+        )
+
     def _is_transient_error(self, error: Exception) -> bool:
         """Check if an error is transient and worth retrying.
 
@@ -864,8 +1260,10 @@ class ClaudeAgentAdapter:
         Returns:
             True if the error appears to be transient.
         """
-        error_str = str(error).lower()
-        return any(pattern in error_str for pattern in TRANSIENT_ERROR_PATTERNS)
+        return is_transient_error(
+            str(error),
+            extra_patterns=_CLAUDE_EXECUTION_RETRYABLE_EXTRA_PATTERNS,
+        )
 
     @staticmethod
     def _parse_optional_positive_int(
@@ -893,16 +1291,26 @@ class ClaudeAgentAdapter:
         return parsed
 
     def _build_rate_limit_bucket(self) -> SharedRateLimitBucket:
-        """Create the shared Anthropic rate-limit bucket for orchestrator workers."""
+        """Create the shared rate-limit bucket for orchestrator workers.
+
+        RPM/TPM defaults are sourced from the backend-limits registry (the
+        single source of truth for per-backend constraints) and may be
+        overridden per deployment via the ``OUROBOROS_ANTHROPIC_*`` env knobs
+        (``0`` disables that limit). For the native Claude backend this resolves
+        to the same Anthropic ceilings as before.
+        """
+        limits = resolve_backend_limits(self._runtime_backend)
+        rpm_default = limits.requests_per_minute or DEFAULT_ANTHROPIC_RPM_CEILING
+        tpm_default = limits.tokens_per_minute or DEFAULT_ANTHROPIC_TPM_CEILING
         return SharedRateLimitBucket(
             runtime_backend=self._runtime_backend,
             request_limit=self._parse_optional_positive_int(
                 "OUROBOROS_ANTHROPIC_RPM_CEILING",
-                default=DEFAULT_ANTHROPIC_RPM_CEILING,
+                default=rpm_default,
             ),
             token_limit=self._parse_optional_positive_int(
                 "OUROBOROS_ANTHROPIC_TPM_CEILING",
-                default=DEFAULT_ANTHROPIC_TPM_CEILING,
+                default=tpm_default,
             ),
         )
 
@@ -1115,6 +1523,8 @@ class ClaudeAgentAdapter:
         system_prompt: str | None = None,
         resume_handle: RuntimeHandle | None = None,
         resume_session_id: str | None = None,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
     ) -> AsyncIterator[AgentMessage]:
         """Execute a task and yield progress messages.
 
@@ -1127,6 +1537,9 @@ class ClaudeAgentAdapter:
             system_prompt: Optional custom system prompt.
             resume_handle: Backend-neutral handle to resume from.
             resume_session_id: Legacy Claude session ID to resume from.
+            model: Per-call model override from model-tier routing. When set it
+                WINS over the constructor pin (``self._model``); when ``None``
+                (the default) behavior is byte-identical to before.
 
         Yields:
             AgentMessage for each SDK message (assistant reasoning, tool calls, results).
@@ -1134,7 +1547,19 @@ class ClaudeAgentAdapter:
         Raises:
             ProviderError: If SDK initialization fails.
         """
-        effective_tools = tools or DEFAULT_TOOLS
+        cwd_failure = worker_cwd_failure_message(
+            self._cwd,
+            runtime_backend=self._runtime_backend,
+            resume_handle=resume_handle,
+        )
+        if cwd_failure is not None:
+            yield cwd_failure
+            return
+
+        # ``None`` means the caller did not choose a tool policy and receives
+        # the normal execution defaults.  An explicit empty list is different:
+        # Synapse ``inform`` uses it to create a read-only, no-tools reply turn.
+        effective_tools = DEFAULT_TOOLS if tools is None else tools
 
         log.info(
             "orchestrator.adapter.task_started",
@@ -1214,11 +1639,29 @@ class ClaudeAgentAdapter:
                     ]
                 }
 
-                if self._model:
-                    options_kwargs["model"] = self._model
+                # Per-call model-tier override (RFC #1405 sibling) wins over the
+                # constructor pin; ``model is None`` falls back to ``self._model``
+                # so existing call sites are byte-identical. The Claude Agent SDK
+                # honors ``model`` natively per call, which is what makes
+                # ``model_override_support = NATIVE`` truthful for this runtime.
+                effective_model = model or self._model
+                if effective_model:
+                    options_kwargs["model"] = effective_model
+
+                if reasoning_effort:
+                    # Effort-first investment dial (RFC #1405). The Claude Agent
+                    # SDK honors ``effort`` natively per call (low/medium/high/
+                    # xhigh/max), so the level the orchestrator chose is ENFORCED
+                    # here rather than merely advised in the prompt. This is what
+                    # makes ``reasoning_effort_support = NATIVE`` truthful for the
+                    # Claude runtime.
+                    options_kwargs["effort"] = reasoning_effort
 
                 if self._cli_path:
                     options_kwargs["cli_path"] = self._cli_path
+
+                if self._session_cli_args:
+                    options_kwargs["extra_args"] = dict(self._session_cli_args)
 
                 if system_prompt:
                     options_kwargs["system_prompt"] = system_prompt
@@ -1235,7 +1678,7 @@ class ClaudeAgentAdapter:
                 # Stream messages from SDK
                 session_id: str | None = None
                 async for sdk_message in query(prompt=prompt, options=options):
-                    agent_message = self._convert_message(sdk_message)
+                    agent_message = self._convert_message(sdk_message, effective_model)
 
                     # Capture session ID from init message
                     session_id = getattr(sdk_message, "session_id", None) or agent_message.data.get(
@@ -1340,11 +1783,16 @@ class ClaudeAgentAdapter:
                 resume_handle=current_runtime_handle,
             )
 
-    def _convert_message(self, sdk_message: Any) -> AgentMessage:
+    def _loggable(self, text: str, limit: int) -> Any:
+        if self._log_message_text:
+            return text[:limit]
+        return {"chars": len(text), "sha256": hashlib.sha256(text.encode()).hexdigest()}
+
+    def _convert_message(self, sdk_message: Any, model: str | None = None) -> AgentMessage:
         """Convert SDK message to internal AgentMessage format.
 
         Args:
-            sdk_message: Message from Claude Agent SDK.
+            sdk_message: Message from Claude Agent SDK; ``model`` is the one requested.
 
         Returns:
             Normalized AgentMessage.
@@ -1355,7 +1803,7 @@ class ClaudeAgentAdapter:
         log.debug(
             "orchestrator.adapter.message_received",
             class_name=class_name,
-            sdk_message=str(sdk_message)[:500],
+            sdk_message=self._loggable(str(sdk_message), 500),
         )
 
         # Extract content based on message class
@@ -1381,6 +1829,12 @@ class ClaudeAgentAdapter:
                     tool_input = getattr(block, "input", {}) or {}
                     data["tool_input"] = tool_input
                     data["tool_detail"] = _format_tool_detail(tool_name, tool_input)
+                    tool_call_id = getattr(block, "id", None) or getattr(block, "tool_use_id", None)
+                    if isinstance(tool_call_id, str) and tool_call_id.strip():
+                        # Preserve the SDK correlation id so later evidence
+                        # validation can pair a mutation request with its actual
+                        # (possibly failed) ToolResultBlock.
+                        data["tool_call_id"] = tool_call_id.strip()
 
                 elif block_type == "ThinkingBlock":
                     thinking = getattr(block, "thinking", "") or getattr(block, "text", "")
@@ -1399,9 +1853,26 @@ class ClaudeAgentAdapter:
             data["subtype"] = getattr(sdk_message, "subtype", "success")
             data["is_error"] = getattr(sdk_message, "is_error", False)
             data["session_id"] = getattr(sdk_message, "session_id", None)
+            # Surface token usage so a later executor can attribute per-AC spend.
+            # The SDK ResultMessage carries ``usage`` (a dict) and
+            # ``total_cost_usd``; normalize defensively and omit anything
+            # malformed (the deterministic proof treats such as missing).
+            usage = _normalized_usage(getattr(sdk_message, "usage", None))
+            if usage is _INVALID_USAGE:
+                data["usage_invalid"] = True
+            elif usage is not None:
+                data["usage"] = usage
+            total_cost_usd = getattr(sdk_message, "total_cost_usd", None)
+            if (
+                total_cost_usd is not None
+                and not isinstance(total_cost_usd, bool)
+                and isinstance(total_cost_usd, (int, float))
+                and math.isfinite(total_cost_usd)
+            ):
+                data["total_cost_usd"] = total_cost_usd
             log.info(
                 "orchestrator.adapter.result_message",
-                result_content=content[:200] if content else "empty",
+                result_content=self._loggable(content, 200) if content else "empty",
                 subtype=data["subtype"],
                 is_error=data["is_error"],
             )
@@ -1411,21 +1882,51 @@ class ClaudeAgentAdapter:
             subtype = getattr(sdk_message, "subtype", "")
             msg_data = getattr(sdk_message, "data", {})
             if subtype == "init":
-                session_id = msg_data.get("session_id")
-                content = f"Session initialized: {session_id}"
-                data["session_id"] = session_id
+                data.update(claude_init_data(msg_data, requested_model=model))
+                content = f"Session initialized: {data['session_id']}"
             else:
                 content = f"System: {subtype}"
             data["subtype"] = subtype
 
         elif class_name == "UserMessage":
             msg_type = "user"
-            # Tool result message
+            # Tool result message. Claude's SDK reports ToolResultBlock on a
+            # UserMessage and, historically, this adapter kept only its prose.
+            # Preserve the call id + structured error bit so failed Edit/Write
+            # calls can never become accepted mutation evidence.
             content_blocks = getattr(sdk_message, "content", [])
             for block in content_blocks:
                 if hasattr(block, "content"):
                     content = str(block.content)[:500]
-                    break
+                block_type = type(block).__name__
+                tool_call_id = getattr(block, "tool_use_id", None) or getattr(block, "id", None)
+                is_tool_result = block_type == "ToolResultBlock" or isinstance(tool_call_id, str)
+                if not is_tool_result:
+                    continue
+                msg_type = "tool_result"
+                data["subtype"] = "tool_result"
+                if isinstance(tool_call_id, str) and tool_call_id.strip():
+                    data["tool_call_id"] = tool_call_id.strip()
+                result_tool_name = getattr(block, "tool_name", None) or getattr(block, "name", None)
+                if isinstance(result_tool_name, str) and result_tool_name.strip():
+                    tool_name = result_tool_name.strip()
+                raw_is_error = getattr(block, "is_error", None)
+                if isinstance(raw_is_error, bool):
+                    data["is_error"] = raw_is_error
+                if isinstance(raw_is_error, bool):
+                    data["tool_result"] = {
+                        "content": [],
+                        "text_content": content,
+                        "is_error": raw_is_error,
+                        "meta": {
+                            **(
+                                {"tool_call_id": tool_call_id.strip()}
+                                if isinstance(tool_call_id, str) and tool_call_id.strip()
+                                else {}
+                            )
+                        },
+                    }
+                break
 
         else:
             # Unknown message type
@@ -1604,10 +2105,21 @@ __all__ = [
     "ClaudeAgentAdapter",
     "ClaudeCodeRuntime",
     "DEFAULT_TOOLS",
+    "FULL_CAPABILITIES",
+    "ParamSupport",
+    "ResolvedWorkerCwd",
+    "RuntimeCapabilities",
     "RuntimeHandle",
     "SkillDispatchHandler",
+    "SubagentOrchestration",
     "TaskResult",
+    "WORKER_CWD_UNAVAILABLE_MESSAGE",
+    "is_host_bridge_dispatch",
+    "is_leader_driven_worker",
+    "subagent_orchestration_for_backend",
     "runtime_handle_tool_catalog",
     "runtime_handle_capability_graph",
     "runtime_handle_control_plane",
+    "resolve_worker_cwd",
+    "worker_cwd_failure_message",
 ]

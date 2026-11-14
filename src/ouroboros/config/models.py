@@ -9,6 +9,7 @@ Classes:
     ProviderCredentials: API credentials for a single provider
     CredentialsConfig: All provider credentials
     LLMConfig: Shared LLM backend/model defaults
+    ModelsConfig: Automatic model selection and pinning
     EconomicsConfig: Economic model with tier definitions
     ClarificationConfig: Phase 0 configuration
     ExecutionConfig: Phase 2 configuration
@@ -21,10 +22,23 @@ Classes:
     OuroborosConfig: Top-level configuration combining all sections
 """
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Literal
+import re
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
+import yaml
+
+from ouroboros.config._model_defaults import (
+    CODEX_TIER_MODELS,
+    DEFAULT_HAIKU_MODEL,
+    DEFAULT_OPUS_MODEL,
+    DEFAULT_SONNET_MODEL,
+)
+from ouroboros.orchestrator_stage import VALID_STAGE_KEYS
+
+_SAFE_PROJECT_GUIDANCE_ID_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$")
 
 
 class ModelConfig(BaseModel, frozen=True):
@@ -115,15 +129,101 @@ class LLMConfig(BaseModel, frozen=True):
         context_compression_model: Default model for workflow context compression
     """
 
-    backend: Literal["claude", "claude_code", "litellm", "codex", "gemini", "opencode"] = (
-        "claude_code"
-    )
+    backend: Literal[
+        "claude",
+        "claude_code",
+        "litellm",
+        "codex",
+        "copilot",
+        "gemini",
+        "opencode",
+        "kiro",
+        "hermes",
+        "goose",
+        "pi",
+        "omp",
+        "ourocode",
+        "dsh",
+        "gjc",
+        "zcode",
+        "megacode",
+    ] = "claude_code"
     permission_mode: Literal["default", "acceptEdits", "bypassPermissions"] = "default"
     opencode_permission_mode: Literal["default", "acceptEdits", "bypassPermissions"] = "acceptEdits"
-    qa_model: str = "claude-sonnet-4-20250514"
-    dependency_analysis_model: str = "claude-opus-4-6"
-    ontology_analysis_model: str = "claude-opus-4-6"
-    context_compression_model: str = "gpt-4"
+    # Model fields default to "auto" (the latest model of the role's tier; see
+    # ``ouroboros.config.model_selection``). Dependency and ontology analysis
+    # are bounded structured-extraction tasks, so their tier is standard.
+    qa_model: str = "auto"
+    dependency_analysis_model: str = "auto"
+    ontology_analysis_model: str = "auto"
+    context_compression_model: str = "auto"
+
+
+class LLMProviderProfileConfig(BaseModel, frozen=True):
+    """Backend-specific overrides for an Ouroboros LLM task profile.
+
+    ``profile`` is intentionally generic here: for Codex it maps to a
+    ``codex exec --profile`` name, while other backends can ignore it and use
+    portable fields such as ``model`` or ``temperature``.
+    """
+
+    profile: str | None = None
+    model: str | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    max_tokens: int | None = Field(default=None, ge=1)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_turns: int | None = Field(default=None, ge=1)
+    # Provider-scoped mappings may use the Codex-native ``xhigh`` level.
+    # Keeping it here (rather than in a generated Codex profile file) lets
+    # Ouroboros apply it only to the selected Codex invocation.
+    reasoning_effort: Literal["low", "medium", "high", "xhigh"] | None = None
+
+
+class LLMTaskProfileConfig(BaseModel, frozen=True):
+    """Provider-neutral LLM task profile with optional backend overrides."""
+
+    model: str | None = None
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    max_tokens: int | None = Field(default=None, ge=1)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    max_turns: int | None = Field(default=None, ge=1)
+    reasoning_effort: Literal["low", "medium", "high"] | None = None
+    providers: dict[str, LLMProviderProfileConfig] = Field(default_factory=dict)
+
+    @field_validator("providers")
+    @classmethod
+    def validate_provider_reasoning_efforts(
+        cls, providers: dict[str, LLMProviderProfileConfig]
+    ) -> dict[str, LLMProviderProfileConfig]:
+        """Keep Codex-only reasoning effort levels out of non-Codex providers."""
+        for provider_name, provider_config in providers.items():
+            if provider_config.reasoning_effort != "xhigh":
+                continue
+            if provider_name.strip().lower() not in {"codex", "codex_cli"}:
+                msg = (
+                    "reasoning_effort='xhigh' is only supported for Codex provider "
+                    f"profiles, not {provider_name!r}"
+                )
+                raise ValueError(msg)
+        return providers
+
+
+class ModelsConfig(BaseModel, frozen=True):
+    """How every role's model is chosen.
+
+    Attributes:
+        default: ``auto`` (the latest model of each role's tier for the active
+            backend), a tier name (``frugal``/``standard``/``frontier``) applied
+            to every role, or a model id applied to every role.
+        pin: Run the concrete model ids persisted in role fields and
+            ``OUROBOROS_*_MODEL`` variables on every backend. Off by default:
+            those ids are then ignored except on backends whose ids are
+            provider-owned (``litellm``, ``copilot``). Turn on for research
+            or reproducibility.
+    """
+
+    default: str = "auto"
+    pin: bool = False
 
 
 class ClarificationConfig(BaseModel, frozen=True):
@@ -139,7 +239,7 @@ class ClarificationConfig(BaseModel, frozen=True):
     ambiguity_threshold: float = Field(default=0.2, ge=0.0, le=1.0)
     max_interview_rounds: int = Field(default=10, ge=1)
     model_tier: Literal["frugal", "standard", "frontier"] = "standard"
-    default_model: str = "claude-opus-4-6"
+    default_model: str = "auto"
 
 
 class ExecutionConfig(BaseModel, frozen=True):
@@ -148,16 +248,122 @@ class ExecutionConfig(BaseModel, frozen=True):
     Attributes:
         max_iterations_per_ac: Maximum iterations per acceptance criteria
         retrospective_interval: Iterations between retrospectives
-        atomicity_model: Default model for atomicity analysis
-        decomposition_model: Default model for AC decomposition
-        double_diamond_model: Default model for Double Diamond phases
+        tui_autolaunch: Whether `ooo run` should open the TUI without prompting
+        auto_evaluate: When true, an evaluable terminal `execute_seed` run
+            automatically enqueues formal evaluation as a background job.
+        auto_evolve: When true, a rejected formal evaluation automatically
+            continues through a bounded Ralph evolution loop.
+        auto_evolve_max_generations: Maximum Ralph generations for that chain.
+        default_model: Optional model pin for every Execute-stage runtime call.
+            ``None`` (the default) keeps the runtime's own selected model.
+        run_verify_commands: Whether the orchestrator checks an AC's success
+            contract itself before accepting the AC: all ``expected_artifacts``
+            must exist under the run workspace and ``verify_command`` must exit
+            0 (plus any ``output_assertion``). On by default.
+        verify_command_timeout_seconds: Timeout for an AC verify command.
+        exec_sandbox: Whether commands the controller runs on its own
+            authority (legacy-verifier replay) are confined by the execution
+            sandbox (``runtime/exec_sandbox.py``). On by default. ``false`` is
+            unsafe: those commands then run unconfined, able to write outside
+            their workspace copy and to use the network.
+        ac_retry_attempts: How many times a failed AC is re-dispatched before
+            it is marked FAILED (per-AC, excludes stall retries).
+        cross_harness_redispatch: Whether a terminally failing AC may be
+            re-dispatched once onto a different (installed, capable) runtime
+            backend before being marked FAILED (PR-X cross-harness recovery).
+        n_version_tournament: Whether an AC that has already exhausted its
+            alt-harness redispatch may fan out to multiple runtimes in parallel,
+            first-passing-verification wins (PR-X N-version tournament, opt-in).
+        decomposition_mode: Controls where AC decomposition is allowed:
+            ``bounce_only`` only decomposes after an evidence-backed too-big
+            bounce, and ``off`` disables decomposition. Legacy ``preflight``
+            configuration is migrated to ``bounce_only`` at load time.
+        context_pack: Whether to append a deterministic repo context pack
+            (stack, verify commands, layout) to run worker system prompts.
+        project_guidance: Allowlist of project guidance ids to resolve from
+            fixed project-local paths under ``.ouroboros/guidance/<id>/GUIDANCE.md``.
+        transcript_verifier: How the per-criterion evidence verifier of the
+            fat-harness path (typed evidence plus the transcript verifier,
+            ``orchestrator/evidence/verification.py``) acts. ``record`` (the
+            default) runs it and records what it would have decided on the
+            criterion's typed-evidence event, but a rejection fails no
+            criterion and triggers no retry. ``decide`` lets a rejection fail
+            the attempt and drive retries. A failing ``verify_command`` of the
+            Seed (``run_verify_commands``) decides in both modes. Sealed in a
+            run's execution semantics, so a resume uses the run's own mode.
+        default_policy: Persistent default execution policy for FRESH runs
+            (#1733). ``quality_first`` (the default) resolves to
+            quality_first/off without asking, so a request routed to
+            Ouroboros starts at once; ``efficient`` resolves to
+            adaptive/observe; ``ask`` opts back into the host's interactive
+            prompt. Explicit invocation arguments always win, resumed
+            sessions keep their persisted immutable contract, and strict
+            frugality assurance never derives from this setting.
     """
 
     max_iterations_per_ac: int = Field(default=10, ge=1)
     retrospective_interval: int = Field(default=3, ge=1)
-    atomicity_model: str = "claude-opus-4-6"
-    decomposition_model: str = "claude-opus-4-6"
-    double_diamond_model: str = "claude-opus-4-6"
+    tui_autolaunch: bool = False
+    auto_evaluate: bool = True
+    auto_evolve: bool = True
+    auto_evolve_max_generations: int = Field(default=3, ge=1, le=10)
+    default_model: str | None = None
+    run_verify_commands: bool = True
+    verify_command_timeout_seconds: int = Field(default=600, ge=1)
+    exec_sandbox: bool = True
+    ac_retry_attempts: int = Field(default=2, ge=0)
+    cross_harness_redispatch: bool = False
+    n_version_tournament: bool = False
+    decomposition_mode: Literal["bounce_only", "off"] = "bounce_only"
+    context_pack: bool = True
+    project_guidance: tuple[str, ...] = ()
+    default_policy: Literal["ask", "efficient", "quality_first"] = "quality_first"
+    transcript_verifier: Literal["decide", "record"] = "record"
+
+    @field_validator("decomposition_mode", mode="before")
+    @classmethod
+    def _migrate_legacy_decomposition_mode(cls, value: object) -> object:
+        """Retire pre-execution splitting without breaking stored config files."""
+        return "bounce_only" if value == "preflight" else value
+
+    @field_validator("auto_evolve_max_generations", mode="before")
+    @classmethod
+    def _clamp_auto_evolve_max_generations(cls, value: object) -> object:
+        """Keep the automatic loop inside Ralph's public 1..10 envelope."""
+
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = int(value)
+            except ValueError:
+                return value
+        else:
+            return value
+        return max(1, min(10, parsed))
+
+    @field_validator("project_guidance")
+    @classmethod
+    def _validate_project_guidance(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Reject path-like or duplicate project guidance ids at config load."""
+        seen: set[str] = set()
+        validated: list[str] = []
+        for raw_id in value:
+            guidance_id = raw_id.strip()
+            if not _SAFE_PROJECT_GUIDANCE_ID_RE.fullmatch(guidance_id):
+                raise ValueError(
+                    "execution.project_guidance entries must be safe ids containing only "
+                    "letters, numbers, '.', '_', or '-' and must not be path segments"
+                )
+            if guidance_id in {".", ".."}:
+                raise ValueError("execution.project_guidance entries must not be '.' or '..'")
+            if guidance_id in seen:
+                raise ValueError(f"duplicate execution.project_guidance id: {guidance_id!r}")
+            seen.add(guidance_id)
+            validated.append(guidance_id)
+        return tuple(validated)
 
 
 class ResilienceConfig(BaseModel, frozen=True):
@@ -176,8 +382,8 @@ class ResilienceConfig(BaseModel, frozen=True):
     lateral_thinking_enabled: bool = True
     lateral_model_tier: Literal["frugal", "standard", "frontier"] = "frontier"
     lateral_temperature: float = Field(default=0.8, ge=0.0, le=2.0)
-    wonder_model: str = "claude-opus-4-6"
-    reflect_model: str = "claude-opus-4-6"
+    wonder_model: str = "auto"
+    reflect_model: str = "auto"
 
 
 class EvaluationConfig(BaseModel, frozen=True):
@@ -198,8 +404,8 @@ class EvaluationConfig(BaseModel, frozen=True):
     stage3_enabled: bool = True
     satisfaction_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
     uncertainty_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
-    semantic_model: str = "claude-opus-4-6"
-    assertion_extraction_model: str = "claude-sonnet-4-6"
+    semantic_model: str = "auto"
+    assertion_extraction_model: str = "auto"
 
 
 class ConsensusConfig(BaseModel, frozen=True):
@@ -218,14 +424,10 @@ class ConsensusConfig(BaseModel, frozen=True):
     min_models: int = Field(default=3, ge=2)
     threshold: float = Field(default=0.67, ge=0.0, le=1.0)
     diversity_required: bool = True
-    models: tuple[str, ...] = (
-        "openrouter/openai/gpt-4o",
-        "openrouter/anthropic/claude-opus-4-6",
-        "openrouter/google/gemini-2.5-pro",
-    )
-    advocate_model: str = "openrouter/anthropic/claude-opus-4-6"
-    devil_model: str = "openrouter/openai/gpt-4o"
-    judge_model: str = "openrouter/google/gemini-2.5-pro"
+    models: tuple[str, ...] = ("auto",)
+    advocate_model: str = "auto"
+    devil_model: str = "auto"
+    judge_model: str = "auto"
 
 
 class PersistenceConfig(BaseModel, frozen=True):
@@ -303,11 +505,134 @@ class LoggingConfig(BaseModel, frozen=True):
     include_reasoning: bool = True
 
 
+VALID_RUNTIME_BACKENDS = frozenset(
+    {
+        "claude",
+        "claude_code",
+        "claude_mcp",
+        "codex",
+        "codex_cli",
+        "opencode",
+        "opencode_cli",
+        "hermes",
+        "hermes_cli",
+        "gemini",
+        "gemini_cli",
+        "kiro",
+        "kiro_cli",
+        "copilot",
+        "copilot_cli",
+        "goose",
+        "goose_cli",
+        "pi",
+        "pi_cli",
+        "omp",
+        "omp_cli",
+        "gjc",
+        "gjc_cli",
+        "antigravity",
+        "agy",
+        "grok",
+        "grok_cli",
+        "grok_build",
+        "zcode",
+        "zcode_cli",
+        "megacode",
+        "megacode_cli",
+        "host",
+        "host_dispatch",
+    }
+)
+
+
+class RuntimeProfileConfig(BaseModel, frozen=True):
+    """Runtime profile configuration (issue #519 / M4 / S3).
+
+    The Agent OS architecture diagram agreed in #476 lets each pipeline
+    stage (``interview`` / ``execute`` / ``evaluate`` / ``reflect``) be
+    served by a different harness. This block exposes that decision as
+    a configuration surface; the resolution helper in
+    ``ouroboros.orchestrator.stage`` reads it.
+
+    This object also reserves ``backend_profile`` for backend-native
+    profile selection (for example PR #505's Codex ``worker`` profile),
+    so the public ``orchestrator.runtime_profile`` key has one stable
+    object shape instead of conflicting string-vs-table meanings.
+
+    Attributes:
+        backend_profile: Optional backend-native profile name. Stage
+            routing does not interpret it; backend adapters may map it
+            to their own profile mechanism.
+        default: Optional runtime backend that serves any stage missing
+            from ``stages``. ``None`` means "fall through to the
+            orchestrator's top-level ``runtime_backend``".
+        stages: Explicit per-stage mapping. Keys must be members of the
+            closed stage vocabulary; unknown keys raise ``ValueError``
+            during Pydantic validation at startup.
+    """
+
+    backend_profile: str | None = None
+    default: str | None = None
+    stages: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("backend_profile")
+    @classmethod
+    def _validate_backend_profile(cls, value: str | None) -> str | None:
+        """Normalize optional backend-native profile names."""
+        if value is None:
+            return None
+        candidate = value.strip()
+        if not candidate:
+            raise ValueError("runtime_profile.backend_profile must not be empty")
+        return candidate
+
+    @field_validator("default")
+    @classmethod
+    def _validate_default_backend(cls, value: str | None) -> str | None:
+        """Reject invalid runtime_profile.default backend names at startup."""
+        if value is None:
+            return None
+        return _validate_runtime_backend(value, field_name="runtime_profile.default")
+
+    @field_validator("stages")
+    @classmethod
+    def _validate_stage_keys(cls, value: dict[str, str]) -> dict[str, str]:
+        """Reject unknown stage names and invalid backend names at startup."""
+        validated: dict[str, str] = {}
+        for key, backend in value.items():
+            if key not in VALID_STAGE_KEYS:
+                valid_list = ", ".join(sorted(VALID_STAGE_KEYS))
+                raise ValueError(
+                    f"Unknown runtime_profile.stages key: {key!r}. Valid keys are: {valid_list}.",
+                )
+            validated[key] = _validate_runtime_backend(
+                backend,
+                field_name=f"runtime_profile.stages[{key!r}]",
+            )
+        return validated
+
+
+def _validate_runtime_backend(value: str, *, field_name: str) -> str:
+    """Validate runtime_profile backend names against orchestrator backends."""
+    candidate = value.strip().lower()
+    if candidate not in VALID_RUNTIME_BACKENDS:
+        valid_list = ", ".join(sorted(VALID_RUNTIME_BACKENDS))
+        raise ValueError(f"{field_name} must be one of: {valid_list}")
+    return candidate
+
+
 class OrchestratorConfig(BaseModel, frozen=True):
     """Orchestrator runtime configuration.
 
     Attributes:
         runtime_backend: Agent runtime backend to use for orchestrator execution.
+        runtime_profile: Optional Agent OS runtime profile object.
+            ``runtime_profile.backend_profile`` selects backend-native profiles
+            such as Codex ``--profile ouroboros-worker``. Default ``None``
+            preserves the backend's normal user-config behavior. The ``default``
+            and ``stages`` fields reserve the same object contract used by the
+            stage-routing stack so this public key does not split into
+            incompatible string-vs-table meanings.
         permission_mode: Default permission mode for local agent runtimes.
         opencode_permission_mode: Default permission mode for OpenCode agent runtimes.
         cli_path: Path to Claude CLI binary. Supports:
@@ -330,41 +655,154 @@ class OrchestratorConfig(BaseModel, frozen=True):
             - Absolute path: /path/to/gemini
             - ~ expansion: ~/.local/bin/gemini
             - None: Resolve from PATH at runtime (or OUROBOROS_GEMINI_CLI_PATH)
+        antigravity_cli_path: Path to the Antigravity CLI binary (``agy``).
+            Supports:
+            - Absolute path: /path/to/agy
+            - ~ expansion: ~/.local/bin/agy
+            - None: Resolve from PATH at runtime (or OUROBOROS_ANTIGRAVITY_CLI_PATH)
+        grok_cli_path: Path to the Grok Build CLI binary (``grok``). Supports:
+            - Absolute path: /path/to/grok
+            - ~ expansion: ~/.local/bin/grok
+            - None: Resolve from PATH at runtime (or OUROBOROS_GROK_CLI_PATH)
+        zcode_cli_path: Path to the Zcode CLI entry script (``zcode.cjs``).
+            Official app-bundle scripts launch through ZCode's bundled
+            Electron/Node runtime; standalone scripts use the system Node.
+            Directly executable wrappers are also accepted. Supports:
+            - Absolute path: /Applications/ZCode.app/Contents/Resources/glm/zcode.cjs
+            - ~ expansion supported
+            - None: Resolve from config/env or fall back to the macOS app-bundle
+              default (or OUROBOROS_ZCODE_CLI_PATH)
+        megacode_cli_path: Path to the megacode harness CLI binary (``harness``).
+            Supports absolute paths and ~ expansion; None resolves from PATH at
+            runtime (or OUROBOROS_MEGACODE_CLI_PATH)
         default_max_turns: Default max turns for agent execution
         max_parallel_workers: Default maximum concurrent AC workers
+        usage_limit_pause_hours: Default pause window for provider usage/quota limits
         use_worktrees: Whether mutating workflows run in dedicated git worktrees
         worktree_root: Root directory for managed task worktrees
-        worktree_cleanup: Cleanup policy for managed task worktrees
-        worktree_lock_stale_after_minutes: Staleness threshold for task lock recovery
+        worktree_cleanup: Cleanup policy for managed task worktrees applied when
+            an auto session completes:
+            - ``keep``: never remove anything (legacy behavior)
+            - ``prune-merged`` (default): remove the worktree + ``ooo/*`` branch
+              only when the branch is fully merged and the worktree checkout is
+              clean
+            - ``remove``: remove clean worktrees; delete the branch only when
+              Git accepts a safe merged-branch deletion
+        worktree_lock_stale_after_minutes: Legacy compatibility setting. Remote
+            task locks are retained regardless of heartbeat age because age alone
+            cannot prove the remote owner has exited.
+        pm_snapshot_worktrees: Whether PM brownfield exploration reads from
+            persistent detached worktrees pinned to the remote default branch
+            (``origin/HEAD``) instead of the developer's live checkout. The
+            worktree is created once per repo and refreshed (fetch + hard
+            reset) on each PM interview start
+        pm_snapshot_root: Root directory for PM snapshot worktrees
     """
 
-    runtime_backend: Literal["claude", "codex", "opencode", "hermes", "gemini"] = "claude"
+    runtime_backend: Literal[
+        "claude",
+        "claude_mcp",
+        "codex",
+        "opencode",
+        "hermes",
+        "gemini",
+        "kiro",
+        "copilot",
+        "goose",
+        "pi",
+        "omp",
+        "gjc",
+        "antigravity",
+        "grok",
+        "zcode",
+        "megacode",
+        "host",
+    ] = "claude"
+    runtime_profile: RuntimeProfileConfig | None = None
+
+    @field_validator("runtime_profile", mode="before")
+    @classmethod
+    def _coerce_runtime_profile(cls, value: Any) -> Any:
+        """Accept the legacy PR #505 string shorthand as backend_profile."""
+        if isinstance(value, str):
+            return {"backend_profile": value}
+        return value
+
     permission_mode: Literal["default", "acceptEdits", "bypassPermissions"] = "acceptEdits"
     opencode_permission_mode: Literal["default", "acceptEdits", "bypassPermissions"] = (
         "bypassPermissions"
     )
+    # Effort-first investment dial (RFC #1405): base reasoning-effort level for
+    # AC execution. Optional investment metadata may impose a floor or authorize
+    # one lower notch; decomposition alone never lowers effort. The level is
+    # ENFORCED on runtimes with a native per-call knob (Claude Agent SDK, Codex)
+    # and advised elsewhere. ``None`` leaves effort routing dormant.
+    # Restricted to the vocabulary every native runtime accepts: Codex-only
+    # ``minimal`` and Claude-only ``max`` are excluded so a single global value is
+    # never forwarded as an invalid level to whichever runtime executes the AC.
+    reasoning_effort: Literal["low", "medium", "high", "xhigh"] | None = None
     # OpenCode integration mode. Written by `ouroboros setup --opencode-mode`.
     # None = unset (legacy installs); gate treats None as NOT plugin (safe
     # default — require explicit opt-in via setup --opencode-mode=plugin).
     opencode_mode: Literal["plugin", "subprocess"] | None = None
     cli_path: str | None = None
     codex_cli_path: str | None = None
+    copilot_cli_path: str | None = None
+    copilot_transport: Literal["cli", "acp"] = "cli"
+    copilot_acp_fallback: bool = True
     opencode_cli_path: str | None = None
+    opencode_stdout_idle_timeout_seconds: float | None = Field(default=None, gt=0.0)
     hermes_cli_path: str | None = None
     gemini_cli_path: str | None = None
+    kiro_cli_path: str | None = None
+    goose_cli_path: str | None = None
+    pi_cli_path: str | None = None
+    omp_cli_path: str | None = None
+    gjc_cli_path: str | None = None
+    antigravity_cli_path: str | None = None
+    grok_cli_path: str | None = None
+    ourocode_cli_path: str | None = None
+    zcode_cli_path: str | None = None
+    megacode_cli_path: str | None = None
+    dsh_cli_path: str | None = None
+    # dsh Cordis composition file passed to `dsh-acp-demo --config`. Not an
+    # executable itself, but it names the plugins the Node process loads, so it
+    # is treated with the same untrusted-source caution as a CLI path.
+    dsh_config_path: str | None = None
+    # POSIX shell used to run an AC's verify_command. Not an agent CLI, but it
+    # is an executable path fed straight into a subprocess, so it carries the
+    # same untrusted-source caution.
+    verify_bash_path: str | None = None
     default_max_turns: int = Field(default=10, ge=1)
     max_parallel_workers: int = Field(default=3, ge=1)
+    usage_limit_pause_hours: float = Field(default=5.0, gt=0.0)
     use_worktrees: bool = True
     worktree_root: str = "~/.ouroboros/worktrees"
-    worktree_cleanup: Literal["keep"] = "keep"
+    worktree_cleanup: Literal["keep", "remove", "prune-merged"] = "prune-merged"
     worktree_lock_stale_after_minutes: int = Field(default=60, ge=1)
+    pm_snapshot_worktrees: bool = True
+    pm_snapshot_root: str = "~/.ouroboros/pm-snapshots"
 
     @field_validator(
         "cli_path",
         "codex_cli_path",
+        "copilot_cli_path",
         "opencode_cli_path",
         "hermes_cli_path",
         "gemini_cli_path",
+        "kiro_cli_path",
+        "goose_cli_path",
+        "pi_cli_path",
+        "omp_cli_path",
+        "gjc_cli_path",
+        "antigravity_cli_path",
+        "grok_cli_path",
+        "ourocode_cli_path",
+        "zcode_cli_path",
+        "megacode_cli_path",
+        "dsh_cli_path",
+        "dsh_config_path",
+        "verify_bash_path",
     )
     @classmethod
     def expand_cli_path(cls, v: str | None) -> str | None:
@@ -380,6 +818,96 @@ class OrchestratorConfig(BaseModel, frozen=True):
         return str(Path(v).expanduser())
 
 
+class TelemetryConfig(BaseModel, frozen=True):
+    """Anonymous usage telemetry configuration.
+
+    Attributes:
+        enabled: Whether anonymous usage events may be sent. Environment
+            overrides (DO_NOT_TRACK, OUROBOROS_TELEMETRY) always win over
+            this flag — see config.loader.get_telemetry_enabled().
+    """
+
+    enabled: bool = True
+
+
+class SeedConfig(BaseModel, frozen=True):
+    """Seed-authoring gates applied before a Seed is executed.
+
+    Attributes:
+        verify_command_gate: How to treat an acceptance criterion that declares
+            neither a ``verify_command`` nor a ``verify_exemption_reason``.
+            ``warn`` surfaces it and continues; ``block`` refuses the run.
+            Such an AC can only be judged from the leaf's own transcript, which
+            is both the gameable path and the one that breaks when transcript
+            collection fails — so the default moves toward ``block`` over time.
+            There is no permanent opt-out; the exemption reason is the escape
+            hatch, and it is per-AC and explicit.
+    """
+
+    verify_command_gate: Literal["warn", "block"] = "warn"
+
+
+class BoundaryConfig(BaseModel, frozen=True):
+    """Pre-dispatch check package for ``ooo run`` (record only by default).
+
+    Attributes:
+        check_package: ``record`` makes a new ``ooo run`` construct a check
+            package from the Seed's acceptance criteria before the worker
+            starts, admit it on the base checkout, verify the finished
+            workspace against it, and record what it would have decided; it
+            does not change any criterion or the run's outcome, and it sends
+            the worker no repair turn. ``decide`` (or its older spelling
+            ``on``) lets the package decide the criteria it covers and drive
+            repairs. ``off`` leaves the run path unchanged. Unset (default)
+            means ``record`` (``ouroboros.boundary.switch``).
+        constructor_timeout_seconds: Wall-clock budget of one read-only
+            constructor model call.
+        check_timeout_seconds: Per-check command timeout during admission and
+            candidate verification.
+        max_construction_attempts: Package versions tried before the worker
+            starts. A version that is not admitted is superseded by the next
+            one; 1 means no regeneration.
+        base_regression: How the base regression check acts
+            (``ouroboros.boundary.base_regression``): ``decide`` runs the base
+            tree's own tests that pair with or import the changed modules on
+            the base and on the finished workspace and, with an admitted
+            package, fails the criteria the package left unverified or
+            uncovered (without one it only sends the worker one repair turn
+            and records the regression); ``record`` runs it and records what
+            it would have decided; ``off`` does not run it. ``decide`` takes
+            effect only while the check package itself decides
+            (``check_package: decide``); under a recording check package it
+            records too. Unset means ``BASE_REGRESSION_DEFAULT`` there
+            (``record``); a YAML boolean means ``decide`` or ``off``.
+        worker_test_gate: How the worker-test gate (the test files the worker
+            added, run by the controller) acts, with the same three modes.
+            Unset means ``WORKER_TEST_GATE_DEFAULT`` (``record``).
+    """
+
+    check_package: Literal["off", "on", "decide", "record"] | None = None
+    constructor_timeout_seconds: int = Field(default=600, ge=30, le=3600)
+    check_timeout_seconds: int = Field(default=120, ge=5, le=1800)
+    max_construction_attempts: int = Field(default=2, ge=1, le=5)
+    base_regression: Literal["decide", "record", "off"] | None = None
+    worker_test_gate: Literal["decide", "record", "off"] | None = None
+
+    @field_validator("check_package", mode="before")
+    @classmethod
+    def _yaml_booleans(cls, value: Any) -> Any:
+        # YAML 1.1 reads a bare ``on`` / ``off`` as a boolean.
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        return value
+
+    @field_validator("base_regression", "worker_test_gate", mode="before")
+    @classmethod
+    def _yaml_booleans_as_modes(cls, value: Any) -> Any:
+        # A bare ``on`` / ``off`` (a YAML boolean) is ``decide`` / ``off``.
+        if isinstance(value, bool):
+            return "decide" if value else "off"
+        return value
+
+
 class OuroborosConfig(BaseModel, frozen=True):
     """Top-level Ouroboros configuration.
 
@@ -389,29 +917,40 @@ class OuroborosConfig(BaseModel, frozen=True):
     Attributes:
         economics: Economic model and tier configuration
         llm: Shared LLM backend and model configuration
+        models: Automatic model selection and the explicit pin switch
         clarification: Phase 0 (Big Bang) configuration
         execution: Phase 2 configuration
         resilience: Phase 3 configuration
         evaluation: Phase 4 configuration
         consensus: Phase 5 configuration
+        llm_profiles: Named provider-neutral profiles for LLM-only tasks
+        llm_role_profiles: Mapping from logical task roles to profile names
         persistence: Storage configuration
         drift: Drift monitoring configuration
         runtime_controls: Long-running workflow timeout/progress controls
         logging: Logging configuration
+        seed: Seed-authoring gates applied before execution
+        boundary: Pre-dispatch check package for ``ooo run`` (on by default)
     """
 
     economics: EconomicsConfig = Field(default_factory=EconomicsConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    models: ModelsConfig = Field(default_factory=ModelsConfig)
     clarification: ClarificationConfig = Field(default_factory=ClarificationConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
     consensus: ConsensusConfig = Field(default_factory=ConsensusConfig)
+    llm_profiles: dict[str, LLMTaskProfileConfig] = Field(default_factory=dict)
+    llm_role_profiles: dict[str, str] = Field(default_factory=dict)
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
     drift: DriftConfig = Field(default_factory=DriftConfig)
     runtime_controls: RuntimeControlsConfig = Field(default_factory=RuntimeControlsConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
+    telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
+    seed: SeedConfig = Field(default_factory=SeedConfig)
+    boundary: BoundaryConfig = Field(default_factory=BoundaryConfig)
 
 
 def get_default_config() -> OuroborosConfig:
@@ -423,14 +962,18 @@ def get_default_config() -> OuroborosConfig:
     return OuroborosConfig(
         economics=EconomicsConfig(
             default_tier="frugal",
+            # openai entries are the currently documented Codex CLI model ids per
+            # tier (frugal/standard/frontier). Codex users on a custom
+            # model_providers config or a proxy should override economics.tiers or
+            # pin OUROBOROS_EXECUTION_MODEL, since those ids are not routable there.
             tiers={
                 "frugal": TierConfig(
                     cost_factor=1,
                     intelligence_range=(9, 11),
                     models=[
-                        ModelConfig(provider="openai", model="gpt-4o-mini"),
+                        ModelConfig(provider="openai", model=CODEX_TIER_MODELS["frugal"]),
                         ModelConfig(provider="google", model="gemini-2.0-flash"),
-                        ModelConfig(provider="anthropic", model="claude-3-5-haiku"),
+                        ModelConfig(provider="anthropic", model=DEFAULT_HAIKU_MODEL),
                     ],
                     use_cases=["routine_coding", "log_analysis", "stage1_fix"],
                 ),
@@ -438,8 +981,8 @@ def get_default_config() -> OuroborosConfig:
                     cost_factor=10,
                     intelligence_range=(14, 16),
                     models=[
-                        ModelConfig(provider="openai", model="gpt-4o"),
-                        ModelConfig(provider="anthropic", model="claude-sonnet-4-6"),
+                        ModelConfig(provider="openai", model=CODEX_TIER_MODELS["standard"]),
+                        ModelConfig(provider="anthropic", model=DEFAULT_SONNET_MODEL),
                         ModelConfig(provider="google", model="gemini-2.5-pro"),
                     ],
                     use_cases=["logic_design", "stage2_evaluation", "refactoring"],
@@ -448,8 +991,8 @@ def get_default_config() -> OuroborosConfig:
                     cost_factor=30,
                     intelligence_range=(18, 20),
                     models=[
-                        ModelConfig(provider="openai", model="o3"),
-                        ModelConfig(provider="anthropic", model="claude-opus-4-6"),
+                        ModelConfig(provider="openai", model=CODEX_TIER_MODELS["frontier"]),
+                        ModelConfig(provider="anthropic", model=DEFAULT_OPUS_MODEL),
                     ],
                     use_cases=["consensus", "lateral_thinking", "big_bang"],
                 ),
@@ -458,6 +1001,21 @@ def get_default_config() -> OuroborosConfig:
             downgrade_success_streak=5,
         ),
     )
+
+
+def fresh_config_data() -> dict[str, Any]:
+    """The contents of a new config.yaml.
+
+    Models are chosen by ``models.default`` (``auto``) alone: the per-role model
+    fields are left out, so a fresh file holds no model id that goes stale.
+    """
+    # Deferred: model_selection reads this module's types.
+    from ouroboros.config.model_selection import ROLE_MODEL_CONFIG_PATHS
+
+    data = get_default_config().model_dump(mode="json")
+    for section, field in ROLE_MODEL_CONFIG_PATHS:
+        data[section].pop(field, None)
+    return data
 
 
 def get_default_credentials() -> CredentialsConfig:
@@ -490,3 +1048,59 @@ def get_config_dir() -> Path:
         Path to ~/.ouroboros/
     """
     return Path.home() / ".ouroboros"
+
+
+def _existing_event_store_target(path: Path) -> bool:
+    """Return whether *path* exists, rejecting entries SQLite cannot open as a file."""
+    try:
+        exists = path.exists() or path.is_symlink()
+        is_file = path.is_file() if exists else False
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("invalid EventStore configuration") from None
+    if exists and not is_file:
+        raise ValueError("invalid EventStore configuration")
+    return exists
+
+
+def event_store_path_from_config(data: Mapping[str, Any], config_path: Path) -> Path:
+    """Resolve the EventStore path while preserving an existing legacy database."""
+    persistence = data.get("persistence")
+    if persistence is not None and not isinstance(persistence, Mapping):
+        raise ValueError("config section 'persistence' must be a mapping")
+
+    legacy_path = config_path.parent / "ouroboros.db"
+    if not persistence or "database_path" not in persistence:
+        _existing_event_store_target(legacy_path)
+        return legacy_path
+    configured = persistence["database_path"]
+    if not isinstance(configured, str) or not configured.strip():
+        raise ValueError("config field 'persistence.database_path' must be a non-empty string")
+
+    try:
+        configured_path = Path(configured).expanduser()
+        if not configured_path.is_absolute():
+            configured_path = config_path.parent / configured_path
+        configured_exists = _existing_event_store_target(configured_path)
+        legacy_exists = legacy_path.is_file()
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("invalid EventStore configuration") from None
+    if configured_exists or not legacy_exists:
+        return configured_path
+    return legacy_path
+
+
+def resolve_event_store_path(config_path: Path | None = None) -> Path:
+    """Resolve the authoritative EventStore path for runtime and CLI readers."""
+    if config_path is None:
+        config_path = get_config_dir() / "config.yaml"
+
+    if not config_path.exists():
+        return config_path.parent / "ouroboros.db"
+
+    try:
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        raise ValueError("invalid EventStore configuration") from None
+    if not isinstance(loaded, Mapping):
+        raise ValueError("invalid EventStore configuration")
+    return event_store_path_from_config(loaded, config_path)

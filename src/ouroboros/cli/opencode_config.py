@@ -8,12 +8,54 @@ centralising the logic here avoids duplication and keeps the ``PermissionError``
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
 import yaml
+
+
+def plugin_version_error(
+    cli_path: str, on_unknown: Callable[[str], None] | None = None
+) -> str | None:
+    def warn_unknown() -> None:
+        if on_unknown is not None:
+            on_unknown(
+                "Could not determine the OpenCode version. Plugin compatibility is unverified: "
+                "OpenCode 2.x and later are not supported. Check 'opencode --version', or use "
+                "'ouroboros setup --runtime opencode --opencode-mode subprocess'."
+            )
+
+    try:
+        result = subprocess.run(
+            [cli_path, "--version"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        warn_unknown()
+        return None
+    if result.returncode != 0:
+        warn_unknown()
+        return None
+    version = re.fullmatch(
+        r"(?:opencode\s+)?v?(\d+)\.\d+\.\d+(?:[-+][\w.-]+)?", result.stdout.strip()
+    )
+    if version is None:
+        warn_unknown()
+        return None
+    if int(version.group(1)) < 2:
+        return None
+    return (
+        "OpenCode 2.x and later plugin mode is not supported by this bridge. "
+        "Use 'ouroboros setup --runtime opencode --opencode-mode subprocess'. "
+        "The V2 plugin API requires a separate bridge migration (issue #2529)."
+    )
 
 
 def _expand_config_dir(raw: str) -> Path:
@@ -177,3 +219,33 @@ def is_bridge_plugin_entry(entry: object) -> bool:
         and parts[-2] == BRIDGE_PLUGIN_SUBDIR[1]
         and parts[-3] == BRIDGE_PLUGIN_SUBDIR[0]
     )
+
+
+def is_v2_bridge_plugin_entry(entry: object, config_dir: Path, config_parent: Path) -> bool:
+    """Match V2 directory references only when they resolve to our installed bridge."""
+    from urllib.parse import urlsplit
+    from urllib.request import url2pathname
+
+    if isinstance(entry, dict):
+        entry = entry.get("package")
+    if not isinstance(entry, str) or not entry:
+        return False
+    try:
+        if entry.lower().startswith("file:"):
+            uri = urlsplit(entry)
+            if uri.query or uri.fragment:
+                return False
+            if uri.netloc not in ("", "localhost"):
+                if os.name != "nt":
+                    return False
+                actual = url2pathname(f"//{uri.netloc}{uri.path}")
+            else:
+                actual = url2pathname(uri.path)
+        else:
+            actual = entry
+        path = Path(actual)
+        if not path.is_absolute():
+            path = config_parent / path
+        return path.resolve() == config_dir.joinpath(*BRIDGE_PLUGIN_SUBDIR).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False

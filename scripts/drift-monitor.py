@@ -8,11 +8,24 @@ Hook: PostToolUse (Write|Edit)
 Output: Advisory message if active session detected
 
 This is a lightweight check - actual drift measurement
-requires calling /ouroboros:status with the MCP server.
+requires calling /ouroboros:ouroboros-status with the MCP server.
 """
 
 from pathlib import Path
+import sys
 import time
+
+
+def _configure_utf8_stdio() -> None:
+    """Keep hook output safe on non-UTF-8 Windows locales."""
+    for stream in (sys.stdout, sys.stderr):
+        encoding = getattr(stream, "encoding", None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if encoding and encoding.lower().replace("-", "") != "utf8" and reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+_configure_utf8_stdio()
 
 
 def check_active_session() -> dict:
@@ -54,7 +67,7 @@ def main() -> None:
     if session["active"]:
         print(
             f"Ouroboros session active ({session['session_file']}). "
-            f"Use /ouroboros:status to check drift."
+            f"Use /ouroboros:ouroboros-status to check drift."
         )
     else:
         print("Success")

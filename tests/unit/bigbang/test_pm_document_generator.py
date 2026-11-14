@@ -6,11 +6,12 @@ generation on failure.
 """
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from ouroboros.bigbang.pm_document import (
+    _PM_GENERATION_SYSTEM_PROMPT,
     PMDocumentGenerator,
 )
 from ouroboros.bigbang.pm_seed import PMSeed, UserStory
@@ -50,6 +51,14 @@ Build a task management tool for small teams.
 *PM ID: pm_seed_test123*
 *Interview ID: int_abc*
 """
+
+
+def test_pm_generation_prompt_preserves_uncertainty_sections() -> None:
+    """LLM PM generation keeps uncertainty in existing Assumptions/Decide Later buckets."""
+    assert "Preserve uncertainty explicitly" in _PM_GENERATION_SYSTEM_PROMPT
+    assert "Assumptions" in _PM_GENERATION_SYSTEM_PROMPT
+    assert "Decide Later" in _PM_GENERATION_SYSTEM_PROMPT
+    assert "unknown items" in _PM_GENERATION_SYSTEM_PROMPT
 
 
 def _make_seed(**overrides) -> PMSeed:
@@ -153,6 +162,8 @@ class TestPMDocumentGeneratorGenerate:
 
         # Mock InterviewState with rounds
         mock_state = MagicMock()
+        mock_state.proposed_opening = None
+        mock_state.opening_decisions = ()
         mock_round1 = MagicMock()
         mock_round1.question = "What problem?"
         mock_round1.user_response = "Task tracking."
@@ -179,6 +190,8 @@ class TestPMDocumentGeneratorGenerate:
         seed = _make_seed()
 
         mock_state = MagicMock()
+        mock_state.proposed_opening = None
+        mock_state.opening_decisions = ()
         mock_round = MagicMock()
         mock_round.question = "State question"
         mock_round.user_response = "State answer"
@@ -197,6 +210,22 @@ class TestPMDocumentGeneratorGenerate:
         user_msg = call_args[0][0][1].content
         assert "Explicit Q" in user_msg
         assert "State question" not in user_msg
+
+    @pytest.mark.asyncio
+    async def test_generate_withholds_observation_from_raw_qa_pairs(self):
+        adapter = _make_adapter()
+        generator = PMDocumentGenerator(llm_adapter=adapter)
+        observed = "competitor-secret-retry-policy"
+
+        result = await generator.generate(
+            _make_seed(),
+            qa_pairs=[("What exists today?", f"[from-research] {observed}")],
+        )
+
+        assert result.is_ok
+        user_msg = adapter.complete.call_args[0][0][1].content
+        assert observed not in user_msg
+        assert "observation withheld" in user_msg
 
     @pytest.mark.asyncio
     async def test_generate_falls_back_to_template_on_llm_error(self):
@@ -450,6 +479,8 @@ class TestPMDocumentGeneratorGenerateAndSave:
         seed = _make_seed()
 
         mock_state = MagicMock()
+        mock_state.proposed_opening = None
+        mock_state.opening_decisions = ()
         mock_round = MagicMock()
         mock_round.question = "What problem?"
         mock_round.user_response = "Tracking."
@@ -521,8 +552,26 @@ class TestPMDocumentGeneratorMessages:
         config = call_args[0][1]
 
         assert config.model == "test-model"
+        assert config.model_is_explicit is True
         assert config.temperature == 0.3
         assert config.max_tokens == 8192
+
+    @pytest.mark.asyncio
+    async def test_default_model_path_keeps_document_model_implicit(self):
+        """Implicit document model should preserve downstream profile-based overrides."""
+        adapter = _make_adapter()
+        seed = _make_seed()
+
+        with patch(
+            "ouroboros.bigbang.pm_document.get_llm_model_for_role",
+            return_value="default",
+        ):
+            generator = PMDocumentGenerator(llm_adapter=adapter)
+            await generator.generate(seed)
+
+        config = adapter.complete.call_args[0][1]
+        assert config.model == "default"
+        assert config.model_is_explicit is False
 
     @pytest.mark.asyncio
     async def test_user_message_includes_all_seed_sections(self):

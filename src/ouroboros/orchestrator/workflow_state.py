@@ -25,6 +25,7 @@ from enum import Enum
 import re
 from typing import TYPE_CHECKING, Any
 
+from ouroboros.core.seed import AcceptanceCriterionInput, AcceptanceCriterionSpec, ac_text
 from ouroboros.mcp.types import MCPToolResult
 from ouroboros.orchestrator.mcp_tools import serialize_tool_result
 from ouroboros.orchestrator.runtime_message_projection import project_runtime_message
@@ -341,6 +342,7 @@ class AcceptanceCriterion:
 
     index: int
     content: str
+    spec: AcceptanceCriterionSpec | None = None
     status: ACStatus = ACStatus.PENDING
     retry_attempt: int = 0
     started_at: datetime | None = None
@@ -612,7 +614,7 @@ class WorkflowStateTracker:
 
     def __init__(
         self,
-        acceptance_criteria: list[str],
+        acceptance_criteria: list[AcceptanceCriterionInput],
         goal: str = "",
         session_id: str = "",
         activity_map: dict[str, ActivityType] | None = None,
@@ -631,7 +633,11 @@ class WorkflowStateTracker:
             session_id=session_id,
             goal=goal,
             acceptance_criteria=[
-                AcceptanceCriterion(index=i + 1, content=ac)
+                AcceptanceCriterion(
+                    index=i + 1,
+                    content=ac_text(ac),
+                    spec=ac if isinstance(ac, AcceptanceCriterionSpec) else None,
+                )
                 for i, ac in enumerate(acceptance_criteria)
             ],
         )
@@ -656,8 +662,8 @@ class WorkflowStateTracker:
 
         Args:
             content: Message content.
-            message_type: Type of message (assistant, tool, result).
-            tool_name: Name of tool if this is a tool call.
+            message_type: Type of message (assistant, tool, tool_result, result).
+            tool_name: Name of the tool associated with a call or result.
             is_input: Whether this is input (True) or output (False).
             message_data: Optional normalized runtime metadata for the message.
         """
@@ -672,9 +678,10 @@ class WorkflowStateTracker:
 
         self._update_cost_estimate()
 
-        # Update tool tracking
+        # Count invocations while retaining activity updates from named results.
         if tool_name:
-            self._state.tool_calls_count += 1
+            if message_type == "tool":
+                self._state.tool_calls_count += 1
             self._state.last_tool = tool_name
             self._update_activity_from_tool(tool_name, content)
 

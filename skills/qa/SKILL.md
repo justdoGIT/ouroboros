@@ -5,172 +5,80 @@ description: "General-purpose QA verdict for any artifact type"
 
 # /ouroboros:qa
 
-Standalone quality assessment for any artifact — code, documents, API responses, test output, or custom content. Unlike `ooo evaluate` (3-stage formal verification pipeline), `ooo qa` is a fast single-pass verdict with actionable suggestions.
-
-## Usage
+Fast single-pass quality verdict with actionable suggestions for any artifact: code, documents, API responses, test output, or custom content. For formal three-stage verification of an execution, use `ooo evaluate`.
 
 ```
 ooo qa [file_path | artifact_text]
-ooo qa                                     # evaluate recent execution output
-/ouroboros:qa [file_path | artifact_text]   # plugin mode
+ooo qa                                     # recent execution output
+/ouroboros:qa [file_path | artifact_text]
 ```
 
-**Trigger keywords:** "ooo qa", "qa check", "quality check"
+The QA Judge scores the artifact against a quality bar on Correctness, Completeness, Quality, Intent Alignment, and Domain-Specific dimensions:
 
-## How It Works
-
-The QA Judge evaluates an artifact against a quality bar and returns a structured verdict:
-
-1. **Parse the Quality Bar** — What EXACTLY must be true to pass?
-2. **Assess Dimensions** — Correctness, Completeness, Quality, Intent Alignment, Domain-Specific
-3. **Render Verdict** — Score (0.0-1.0) with PASS / REVISE / FAIL
-4. **Determine Loop Action** — `done` (pass), `continue` (revise), `escalate` (fail)
-
-### Verdict Thresholds
-
-| Score Range  | Verdict | Loop Action |
-|--------------|---------|-------------|
-| >= 0.80      | PASS    | done        |
-| 0.40 - 0.79  | REVISE  | continue    |
-| < 0.40       | FAIL    | escalate    |
+| Score | Verdict | Loop action |
+|-------|---------|-------------|
+| >= 0.80 | PASS | done |
+| 0.40 - 0.79 | REVISE | continue |
+| < 0.40 | FAIL | escalate |
 
 ## Instructions
 
-When the user invokes this skill:
+### Loading MCP tools (deferred-schema guard)
 
-### Step 0: Determine execution mode
+Ouroboros tools may be deferred, and a schema loaded on one turn can unload by the next. Immediately before each `ouroboros_*` call, load it with the active runtime's tool-discovery capability: `"+ouroboros qa"` for `ouroboros_qa`, and discover `ouroboros_start_qa`, `ouroboros_job_wait`, and `ouroboros_job_result` before using the background path. A call whose schema is not loaded fails with "Invalid tool parameters". If the tool is already callable, discovery is a no-op and an empty result is expected. Use the fallback only when the tool is genuinely absent; this skill works without MCP setup.
 
-This skill works in two modes. Determine which one **before** attempting any tool calls:
+### QA steps
 
-- **MCP mode** — If `ToolSearch` is available, try loading the QA MCP tool:
-  ```
-  ToolSearch query: "+ouroboros qa"
-  ```
-  If found (typically named `mcp__plugin_ouroboros_ouroboros__ouroboros_qa`), proceed with **QA Steps** below.
+1. **Artifact**: a file path (read it with the active runtime's `inspect_code` capability), inline text, or else the most recent execution output; ask with `ask_user` if unclear.
+2. **Quality bar**: the Seed's acceptance criteria when a Seed is in context, else the user's stated bar; otherwise ask "What does 'good' mean for this artifact?"
+3. **Artifact type**: `code`, `test_output`, `document`, `api_response`, `screenshot`, or `custom`.
 
-- **Fallback mode** — If `ToolSearch` is not available, or it finds no matching tool, skip directly to the **Fallback** section. This skill is designed to work without MCP setup.
+3.5. **Acting verification fan-out** (behavior-bearing artifacts): a text judge can be fooled by a hopeful log line. Use the active runtime's `orchestrate_subagents` capability to launch, together, one probe child per acting modality the runtime exposes: a process probe (`run_shell`: run the command or app or smoke commands with bounded timeouts, capture exit codes and real output), a browser probe (HTTP services and web UIs: load them, exercise the primary flows, capture rendering and console/network errors), a computer-use probe (GUI/TUI: drive it like a user, screenshot observed states), and an artifact probe (`inspect_code`: declared files exist with real content, not placeholders). Each probe returns structured evidence only (commands, observed effects, screenshots/paths, pass/fail per behavior) and covers the applicable adversarial classes the QA tool lists. Skip a modality only when its tools are absent or it is meaningless for the artifact, and say which were skipped and why. Await all probes and pass the merged evidence as `reference`; prefer observed behavior over source text as the `artifact` when they disagree.
 
-### QA Steps (MCP mode)
-
-1. **Determine the artifact to evaluate:**
-   - If user provides a file path: Read the file with Read tool
-   - If user provides inline text: Use that directly
-   - If no artifact specified: Look for the most recent execution output in conversation context
-   - Ask user if unclear what to evaluate
-
-2. **Determine the quality bar:**
-   - If a seed YAML is available in context: Extract acceptance criteria from it
-   - If user specifies a quality bar: Use that
-   - If neither: Ask the user "What does 'good' mean for this artifact?"
-
-3. **Determine artifact type:**
-   - `code` — source code files
-   - `test_output` — test results, CI output
-   - `document` — specs, docs, READMEs
-   - `api_response` — API responses, JSON payloads
-   - `screenshot` — visual artifacts
-   - `custom` — anything else
-
-4. **Call the `ouroboros_qa` MCP tool:**
+4. **Call the tool**: When a durable subprocess-backed server exposes
+   `ouroboros_start_qa`, use it to avoid host tool-call timeouts. The QA verdict
+   is stored in the server's local job event store and may repeat artifact text.
+   Poll the returned `job_id` with `ouroboros_job_wait` and retrieve the verdict
+   with `ouroboros_job_result`. A nonterminal result is not a verdict: wait
+   until the job is terminal, and report failed, cancelled, or interrupted
+   states as such. A pending or ambiguous acceptance is not a
+   failure: follow its status receipt and do not start a duplicate. If the tool
+   is absent or explicitly rejects an unsupported host/plugin or non-durable
+   backend before accepting work, use `ouroboros_qa` instead:
    ```
    Tool: ouroboros_qa
    Arguments:
      artifact: <the content to evaluate>
      quality_bar: <what 'pass' means>
      artifact_type: "code"  (or other type)
-     reference: <optional reference for comparison>
+     reference: <observed-behaviour evidence from step 3.5, plus any reference>
      pass_threshold: 0.80  (adjustable)
      seed_content: <seed YAML if available>
    ```
 
-5. **Present results clearly:**
-   - Show the score and verdict prominently
-   - List dimension scores
-   - Highlight specific differences found
-   - Show actionable suggestions
-   - End with next step guidance based on verdict:
-     - **PASS (done)**: `Next: Your artifact meets the quality bar. Proceed with confidence.`
-     - **REVISE (continue)**: `Next: Address the suggestions above, then run ooo qa again to re-check.`
-     - **FAIL (escalate)**: `Next: Fundamental issues detected. Consider ooo interview to re-examine requirements, or ooo unstuck to challenge assumptions.`
+   **Plugin delegation**: a response with `status: "delegated_to_subagent"` and `dispatch_mode: "plugin"` carries no verdict. Its content is the bridge's dispatch notice and its `_subagent` prompt is the child's input, never a result. Keep `qa_session_id`, await the plugin-spawned child, and parse its JSON verdict (`score`, `verdict`, `dimensions`, `differences`, `suggestions`, `reasoning`). No `iteration_entry` comes back, so derive the loop action as the tool does (score >= `pass_threshold`: done; >= 0.40: continue; else escalate) and build the entry yourself (`iteration`, `score`, `verdict`, `loop_action`). If the child returns no parseable verdict, say so instead of presenting the envelope.
 
-### Iterative QA Loop
+5. **Present** the score and verdict prominently, then dimension scores, specific differences, and actionable suggestions. **Empirical evidence outranks the judge**: if the judge scores PASS but a probe observed the behavior failing, present REVISE/FAIL on that evidence and say so. If nothing could act, flag that behavior was not observed. Pick the next action from the verdict:
+   - **PASS (done)**: proceed; the artifact meets the quality bar
+   - **REVISE (continue)**: address the suggestions, then run `ooo qa` again
+   - **FAIL (escalate)**: `ooo interview` to re-examine requirements, or `ooo unstuck` to challenge assumptions
 
-For iterative usage, track the `qa_session_id` and `iteration_history` from the response meta:
+### Iterative QA
 
-1. First call returns `qa_session_id` and `iteration_entry` in meta
-2. On subsequent calls, pass `qa_session_id` and accumulated `iteration_history`
-3. Continue until verdict is `pass` or `fail`
+The first call returns `qa_session_id` and `iteration_entry` in meta. On later calls pass `qa_session_id` and the accumulated `iteration_history`. Continue until the verdict is `pass` or `fail`.
 
-In fallback mode, generate a `qa-<uuid4_short>` session ID on the first run and maintain iteration count in conversation context to preserve the same iterative contract.
+### Fallback (no Ouroboros MCP server)
 
-## Fallback (No MCP Server)
+Adopt the `qa-judge` role yourself with the same prompt the MCP tool uses: `$OUROBOROS_AGENTS_DIR/qa-judge.md` when that override is set; else the installed package's copy, printed with `run_shell`:
 
-If the MCP server is not available, adopt the `ouroboros:qa-judge` agent role directly:
-
-1. Read the canonical agent definition: `<project-root>/src/ouroboros/agents/qa-judge.md`
-   (This is the same prompt used by the MCP QA tool, ensuring consistent verdicts.)
-2. Follow the QA Judge framework to evaluate the artifact
-3. Output the verdict in the standard format (must match MCP output shape):
-
-```
-QA Verdict [Iteration N]
-========================
-Session: qa-<id>
-Score: X.XX / 1.00 [PASS/REVISE/FAIL]
-Verdict: pass/revise/fail
-Threshold: 0.80
-
-Dimensions:
-  Correctness:      X.XX
-  Completeness:     X.XX
-  Quality:          X.XX
-  Intent Alignment: X.XX
-  Domain-Specific:  X.XX
-
-Differences:
-  - <specific difference>
-
-Suggestions:
-  - <actionable fix>
-
-Reasoning: <1-3 sentence summary>
-
-Loop Action: done/continue/escalate
+```bash
+uvx --isolated --python '>=3.12' --from ouroboros-ai python -c "import importlib.resources as r, sys; print(r.files('ouroboros.agents').joinpath(sys.argv[1]).read_text(encoding='utf-8'))" qa-judge.md
 ```
 
-## Example
+else `src/ouroboros/agents/qa-judge.md` in a source checkout.
 
-```
-User: ooo qa src/main.py
+If none is reachable, judge on the dimensions and thresholds above and label the verdict as an unaligned fallback. Run the step 3.5 probes first for behavior-bearing artifacts, render the verdict in the same shape the MCP tool returns (score, verdict, threshold, dimensions, differences, suggestions, reasoning, loop action), and keep the iterative contract with a `qa-<uuid4_short>` session id and an iteration count held in the conversation.
 
-QA Verdict [Iteration 1]
-============================================================
-Session: qa-a1b2c3d4
-Score: 0.72 / 1.00 [REVISE]
-Verdict: revise
-Threshold: 0.80
+## RFC #1392 State Breadcrumb Footer
 
-Dimensions:
-  Correctness:           0.85
-  Completeness:          0.60
-  Quality:               0.75
-  Intent Alignment:      0.80
-  Domain-Specific:       0.60
-
-Differences:
-  - Missing error handling for network timeout in fetch_data()
-  - No input validation on user_id parameter
-  - Type hints missing on 3 public functions
-
-Suggestions:
-  - Add try/except with TimeoutError in fetch_data() (line 42)
-  - Add isinstance check for user_id at function entry
-  - Add return type annotations to get_user(), fetch_data(), process_result()
-
-Reasoning: Core logic is correct but lacks defensive programming
-patterns expected for production code.
-
-Loop Action: continue
-
-Next: Address the suggestions above, then run `ooo qa` again to re-check.
-```
+End the final response with exactly one line `◆ <current state> → next: <recommended action>`. Derive the state from live session state via `ouroboros_session_status` when available, otherwise from this skill's actual outcome. Never use a linear `Step N of M` footer; when the next step is a real choice, list 2-3 options.

@@ -45,6 +45,7 @@ import structlog
 
 from ouroboros.config import get_opencode_cli_path
 from ouroboros.core.errors import ProviderError
+from ouroboros.core.retry import BASE_TRANSIENT_PATTERNS, is_transient_error
 from ouroboros.core.security import MAX_LLM_RESPONSE_LENGTH, InputValidator
 from ouroboros.core.types import Result
 from ouroboros.providers.base import (
@@ -52,27 +53,26 @@ from ouroboros.providers.base import (
     CompletionResponse,
     Message,
     MessageRole,
-    UsageInfo,
 )
 from ouroboros.providers.codex_cli_stream import (
     collect_stream_lines,
     iter_stream_lines,
     terminate_process,
 )
+from ouroboros.providers.native_cli_usage import opencode_cli_usage
+from ouroboros.providers.profiles import resolve_completion_profile_result
+from ouroboros.runtime.child_env import DEFAULT_OUROBOROS_STRIP_KEYS, build_child_env
 
 log = structlog.get_logger()
 
 _SAFE_MODEL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_./:@-]+$")
 _MAX_OUROBOROS_DEPTH = 5
+# Child-env strip set for OpenCode.  OpenCode does NOT strip CLAUDECODE (unlike
+# codex/copilot/kiro) — preserve that divergence; only the Ouroboros markers
+# are removed.
+_CHILD_ENV_STRIP_KEYS = DEFAULT_OUROBOROS_STRIP_KEYS
 
-_RETRYABLE_ERROR_PATTERNS = (
-    "rate limit",
-    "temporarily unavailable",
-    "timeout",
-    "overloaded",
-    "try again",
-    "connection reset",
-)
+_RETRYABLE_ERROR_PATTERNS = BASE_TRANSIENT_PATTERNS
 
 
 class OpenCodeLLMAdapter:
@@ -130,11 +130,10 @@ class OpenCodeLLMAdapter:
                 ``PATH`` if not supplied.
             cwd: Working directory for the subprocess.  Defaults to
                 the current process working directory.
-            permission_mode: OpenCode permission mode string.  Stored
-                for forward compatibility but currently a **no-op**:
-                the ``opencode run`` CLI has no ``--permission-mode``
-                flag — it runs non-interactively by default.  Same
-                limitation applies to the Gemini CLI adapter.
+            permission_mode: OpenCode permission mode string.
+                ``bypassPermissions`` maps to the native
+                ``--dangerously-skip-permissions`` flag. OpenCode has no
+                multi-value ``--permission-mode`` flag.
             allowed_tools: Optional tool allow-list injected into the
                 composed prompt.
             max_turns: Maximum conversation turns per CLI invocation.
@@ -226,7 +225,7 @@ class OpenCodeLLMAdapter:
             raise ValueError(msg)
         return candidate
 
-    def _build_prompt(self, messages: list[Message]) -> str:
+    def _build_prompt(self, messages: list[Message], *, max_turns: int | None = None) -> str:
         """Build a plain-text prompt from conversation messages.
 
         System messages are grouped under a ``## System Instructions``
@@ -261,12 +260,13 @@ class OpenCodeLLMAdapter:
                 parts.append("## Tool Constraints")
                 parts.append("Do NOT use any tools. Respond with text only.")
 
-        if self._max_turns == 1:
+        effective_max_turns = max_turns if max_turns is not None else self._max_turns
+        if effective_max_turns == 1:
             parts.append("## Execution Constraints")
             parts.append("Respond in a single turn. Do not ask follow-up questions.")
-        elif self._max_turns > 1:
+        elif effective_max_turns > 1:
             parts.append("## Execution Constraints")
-            parts.append(f"Complete your response within {self._max_turns} turns maximum.")
+            parts.append(f"Complete your response within {effective_max_turns} turns maximum.")
 
         conversation_parts: list[str] = []
         for message in messages:
@@ -308,6 +308,13 @@ class OpenCodeLLMAdapter:
             "json",
         ]
 
+        if self._permission_mode.strip().lower() in {
+            "bypasspermissions",
+            "bypass_permissions",
+            "bypass",
+        }:
+            command.append("--dangerously-skip-permissions")
+
         if model:
             command.extend(["--model", model])
 
@@ -328,20 +335,13 @@ class OpenCodeLLMAdapter:
             RuntimeError: If the nesting depth exceeds
                 ``_MAX_OUROBOROS_DEPTH``.
         """
-        env = os.environ.copy()
-        # Prevent child from re-entering Ouroboros MCP
-        for key in ("OUROBOROS_AGENT_RUNTIME", "OUROBOROS_LLM_BACKEND"):
-            env.pop(key, None)
-        # Track and enforce recursion depth
-        try:
-            depth = int(env.get("_OUROBOROS_DEPTH", "0")) + 1
-        except (ValueError, TypeError):
-            depth = 1
-        if depth > _MAX_OUROBOROS_DEPTH:
-            msg = f"Maximum Ouroboros nesting depth ({_MAX_OUROBOROS_DEPTH}) exceeded"
-            raise RuntimeError(msg)
-        env["_OUROBOROS_DEPTH"] = str(depth)
-        return env
+        return build_child_env(
+            strip_keys=_CHILD_ENV_STRIP_KEYS,
+            max_depth=_MAX_OUROBOROS_DEPTH,
+            depth_error_factory=lambda _depth, max_depth: RuntimeError(
+                f"Maximum Ouroboros nesting depth ({max_depth}) exceeded"
+            ),
+        )
 
     def _is_retryable(self, error_message: str) -> bool:
         """Check if an error message suggests a retryable failure.
@@ -356,8 +356,7 @@ class OpenCodeLLMAdapter:
             ``True`` if any retryable pattern is found in the
             lower-cased message.
         """
-        lower = error_message.lower()
-        return any(pattern in lower for pattern in _RETRYABLE_ERROR_PATTERNS)
+        return is_transient_error(error_message)
 
     def _extract_text_from_events(self, events: list[dict[str, Any]]) -> str:
         """Extract assistant text content from OpenCode JSON events.
@@ -427,18 +426,29 @@ class OpenCodeLLMAdapter:
         Returns:
             Error message string, or ``None`` if no terminal error.
         """
+        saw_error_event = False
         for event in events:
             # Top-level error events are always terminal
-            if event.get("type") == "error":
-                error = event.get("error", {})
-                if isinstance(error, dict):
-                    name = error.get("name", "")
-                    data = error.get("data", {})
-                    msg = data.get("message", "") if isinstance(data, dict) else ""
-                    return msg or name or "Unknown error"
-                return str(error) if error else None
+            if event.get("type") != "error":
+                continue
+            saw_error_event = True
+            error = event.get("error", {})
+            if isinstance(error, dict):
+                name = error.get("name", "")
+                data = error.get("data", {})
+                msg = data.get("message", "") if isinstance(data, dict) else ""
+                if msg or name:
+                    return msg or name
+            elif error:
+                return str(error)
+            # This frame declares a failure but withholds the reason. Keep
+            # reading — a later frame may name it — but do not let the missing
+            # reason be read as a missing failure.
 
-        return None
+        # An error frame with nothing in it is still an error frame. Reporting
+        # `None` here handed the caller a run that failed as one that succeeded,
+        # carrying whatever partial text had been emitted before the failure.
+        return "Unknown error" if saw_error_event else None
 
     async def complete(
         self,
@@ -462,7 +472,11 @@ class OpenCodeLLMAdapter:
             :class:`~ouroboros.providers.base.CompletionResponse` or
             a :class:`~ouroboros.core.errors.ProviderError`.
         """
-        prompt = self._build_prompt(messages)
+        profile_result = resolve_completion_profile_result(config, backend="opencode")
+        if profile_result.is_err:
+            return Result.err(profile_result.error)
+        config = profile_result.value.config
+        prompt = self._build_prompt(messages, max_turns=config.max_turns)
         if len(prompt) > MAX_LLM_RESPONSE_LENGTH:
             return Result.err(
                 ProviderError(
@@ -592,7 +606,7 @@ class OpenCodeLLMAdapter:
             """Collect events, wait for exit, read stderr."""
             evts: list[dict[str, Any]] = []
             if process.stdout is not None:
-                async for line in iter_stream_lines(process.stdout):
+                async for line in iter_stream_lines(process.stdout, provider=self._provider_name):
                     if not line:
                         continue
                     try:
@@ -605,7 +619,9 @@ class OpenCodeLLMAdapter:
             rc = await process.wait()
             stderr = ""
             if process.stderr is not None:
-                stderr_lines = await collect_stream_lines(process.stderr)
+                stderr_lines = await collect_stream_lines(
+                    process.stderr, provider=self._provider_name
+                )
                 stderr = "\n".join(stderr_lines)
             return evts, rc, stderr
 
@@ -702,11 +718,7 @@ class OpenCodeLLMAdapter:
             CompletionResponse(
                 content=content,
                 model=model or "opencode-default",
-                usage=UsageInfo(
-                    prompt_tokens=0,
-                    completion_tokens=0,
-                    total_tokens=0,
-                ),
+                usage=opencode_cli_usage(events),
                 finish_reason="stop",
             )
         )

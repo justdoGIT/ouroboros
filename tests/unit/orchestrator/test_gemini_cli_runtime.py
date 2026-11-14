@@ -14,13 +14,18 @@ These tests cover the regressions surfaced during PR #312 review:
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
+from ouroboros.orchestrator.adapter import ParamSupport
 from ouroboros.orchestrator.gemini_cli_runtime import (
     _MAX_OUROBOROS_DEPTH,
     GeminiCLIRuntime,
 )
 from ouroboros.orchestrator.runtime_factory import resolve_agent_runtime_backend
+from ouroboros.orchestrator.runtime_message_projection import project_runtime_message
 
 # ---------------------------------------------------------------------------
 # _convert_event: terminal `result` event
@@ -28,7 +33,11 @@ from ouroboros.orchestrator.runtime_factory import resolve_agent_runtime_backend
 
 
 def _make_runtime() -> GeminiCLIRuntime:
-    return GeminiCLIRuntime(cli_path="/usr/bin/gemini")
+    return GeminiCLIRuntime(cli_path=_test_cli_path())
+
+
+def _test_cli_path() -> str:
+    return str(Path(os.environ["OUROBOROS_TEST_CLI_DIR"]) / "gemini")
 
 
 def test_convert_event_surfaces_result_response_as_terminal_assistant_message() -> None:
@@ -83,6 +92,64 @@ def test_convert_event_routes_normalizer_response_field_through_result() -> None
     assert messages[0].content == "final answer text"
 
 
+def test_convert_event_projects_tool_result_as_successful_completion() -> None:
+    runtime = _make_runtime()
+    event = {
+        "type": "tool_result",
+        "content": "1 passed in 0.01s",
+        "metadata": {"name": "Bash"},
+        "is_error": False,
+        "raw": {"type": "tool_result", "name": "Bash"},
+    }
+
+    messages = runtime._convert_event(event, current_handle=None)
+    projected = project_runtime_message(messages[0])
+
+    assert messages[0].type == "tool_result"
+    assert messages[0].data["subtype"] == "tool_result"
+    assert projected.is_tool_result is True
+    assert projected.tool_name == "Bash"
+    assert projected.tool_result is not None
+    assert projected.tool_result["is_error"] is False
+    assert projected.tool_result["text_content"] == "1 passed in 0.01s"
+
+
+def test_convert_event_normalizes_native_shell_tool_name() -> None:
+    runtime = _make_runtime()
+    tool_use = runtime._parse_json_event(
+        '{"type":"tool_use","name":"run_shell","input":{"command":"pytest -q"}}'
+    )
+    tool_result = runtime._parse_json_event(
+        '{"type":"tool_result","name":"run_shell","output":"1 passed"}'
+    )
+
+    assert tool_use is not None
+    assert tool_result is not None
+    started = runtime._convert_event(tool_use, current_handle=None)[0]
+    completed = runtime._convert_event(tool_result, current_handle=None)[0]
+
+    assert started.tool_name == "Bash"
+    assert completed.tool_name == "Bash"
+    assert isinstance(completed.data["tool_result"], dict)
+
+
+def test_convert_event_preserves_malformed_error_status_as_invalid() -> None:
+    runtime = _make_runtime()
+    event = runtime._parse_json_event(
+        '{"type":"tool_result","name":"run_shell","output":"1 passed","is_error":"true"}'
+    )
+
+    assert event is not None
+    message = runtime._convert_event(event, current_handle=None)[0]
+    projected = project_runtime_message(message)
+
+    assert message.data["is_error"] == "invalid"
+    assert message.data["tool_result"]["is_error"] == "invalid"
+    assert projected.runtime_metadata["is_error_invalid"] is True
+    assert projected.tool_result is not None
+    assert projected.tool_result["is_error_invalid"] is True
+
+
 # ---------------------------------------------------------------------------
 # _build_command: headless flags
 # ---------------------------------------------------------------------------
@@ -111,10 +178,133 @@ def test_build_command_uses_stream_json_output_format() -> None:
     assert cmd[idx + 1] == "stream-json"
 
 
+def _approval_flag(cmd: list[str]) -> str:
+    idx = cmd.index("--approval-mode")
+    return cmd[idx + 1]
+
+
+def test_build_command_maps_bypass_permissions_to_yolo() -> None:
+    runtime = GeminiCLIRuntime(
+        cli_path=_test_cli_path(),
+        permission_mode="bypassPermissions",
+    )
+    cmd = runtime._build_command("/tmp/unused", prompt="x")
+    assert _approval_flag(cmd) == "yolo"
+    assert "--skip-trust" in cmd
+
+
+def test_build_command_maps_accept_edits_to_auto_edit() -> None:
+    runtime = GeminiCLIRuntime(
+        cli_path=_test_cli_path(),
+        permission_mode="acceptEdits",
+    )
+    cmd = runtime._build_command("/tmp/unused", prompt="x")
+    assert _approval_flag(cmd) == "auto_edit"
+    assert "--skip-trust" not in cmd
+
+
+def test_default_permission_mode_normalized_to_accept_edits() -> None:
+    """``config.orchestrator.permission_mode`` validly accepts ``default``.
+
+    The headless Gemini runtime cannot honour the interactive ``default`` mode,
+    so it is normalized to ``acceptEdits``/``auto_edit`` (non-blocking) with an
+    audit log entry rather than turning a previously valid global config into
+    a hard runtime-creation failure.
+    """
+    from structlog.testing import capture_logs
+
+    with capture_logs() as cap_logs:
+        runtime = GeminiCLIRuntime(cli_path=_test_cli_path(), permission_mode="default")
+
+    assert runtime.permission_mode == "acceptEdits"
+    cmd = runtime._build_command("/tmp/unused", prompt="x")
+    assert _approval_flag(cmd) == "auto_edit"
+    coerced = [
+        e for e in cap_logs if e.get("event") == "gemini_cli_runtime.permission_mode_coerced"
+    ]
+    assert len(coerced) == 1
+    assert coerced[0]["requested"] == "default"
+    assert coerced[0]["resolved"] == "acceptEdits"
+
+
+def test_build_command_uses_auto_edit_when_permission_mode_omitted() -> None:
+    """Default = ``acceptEdits`` (matches orchestrator default) → ``auto_edit``.
+
+    ``auto_edit`` is non-blocking under ``--non-interactive`` so this stays
+    headless-safe without escalating to full ``yolo`` bypass.
+    """
+    runtime = GeminiCLIRuntime(cli_path=_test_cli_path())
+    cmd = runtime._build_command("/tmp/unused", prompt="x")
+    assert _approval_flag(cmd) == "auto_edit"
+
+
+def test_unknown_permission_mode_raises_value_error() -> None:
+    """An unrecognized mode (e.g. typo) must fail fast — silent fallback to
+    a permissive default would escalate any unchecked input."""
+    with pytest.raises(ValueError, match="Unsupported Gemini permission mode"):
+        GeminiCLIRuntime(
+            cli_path=_test_cli_path(),
+            permission_mode="acceptedits",  # plausible typo of "acceptEdits"
+        )
+
+
+def test_omitted_permission_mode_resolves_to_accept_edits() -> None:
+    """``None`` aligns with the orchestrator-wide ``acceptEdits`` default."""
+    runtime = GeminiCLIRuntime(cli_path=_test_cli_path())
+    assert runtime.permission_mode == "acceptEdits"
+
+
+def test_empty_string_permission_mode_raises() -> None:
+    """Empty/whitespace-only strings are not a valid mode either."""
+    with pytest.raises(ValueError, match="Unsupported Gemini permission mode"):
+        GeminiCLIRuntime(cli_path=_test_cli_path(), permission_mode="   ")
+
+
+def test_factory_built_runtime_uses_accept_edits_default() -> None:
+    """``create_agent_runtime(backend="gemini")`` must inherit the orchestrator
+    ``acceptEdits`` default rather than escalate to ``yolo``."""
+    from unittest.mock import patch
+
+    from ouroboros.orchestrator import create_agent_runtime
+
+    with (
+        patch(
+            "ouroboros.orchestrator.runtime_factory.get_agent_permission_mode",
+            return_value=None,
+        ),
+        patch(
+            "ouroboros.orchestrator.runtime_factory.get_llm_backend",
+            return_value="gemini",
+        ),
+        patch(
+            "ouroboros.config.get_gemini_cli_path",
+            return_value="/usr/bin/gemini",
+        ),
+        patch(
+            "ouroboros.orchestrator.runtime_factory.create_codex_command_dispatcher",
+            return_value=None,
+        ),
+    ):
+        runtime = create_agent_runtime(backend="gemini")
+
+    assert isinstance(runtime, GeminiCLIRuntime)
+    assert runtime.permission_mode == "acceptEdits"
+
+
 def test_runtime_does_not_feed_prompt_via_stdin() -> None:
     runtime = _make_runtime()
     assert runtime._feeds_prompt_via_stdin() is False
     assert runtime._requires_process_stdin() is False
+
+
+def test_runtime_capabilities_mark_targeted_resume_unsupported() -> None:
+    runtime = _make_runtime()
+
+    assert runtime.capabilities.skill_dispatch is True
+    assert runtime.capabilities.targeted_resume is False
+    assert runtime.capabilities.structured_output is True
+    assert runtime.capabilities.system_prompt_support is ParamSupport.TRANSLATED
+    assert runtime.capabilities.tool_restriction_support is ParamSupport.TRANSLATED
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +363,13 @@ def test_factory_rejection_message_lists_supported_backends() -> None:
 
 def test_mcp_llm_backend_enum_includes_gemini() -> None:
     from ouroboros.cli.commands.mcp import AgentRuntimeBackend, LLMBackend
+    from ouroboros.cli.commands.run import AgentRuntimeBackend as RunAgentRuntimeBackend
 
     assert LLMBackend("gemini") is LLMBackend.GEMINI
+    assert LLMBackend("kiro") is LLMBackend.KIRO
     assert AgentRuntimeBackend("gemini") is AgentRuntimeBackend.GEMINI
+    assert AgentRuntimeBackend("copilot") is AgentRuntimeBackend.COPILOT
+    assert AgentRuntimeBackend("kiro") is AgentRuntimeBackend.KIRO
+    assert RunAgentRuntimeBackend("gemini") is RunAgentRuntimeBackend.GEMINI
+    assert RunAgentRuntimeBackend("copilot") is RunAgentRuntimeBackend.COPILOT
+    assert RunAgentRuntimeBackend("kiro") is RunAgentRuntimeBackend.KIRO

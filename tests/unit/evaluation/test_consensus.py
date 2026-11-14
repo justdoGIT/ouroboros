@@ -1,12 +1,18 @@
 """Tests for Stage 3 multi-model consensus evaluation."""
 
-from unittest.mock import AsyncMock
+import json
+import os
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from ouroboros.core.errors import ProviderError
+from ouroboros.config.model_selection import SHIPPED_CONSENSUS_ROSTER
+from ouroboros.config.models import ConsensusConfig as ConsensusSettings
+from ouroboros.config.models import OuroborosConfig
+from ouroboros.core.errors import ProviderError, ValidationError
 from ouroboros.core.ontology_aspect import AnalysisResult
 from ouroboros.core.types import Result
+from ouroboros.evaluation import consensus as consensus_module
 from ouroboros.evaluation.consensus import (
     ConsensusConfig,
     ConsensusEvaluator,
@@ -60,6 +66,42 @@ class TestBuildConsensusPrompt:
 class TestParseVoteResponse:
     """Tests for vote parsing."""
 
+    @pytest.mark.parametrize("approved", [True, False])
+    def test_preserves_boolean_approval(self, approved: bool) -> None:
+        response = json.dumps({"approved": approved, "confidence": 0.9, "reasoning": "Test"})
+
+        result = parse_vote_response(response, "model")
+
+        assert result.is_ok
+        assert result.value.approved is approved
+
+    @pytest.mark.parametrize(
+        "approved",
+        ["false", "true", "", 0, 1, 0.0, 1.0, None, [], [False], {}, {"value": False}],
+        ids=[
+            "string-false",
+            "string-true",
+            "empty-string",
+            "integer-zero",
+            "integer-one",
+            "float-zero",
+            "float-one",
+            "null",
+            "empty-array",
+            "nonempty-array",
+            "empty-object",
+            "nonempty-object",
+        ],
+    )
+    def test_rejects_non_boolean_approval(self, approved: object) -> None:
+        response = json.dumps({"approved": approved, "confidence": 0.9, "reasoning": "Test"})
+
+        result = parse_vote_response(response, "model")
+
+        assert result.is_err
+        assert isinstance(result.error, ValidationError)
+        assert result.error.field == "approved"
+
     def test_valid_vote(self) -> None:
         """Parse valid vote response."""
         response = """{
@@ -75,6 +117,22 @@ class TestParseVoteResponse:
         assert vote.approved is True
         assert vote.confidence == 0.95
         assert vote.reasoning == "Looks good"
+
+    def test_tab_indented_pretty_raw_vote(self) -> None:
+        response = json.dumps(
+            {
+                "approved": True,
+                "confidence": 0.95,
+                "reasoning": "Pretty vote remains intact",
+            },
+            indent="\t",
+        )
+
+        result = parse_vote_response(response, "gpt-4o")
+
+        assert result.is_ok
+        assert result.value.approved is True
+        assert result.value.reasoning == "Pretty vote remains intact"
 
     def test_vote_with_surrounding_text(self) -> None:
         """Parse vote embedded in text."""
@@ -146,7 +204,10 @@ class TestConsensusConfig:
     def test_default_values(self) -> None:
         """Verify default configuration."""
         config = ConsensusConfig()
-        assert len(config.models) == 3
+        # Consensus needs a multi-model roster (>=2) so voting can reach a
+        # majority; collapsing to a single model breaks len(votes) >= 2.
+        assert len(config.models) >= 2
+        assert config.models_are_explicit is False
         assert config.majority_threshold == 0.66
         assert config.diversity_required is True
 
@@ -158,6 +219,143 @@ class TestConsensusConfig:
         )
         assert len(config.models) == 4
         assert config.majority_threshold == 0.75
+
+
+def _vote_response() -> Result[CompletionResponse, ProviderError]:
+    return Result.ok(
+        CompletionResponse(
+            content='{"approved": true, "confidence": 0.9, "reasoning": "Good"}',
+            model="test",
+            usage=UsageInfo(0, 0, 0),
+        )
+    )
+
+
+def _consensus_config(
+    backend: str, config: OuroborosConfig | None = None, **env: str
+) -> ConsensusConfig:
+    """Build the implicit roster for ``backend`` under ``env`` and ``config``."""
+    with (
+        patch.dict(os.environ, {"OUROBOROS_LLM_BACKEND": backend, **env}, clear=True),
+        patch(
+            "ouroboros.config.loader.load_config",
+            return_value=config or OuroborosConfig(),
+        ),
+    ):
+        return ConsensusConfig()
+
+
+class TestConsensusRosterResolution:
+    """The implicit roster resolves per config, never frozen at import."""
+
+    def test_no_import_time_roster(self) -> None:
+        assert not hasattr(consensus_module, "DEFAULT_CONSENSUS_MODELS")
+
+    def test_roster_follows_env_and_config_after_import(self) -> None:
+        custom = OuroborosConfig(consensus=ConsensusSettings(models=("a", "b")))
+        assert _consensus_config("litellm").models == SHIPPED_CONSENSUS_ROSTER
+        assert _consensus_config("litellm", custom).models == ("a", "b")
+        assert _consensus_config("litellm", OUROBOROS_CONSENSUS_MODELS="x, y").models == (
+            "x",
+            "y",
+        )
+        assert _consensus_config("claude", custom).models == ("opus",) * 3
+        assert _consensus_config("claude", custom, OUROBOROS_PIN_MODELS="1").models == (
+            "a",
+            "b",
+        )
+
+    def test_claude_auto_roster_is_the_frontier_alias(self) -> None:
+        config = _consensus_config("claude")
+        assert config.models == ("opus", "opus", "opus")
+        assert config.backend == "claude"
+        assert config.models_are_explicit is False
+
+    def test_sentinel_backend_roster_is_default(self) -> None:
+        config = _consensus_config("codex")
+        assert config.models == ("default",) * 3
+        assert config.backend == "codex"
+
+    def test_explicit_roster_has_no_resolved_backend(self) -> None:
+        assert ConsensusConfig(models=("m1", "m2")).backend is None
+
+    @pytest.mark.asyncio
+    async def test_claude_auto_uses_single_model_perspectives(self) -> None:
+        mock_llm = AsyncMock()
+        mock_llm.complete.return_value = _vote_response()
+        evaluator = ConsensusEvaluator(mock_llm, _consensus_config("claude"))
+        context = EvaluationContext(
+            execution_id="exec-1", seed_id="seed-1", current_ac="AC", artifact="code"
+        )
+
+        result = await evaluator.evaluate(context)
+
+        assert result.is_ok
+        consensus, _ = result.value
+        assert consensus.is_single_model is True
+        assert [vote.model for vote in consensus.votes] == [
+            "session/advocate",
+            "session/devil-advocate",
+            "session/judge",
+        ]
+        roles = {call.args[1].role for call in mock_llm.complete.call_args_list}
+        assert roles == {"consensus_perspective"}
+
+    @pytest.mark.asyncio
+    async def test_multi_model_classifies_voters_by_the_roster_backend(self) -> None:
+        mock_llm = AsyncMock()
+        mock_llm.complete.return_value = _vote_response()
+        evaluator = ConsensusEvaluator(mock_llm, _consensus_config("codex"))
+        context = EvaluationContext(
+            execution_id="exec-1",
+            seed_id="seed-1",
+            current_ac="AC",
+            artifact="code",
+            executor_backend="codex",
+        )
+
+        with patch(
+            "ouroboros.orchestrator.runtime_picker.available_runtime_backends",
+            return_value=("codex", "claude"),
+        ):
+            result = await evaluator.evaluate(context)
+
+        assert result.is_ok
+        consensus, _ = result.value
+        # "default" runs whatever codex is configured to run: vendor unproven.
+        assert consensus.reviewer_independence == "unverified"
+
+    @pytest.mark.parametrize(
+        ("backend", "env", "multi_model"),
+        [
+            ("claude", {"OUROBOROS_CONSENSUS_MODELS": "opus,sonnet"}, False),
+            (
+                "claude",
+                {"OUROBOROS_PIN_MODELS": "1", "OUROBOROS_CONSENSUS_MODELS": "opus,sonnet"},
+                True,
+            ),
+            ("codex", {}, True),
+            ("litellm", {}, False),
+            ("litellm", {"OPENROUTER_API_KEY": "sk-or-real"}, True),
+        ],
+        ids=[
+            "claude-auto-ignores-unpinned-roster",
+            "claude-pinned-distinct-roster",
+            "sentinel-default-votes",
+            "litellm-openrouter-without-key",
+            "litellm-openrouter-with-key",
+        ],
+    )
+    def test_mode_selection(
+        self,
+        backend: str,
+        env: dict[str, str],
+        multi_model: bool,
+    ) -> None:
+        consensus_config = _consensus_config(backend, **env)
+        evaluator = ConsensusEvaluator(AsyncMock(), consensus_config)
+        with patch.dict(os.environ, env, clear=True):
+            assert evaluator._should_use_multi_model() is multi_model
 
 
 class TestConsensusEvaluator:
@@ -202,6 +400,10 @@ class TestConsensusEvaluator:
         assert consensus.approved is True
         assert consensus.majority_ratio == 1.0
         assert len(consensus.votes) == 3
+        configs = [call.args[1] for call in mock_llm.complete.call_args_list]
+        assert [config.model for config in configs] == ["m1", "m2", "m3"]
+        assert all(config.role == "consensus_vote" for config in configs)
+        assert all(config.model_is_explicit for config in configs)
 
     @pytest.mark.asyncio
     async def test_consensus_rejected(
@@ -571,6 +773,22 @@ class TestDeliberativeConsensus:
         )
         return strategy
 
+    def test_default_devil_strategy_model_is_not_explicit(self, mock_llm: AsyncMock) -> None:
+        """Implicit DeliberativeConfig devil model should still allow role profile routing."""
+        evaluator = DeliberativeConsensus(mock_llm, config=DeliberativeConfig())
+
+        assert evaluator._devil_strategy.model_is_explicit is False
+
+    def test_custom_devil_strategy_model_is_explicit(self, mock_llm: AsyncMock) -> None:
+        """Caller-pinned deliberative devil models remain authoritative."""
+        evaluator = DeliberativeConsensus(
+            mock_llm,
+            config=DeliberativeConfig(devil_model="custom-devil"),
+        )
+
+        assert evaluator._devil_strategy.model_is_explicit is True
+        assert evaluator._devil_strategy.model == "custom-devil"
+
     @pytest.mark.asyncio
     async def test_deliberation_approved(
         self,
@@ -707,6 +925,49 @@ class TestDeliberativeConsensus:
         assert deliberation.judgment.conditions == ("Add error handling",)
 
     @pytest.mark.asyncio
+    async def test_invalid_advocate_boolean_stops_before_judge(
+        self,
+        mock_llm: AsyncMock,
+        sample_context: EvaluationContext,
+    ) -> None:
+        """A malformed Advocate vote is an error, even when the Devil agrees."""
+        mock_llm.complete.side_effect = [
+            Result.ok(
+                CompletionResponse(
+                    content='{"approved": "false", "confidence": 0.9, "reasoning": "Not approved"}',
+                    model="advocate",
+                    usage=UsageInfo(0, 0, 0),
+                )
+            ),
+            Result.ok(
+                CompletionResponse(
+                    content='{"is_root_problem": true, "confidence": 0.9, "reasoning": "Addresses root cause"}',
+                    model="devil",
+                    usage=UsageInfo(0, 0, 0),
+                )
+            ),
+            Result.ok(
+                CompletionResponse(
+                    content='{"verdict": "approved", "confidence": 0.9, "reasoning": "Both agree"}',
+                    model="judge",
+                    usage=UsageInfo(0, 0, 0),
+                )
+            ),
+        ]
+        evaluator = DeliberativeConsensus(
+            mock_llm,
+            DeliberativeConfig(advocate_model="advocate", devil_model="devil", judge_model="judge"),
+        )
+
+        result = await evaluator.deliberate(sample_context)
+
+        assert result.is_err
+        assert isinstance(result.error, ValidationError)
+        assert result.error.field == "approved"
+        roles = [call.args[1].role for call in mock_llm.complete.await_args_list]
+        assert roles == ["consensus_advocate", "ontology_analysis"]
+
+    @pytest.mark.asyncio
     async def test_deliberation_advocate_failure(
         self,
         mock_llm: AsyncMock,
@@ -829,3 +1090,126 @@ class TestRunDeliberativeEvaluation:
         assert result.is_ok
         deliberation, _ = result.value
         assert deliberation.approved is True
+
+
+@pytest.mark.parametrize(
+    "value", ["true", "false", "NaN", "Infinity", "-Infinity", '"NaN"', '"Infinity"', "1e400"]
+)
+@pytest.mark.parametrize("kind", ["vote", "judgment"])
+def test_consensus_rejects_nonfinite_or_boolean_confidence(value: str, kind: str) -> None:
+    """Malformed confidence is not promoted to a confident decision."""
+    if kind == "vote":
+        result = parse_vote_response('{"approved": true, "confidence": ' + value + "}", "model")
+    else:
+        result = _parse_judgment_response(
+            '{"verdict": "approved", "confidence": ' + value + "}", "model"
+        )
+    assert result.is_err
+
+
+@pytest.mark.parametrize("kind", ["vote", "judgment"])
+def test_consensus_rejects_overflow_confidence(kind: str) -> None:
+    value = "9" * 400
+    if kind == "vote":
+        result = parse_vote_response('{"approved": true, "confidence": ' + value + "}", "model")
+    else:
+        result = _parse_judgment_response(
+            '{"verdict": "approved", "confidence": ' + value + "}", "model"
+        )
+    assert result.is_err
+
+
+@pytest.mark.parametrize("kind", ["vote", "judgment"])
+@pytest.mark.parametrize(("value", "expected"), [('"0.7"', 0.7), ("1.5", 1.0), ("-1", 0.0)])
+def test_consensus_preserves_finite_confidence_compatibility(
+    value: str, expected: float, kind: str
+) -> None:
+    if kind == "vote":
+        result = parse_vote_response('{"approved": true, "confidence": ' + value + "}", "model")
+    else:
+        result = _parse_judgment_response(
+            '{"verdict": "approved", "confidence": ' + value + "}", "model"
+        )
+    assert result.is_ok
+    assert result.value.confidence == expected
+
+
+@pytest.mark.asyncio
+async def test_invalid_dissent_confidence_does_not_create_consensus_approval() -> None:
+    responses = (
+        '{"approved": true, "confidence": 0.8}',
+        '{"approved": true, "confidence": 0.8}',
+        '{"approved": false, "confidence": 0.8}',
+        '{"approved": false, "confidence": NaN}',
+    )
+    adapter = AsyncMock()
+    adapter.complete.side_effect = [
+        Result.ok(CompletionResponse(content=value, model="model", usage=UsageInfo(0, 0, 0)))
+        for value in responses
+    ]
+    evaluator = ConsensusEvaluator(adapter, ConsensusConfig(models=("a", "b", "c", "d")))
+    context = EvaluationContext(execution_id="e", seed_id="s", current_ac="x", artifact="y")
+    result = await evaluator.evaluate(context)
+    assert result.is_err or not result.value[0].approved
+
+
+@pytest.mark.asyncio
+async def test_invalid_perspective_dissent_does_not_create_consensus_approval() -> None:
+    responses = (
+        '{"approved": true, "confidence": 0.8}',
+        '{"approved": true, "confidence": 0.8}',
+        '{"approved": false, "confidence": NaN}',
+    )
+    adapter = AsyncMock()
+    adapter.complete.side_effect = [
+        Result.ok(CompletionResponse(content=value, model="model", usage=UsageInfo(0, 0, 0)))
+        for value in responses
+    ]
+    evaluator = ConsensusEvaluator(
+        adapter, ConsensusConfig(models=("a", "b", "c"), majority_threshold=0.75)
+    )
+    context = EvaluationContext(execution_id="e", seed_id="s", current_ac="x", artifact="y")
+    result = await evaluator._evaluate_single_model(context, "test")
+    assert result.is_err
+    assert result.error.field == "confidence"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_with_invalid_dissent_confidence_cannot_approve() -> None:
+    from ouroboros.evaluation.models import CheckResult, CheckType, MechanicalResult, SemanticResult
+    from ouroboros.evaluation.pipeline import EvaluationPipeline, PipelineConfig
+
+    responses = (
+        '{"approved": true, "confidence": 0.8}',
+        '{"approved": true, "confidence": 0.8}',
+        '{"approved": false, "confidence": 0.8}',
+        '{"approved": false, "confidence": NaN}',
+    )
+    adapter = AsyncMock()
+    adapter.complete.side_effect = [
+        Result.ok(CompletionResponse(content=value, model="model", usage=UsageInfo(0, 0, 0)))
+        for value in responses
+    ]
+    pipeline = EvaluationPipeline(
+        adapter, PipelineConfig(stage1_enabled=False, stage2_enabled=True)
+    )
+    semantic = SemanticResult(
+        score=0.9,
+        ac_compliance=True,
+        goal_alignment=0.9,
+        drift_score=0.1,
+        uncertainty=0.1,
+        reasoning="ok",
+    )
+    pipeline._semantic.evaluate = AsyncMock(return_value=Result.ok((semantic, [])))
+    pipeline._consensus = ConsensusEvaluator(adapter, ConsensusConfig(models=("a", "b", "c", "d")))
+    context = EvaluationContext(
+        execution_id="e", seed_id="s", current_ac="x", artifact="y", trigger_consensus=True
+    )
+    stage1 = MechanicalResult(
+        passed=True,
+        checks=(CheckResult(check_type=CheckType.TEST, passed=True, message="ok", executed=True),),
+    )
+    result = await pipeline.evaluate(context, stage1_result=stage1)
+    assert result.is_err
+    assert result.error.field == "confidence"

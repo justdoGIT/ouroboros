@@ -5,116 +5,61 @@ description: "Start or monitor an evolutionary development loop"
 
 # ooo evolve - Evolutionary Loop
 
-## Description
-Start, monitor, or rewind an evolutionary development loop. The loop iteratively
-refines the ontology and acceptance criteria across generations until convergence.
+Start, monitor, or rewind an evolutionary loop that refines the ontology and acceptance criteria across generations.
 
-## Flow
 ```
-Gen 1: Interview → Seed(O₁) → Execute → Evaluate
-Gen 2: Wonder → Reflect → Seed(O₂) → Execute → Evaluate
-Gen 3: Wonder → Reflect → Seed(O₃) → Execute → Evaluate
-...until ontology converges (similarity ≥ 0.95) or max 30 generations
+Gen 1: Seed → Execute(all ACs) → Judge → Gate
+Gen 2+: Wonder(failed ACs) → Reflect(active ACs only) → Execute(active) → Gate(all)
+...until the gate passes, the loop stagnates, or 30 generations are reached
 ```
 
 ## Usage
 
-### Start a new evolutionary loop
 ```
-ooo evolve "build a task management CLI"
-```
-
-### Fast mode (ontology-only, no execution)
-```
-ooo evolve "build a task management CLI" --no-execute
-```
-
-### Check lineage status
-```
-ooo evolve --status <lineage_id>
-```
-
-### Rewind to a previous generation
-```
-ooo evolve --rewind <lineage_id> <generation_number>
+ooo evolve "build a task management CLI"              # start
+ooo evolve "build a task management CLI" --no-execute # ontology-only (fast)
+ooo evolve --status <lineage_id>                      # lineage status
+ooo evolve --rewind <lineage_id> <generation_number>  # rewind
 ```
 
 ## Instructions
 
-### Load MCP Tools (Required before Path A/B decision)
+### Loading MCP tools (deferred-schema guard)
 
-The Ouroboros MCP tools are often registered as **deferred tools** that must be explicitly loaded before use. **You MUST perform this step before deciding between Path A and Path B.**
+Ouroboros tools may be deferred, and a schema loaded on one turn can unload by the next. Immediately before each `ouroboros_*` call, load it with the active runtime's tool-discovery capability: `"+ouroboros evolve"` for `ouroboros_evolve_step`, `ouroboros_lineage_status`, and `ouroboros_evolve_rewind`; `"+ouroboros interview"` for `ouroboros_interview`; `"+ouroboros seed"` for `ouroboros_generate_seed`; `"+ouroboros lateral"` for `ouroboros_lateral_think`. A call whose schema is not loaded fails with "Invalid tool parameters". If the tool is already callable, discovery is a no-op and an empty result is expected. Use the fallback only when the tool is genuinely absent.
 
-1. Use the `ToolSearch` tool to find and load the evolve MCP tools:
-   ```
-   ToolSearch query: "+ouroboros evolve"
-   ```
-2. The tools will typically be named with prefix `mcp__plugin_ouroboros_ouroboros__` (e.g., `ouroboros_evolve_step`, `ouroboros_interview`, `ouroboros_generate_seed`). After ToolSearch returns, the tools become callable.
-3. If ToolSearch finds the tools → proceed to **Path A**. If not → proceed to **Path B**.
+### Start a new loop
 
-**IMPORTANT**: Do NOT skip this step. Do NOT assume MCP tools are unavailable just because they don't appear in your immediate tool list. They are almost always available as deferred tools that need to be loaded first.
+1. Run the interview: `ouroboros_interview` with the user's input as `initial_context`, until ambiguity ≤ 0.2.
+2. Generate the Seed: `ouroboros_generate_seed` with the interview `session_id`.
+3. Call `ouroboros_evolve_step` with a new `lineage_id` (e.g. `lin_<seed_id>`), `seed_content` (the Seed YAML), and `execute` (`true` by default for Execute→Evaluate each generation; `false` for `--no-execute`). Generation 2+ calls pass only `lineage_id`. Each call runs exactly one generation; state is rebuilt from events between calls.
+4. Act on `action`:
+   - `continue`: inspect `active_ac_indices`, then call again with `lineage_id`. Only failed or reopened ACs evolve; frozen PASS ACs are reverified, not regenerated.
+   - `ontology_stable`: not success. Call again for the same lineage with `execute: true` and process that response; never report convergence before a `converged` action.
+   - `converged`: the independently evaluated outcome passed. Show the final ontology.
+   - `stagnated`: the ontology stayed unchanged, or rejected scores moved less than 0.01, across a 3-generation window. Hand off to `ooo unstuck` (`ouroboros_lateral_think`).
+   - `exhausted`: the 30-generation cap was hit. Show the best generation.
+   - `failed`: report the error. If it names an expired lineage owner, first confirm the prior owner process is dead, then make one call with `recover_expired_claim: true`; never set it for a slow or still-running owner.
+5. Repeat while `continue`. With `execute: true` each generation already ran Execute→Evaluate, so never offer `ooo evaluate` with the `lineage_id`: formal evaluation takes an execution `session_id`, which the lineage id is not.
 
-### Path A: MCP Available (loaded via ToolSearch above)
+Executed generations include a QA verdict unless `skip_qa: true`; use its score to track quality across generations. A passing Gen 1 may converge immediately.
 
-**Starting a new evolutionary loop:**
-1. Parse the user's input as `initial_context`
-2. Run the interview: call `ouroboros_interview` with `initial_context`
-3. Complete the interview (3+ rounds until ambiguity ≤ 0.2)
-4. Generate seed: call `ouroboros_generate_seed` with the `session_id`
-5. Call `ouroboros_evolve_step` with:
-   - `lineage_id`: new unique ID (e.g., `lin_<seed_id>`)
-   - `seed_content`: the generated seed YAML
-   - `execute`: `true` (default) for full Execute→Evaluate pipeline,
-     `false` for fast ontology-only evolution (no seed execution)
-6. Check the `action` in the response:
-   - `continue` → Call `ouroboros_evolve_step` again with just `lineage_id`
-   - `converged` → Evolution complete! Display final ontology
-   - `stagnated` → Ontology unchanged for 3+ gens. Consider `ouroboros_lateral_think`
-   - `exhausted` → Max 30 generations reached. Display best result
-   - `failed` → Check error, possibly retry
-7. **Repeat step 6** until action ≠ `continue`
-8. When the loop terminates, display a result summary with next step:
-   - `converged`: `📍 Next: Ontology converged! Run ooo evaluate for formal verification`
-   - `stagnated`: `📍 Next: ooo unstuck to break through, then ooo evolve --status <lineage_id> to resume`
-   - `exhausted`: `📍 Next: ooo evaluate to check best result — or ooo unstuck to try a new approach`
-   - `failed`: `📍 Next: Check the error above. ooo status to inspect session, or ooo unstuck if blocked`
+### Status
 
-**Checking status:**
-1. Call `ouroboros_lineage_status` with the `lineage_id`
-2. Display: generation count, ontology evolution, convergence progress
+Call `ouroboros_lineage_status` with `lineage_id`; show generation count, ontology evolution, and convergence progress. This only reads status; it does not resume the loop.
 
-**Rewinding:**
-1. Call `ouroboros_evolve_step` with:
-   - `lineage_id`: the lineage to continue from a rewind point
-   - `seed_content`: the seed YAML from the target generation
-   (Future: dedicated `ouroboros_evolve_rewind` tool)
+### Rewind
 
-### Path B: Plugin-only (no MCP tools available)
+Call `ouroboros_evolve_rewind` with `lineage_id` and `to_generation` (kept, inclusive; later generations are truncated). Continue by calling `ouroboros_evolve_step` with the same `lineage_id`.
 
-If MCP tools are not available, explain the evolutionary loop concept and
-suggest installing the Ouroboros MCP server. See [Getting Started](docs/getting-started.md) for install options, then run:
+### Benchmark control (explicit request only)
 
-```
-ouroboros mcp serve
-```
+Never launch a full-graph control arm on your own: it would consume the savings being measured. Only when the user asks, call `ouroboros_evolve_step` for an existing Gen 2+ lineage with `benchmark_control: true`, `execute: true`, and an explicit clean Git `project_dir` in a distinct worktree at the treatment commit. A smaller active set is a working-set observation, not a savings claim; the frugality verdict comes from the server's receipts.
 
-Then add to your runtime's MCP configuration (e.g., `~/.claude/mcp.json` for Claude Code).
+### Fallback (no Ouroboros MCP server)
 
-## Key Concepts
+Explain the evolutionary loop and suggest installing the MCP server (see [Getting Started](https://github.com/Q00/ouroboros/blob/main/docs/getting-started.md)), then running `ouroboros mcp serve --runtime claude-cli` and adding it to the runtime's MCP configuration.
 
-- **Wonder**: "What do we still not know?" - examines evaluation results
-  to identify ontological gaps and hidden assumptions
-- **Reflect**: "How should the ontology evolve?" - proposes specific
-  mutations to fields, acceptance criteria, and constraints
-- **Convergence**: Loop stops when ontology similarity ≥ 0.95 between
-  consecutive generations, or after 30 generations max
-- **Rewind**: Each generation is a snapshot. You can rewind to any
-  generation and branch evolution from there
-- **evolve_step**: Runs exactly ONE generation per call. Designed for
-  Ralph integration — state is fully reconstructed from events between calls
-- **execute flag**: `true` (default) runs full Execute→Evaluate each generation.
-  `false` skips execution for fast ontology exploration. Previous generation's
-  execution output is fed into Wonder/Reflect for informed evolution
-- **QA verdict**: Each generation's response includes a QA Verdict section
-  (when `execute=true` and `skip_qa` is not set). Use the QA score to track
-  quality progression across generations. Pass `skip_qa: true` to disable
+## RFC #1392 State Breadcrumb Footer
+
+End the final response with exactly one line `◆ <current state> → next: <recommended action>`. Derive the state from live session state via `ouroboros_session_status` when available, otherwise from this skill's actual outcome. Never use a linear `Step N of M` footer; when the next step is a real choice, list 2-3 options.

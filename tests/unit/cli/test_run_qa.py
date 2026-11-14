@@ -4,20 +4,28 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import typer
 
 from ouroboros.cli.commands.run import (
+    _execution_model_status,
     _load_skip_completed_markers,
+    _resolve_cli_project_dir,
+    _resolve_fat_harness_mode,
     _resolve_max_decomposition_depth,
     _resolve_max_parallel_workers,
+    _resolve_resume_checkpoint_store_enabled,
+    _resolve_resume_fat_harness_mode,
     _run_orchestrator,
 )
+from ouroboros.core.seed import Seed
 from ouroboros.core.types import Result
 from ouroboros.evaluation.verification_artifacts import VerificationArtifacts
 from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
+from ouroboros.orchestrator.decomposition_limits import MAX_DECOMPOSITION_DEPTH
+from ouroboros.orchestrator.session import SessionTracker
 
 VALID_SEED_DATA = {
     "goal": "Test task",
@@ -75,6 +83,354 @@ FAKE_VERIFICATION_ARTIFACTS = VerificationArtifacts(
 )
 
 
+def test_resolve_cli_project_dir_prefers_explicit_project_dir(tmp_path: Path) -> None:
+    """--project-dir should be the highest-priority run boundary."""
+    seed_file = tmp_path / "seeds" / "seed.yaml"
+    seed_file.parent.mkdir()
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    explicit_project = tmp_path / "project"
+    explicit_project.mkdir()
+    seed = Seed.from_dict(VALID_SEED_DATA)
+
+    assert (
+        _resolve_cli_project_dir(
+            seed,
+            seed_file,
+            seed_data=VALID_SEED_DATA,
+            project_dir=explicit_project,
+        )
+        == explicit_project.resolve()
+    )
+
+
+def test_resolve_cli_project_dir_uses_brownfield_target_dir_when_present(
+    tmp_path: Path,
+) -> None:
+    """Seeds in a central library may target an external brownfield repo."""
+    seed_file = tmp_path / "seed-library" / "seed.yaml"
+    seed_file.parent.mkdir()
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    target_dir = tmp_path / "work" / "myproject"
+    target_dir.mkdir(parents=True)
+    seed_data = {
+        **VALID_SEED_DATA,
+        "brownfield_context": {
+            "project_type": "brownfield",
+            "target_dir": str(target_dir),
+            "context_references": [
+                {"path": "main.py", "role": "primary", "summary": "target file"},
+            ],
+        },
+    }
+    (target_dir / "main.py").write_text("print('hi')\n", encoding="utf-8")
+    seed = Seed.from_dict(seed_data)
+
+    assert _resolve_cli_project_dir(seed, seed_file, seed_data=seed_data) == target_dir.resolve()
+
+
+def test_resolve_cli_project_dir_falls_back_to_seed_parent_without_project_hints(
+    tmp_path: Path,
+) -> None:
+    """Back-compat path remains the seed file directory."""
+    seed_file = tmp_path / "seeds" / "seed.yaml"
+    seed_file.parent.mkdir()
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    seed = Seed.from_dict(VALID_SEED_DATA)
+
+    assert (
+        _resolve_cli_project_dir(seed, seed_file, seed_data=VALID_SEED_DATA)
+        == seed_file.parent.resolve()
+    )
+
+
+def test_resolve_cli_project_dir_keeps_seed_relative_metadata_project_dir(
+    tmp_path: Path,
+) -> None:
+    """metadata.project_dir keeps working with the existing seed-relative behavior."""
+    seed_file = tmp_path / "seeds" / "seed.yaml"
+    seed_file.parent.mkdir()
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    seed_data = {
+        **VALID_SEED_DATA,
+        "metadata": {**VALID_SEED_DATA["metadata"], "project_dir": "repo-root"},
+    }
+    seed = Seed.from_dict(seed_data)
+
+    assert (
+        _resolve_cli_project_dir(seed, seed_file, seed_data=seed_data)
+        == (seed_file.parent / "repo-root").resolve()
+    )
+
+
+@pytest.mark.parametrize("metadata_field", ["project_dir", "working_directory"])
+def test_resolve_cli_project_dir_rejects_raw_metadata_project_escape(
+    tmp_path: Path, metadata_field: str
+) -> None:
+    """Raw metadata project fields must not silently fall back after rejection."""
+    seed_file = tmp_path / "seeds" / "seed.yaml"
+    seed_file.parent.mkdir()
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    outside_project = tmp_path / "outside-project"
+    seed_data = {
+        **VALID_SEED_DATA,
+        "metadata": {
+            **VALID_SEED_DATA["metadata"],
+            metadata_field: str(outside_project),
+        },
+    }
+    seed = Seed.from_dict(seed_data)
+
+    with patch("ouroboros.cli.commands.run.print_error") as mock_print:
+        with pytest.raises(typer.Exit) as exc_info:
+            _resolve_cli_project_dir(seed, seed_file, seed_data=seed_data)
+
+    assert exc_info.value.exit_code == 1
+    assert mock_print.call_count == 1
+    assert "escapes" in mock_print.call_args[0][0]
+
+
+def test_resolve_cli_project_dir_keeps_target_dir_when_context_reference_is_file(
+    tmp_path: Path,
+) -> None:
+    """A primary file reference must not become the runtime cwd or drag it deeper.
+
+    The reference ``src/main.py`` resolved against ``target_dir``, which
+    proves ``target_dir`` is the base the seed's relative paths (including
+    ``expected_artifacts``) were written against. Collapsing to the file's
+    parent (``src/``) made those artifacts unresolvable (#2194).
+    """
+    seed_file = tmp_path / "seed-library" / "seed.yaml"
+    seed_file.parent.mkdir()
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    target_dir = tmp_path / "work" / "myproject"
+    target_dir.mkdir(parents=True)
+    source_file = target_dir / "src" / "main.py"
+    source_file.parent.mkdir()
+    source_file.write_text("print('hi')\n", encoding="utf-8")
+    seed_data = {
+        **VALID_SEED_DATA,
+        "brownfield_context": {
+            "project_type": "brownfield",
+            "target_dir": str(target_dir),
+            "context_references": [
+                {"path": "src/main.py", "role": "primary", "summary": "target file"},
+            ],
+        },
+    }
+    seed = Seed.from_dict(seed_data)
+
+    assert _resolve_cli_project_dir(seed, seed_file, seed_data=seed_data) == target_dir.resolve()
+
+
+def test_resolve_cli_project_dir_global_seed_store_without_hints_does_not_return_home(
+    tmp_path: Path,
+) -> None:
+    """A global seed store path must not become the runtime project cwd (#1312)."""
+    fake_home = tmp_path / "home"
+    global_seed_dir = fake_home / ".ouroboros" / "seeds" / "demo"
+    global_seed_dir.mkdir(parents=True)
+    seed_file = global_seed_dir / "seed.yaml"
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    seed = Seed.from_dict(VALID_SEED_DATA)
+
+    with patch.object(Path, "home", return_value=fake_home):
+        resolved = _resolve_cli_project_dir(seed, seed_file, seed_data=VALID_SEED_DATA)
+
+    assert resolved != global_seed_dir.resolve()
+    assert resolved != fake_home.resolve()
+
+
+def test_resolve_cli_project_dir_global_seed_store_without_hints_uses_the_current_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`ouroboros run ~/.ouroboros/seeds/<id>.yaml` from a project builds in that project."""
+    fake_home = tmp_path / "home"
+    global_seeds = fake_home / ".ouroboros" / "seeds"
+    global_seeds.mkdir(parents=True)
+    seed_file = global_seeds / "seed_abc123.yaml"
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    seed = Seed.from_dict(VALID_SEED_DATA)
+
+    with patch.object(Path, "home", return_value=fake_home):
+        resolved = _resolve_cli_project_dir(seed, seed_file, seed_data=VALID_SEED_DATA)
+
+    assert resolved == project.resolve()
+
+
+@pytest.mark.parametrize("reference", ["durlib", "src/durlib/duration.py", "."])
+def test_resolve_cli_project_dir_global_seed_store_keeps_the_current_directory_over_references(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reference: str,
+) -> None:
+    """A context reference is a documentation pointer, never the runtime root."""
+    fake_home = tmp_path / "home"
+    global_seeds = fake_home / ".ouroboros" / "seeds"
+    global_seeds.mkdir(parents=True)
+    seed_file = global_seeds / "seed_abc123.yaml"
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    project = tmp_path / "project"
+    (project / "durlib").mkdir(parents=True)
+    (project / "src" / "durlib").mkdir(parents=True)
+    (project / "src" / "durlib" / "duration.py").write_text("", encoding="utf-8")
+    monkeypatch.chdir(project)
+    seed_data = {
+        **VALID_SEED_DATA,
+        "brownfield_context": {
+            "project_type": "brownfield",
+            "context_references": [{"path": reference, "role": "primary", "summary": "repo"}],
+        },
+    }
+    seed = Seed.from_dict(seed_data)
+
+    with patch.object(Path, "home", return_value=fake_home):
+        resolved = _resolve_cli_project_dir(seed, seed_file, seed_data=seed_data)
+
+    assert resolved == project.resolve()
+
+
+def test_resolve_cli_project_dir_global_seed_store_still_prefers_explicit_project_dir(
+    tmp_path: Path,
+) -> None:
+    """--project-dir remains the highest-priority boundary for global seeds."""
+    fake_home = tmp_path / "home"
+    global_seed_dir = fake_home / ".ouroboros" / "seeds" / "demo"
+    global_seed_dir.mkdir(parents=True)
+    seed_file = global_seed_dir / "seed.yaml"
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    explicit_project = tmp_path / "actual-project"
+    explicit_project.mkdir()
+    seed = Seed.from_dict(VALID_SEED_DATA)
+
+    with patch.object(Path, "home", return_value=fake_home):
+        resolved = _resolve_cli_project_dir(
+            seed,
+            seed_file,
+            seed_data=VALID_SEED_DATA,
+            project_dir=explicit_project,
+        )
+
+    assert resolved == explicit_project.resolve()
+
+
+def test_resolve_cli_project_dir_global_seed_store_still_uses_raw_metadata_project_dir(
+    tmp_path: Path,
+) -> None:
+    """Raw metadata project_dir keeps #1160/#1161 precedence for global seeds."""
+    fake_home = tmp_path / "home"
+    global_seed_dir = fake_home / ".ouroboros" / "seeds" / "demo"
+    repo_root = global_seed_dir / "repo-root"
+    repo_root.mkdir(parents=True)
+    seed_file = global_seed_dir / "seed.yaml"
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    seed_data = {
+        **VALID_SEED_DATA,
+        "metadata": {**VALID_SEED_DATA["metadata"], "project_dir": "repo-root"},
+    }
+    seed = Seed.from_dict(seed_data)
+
+    with patch.object(Path, "home", return_value=fake_home):
+        resolved = _resolve_cli_project_dir(seed, seed_file, seed_data=seed_data)
+
+    assert resolved == repo_root.resolve()
+
+
+def test_resolve_cli_project_dir_global_seed_store_still_uses_brownfield_target_dir(
+    tmp_path: Path,
+) -> None:
+    """brownfield_context.target_dir remains preferred over global seed fallback."""
+    fake_home = tmp_path / "home"
+    global_seed_dir = fake_home / ".ouroboros" / "seeds" / "demo"
+    global_seed_dir.mkdir(parents=True)
+    seed_file = global_seed_dir / "seed.yaml"
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    target_dir = tmp_path / "actual-project"
+    target_dir.mkdir()
+    seed_data = {
+        **VALID_SEED_DATA,
+        "brownfield_context": {
+            "project_type": "brownfield",
+            "target_dir": str(target_dir),
+            "context_references": [
+                {"path": "main.py", "role": "primary", "summary": "target file"},
+            ],
+        },
+    }
+    (target_dir / "main.py").write_text("print('hi')\n", encoding="utf-8")
+    seed = Seed.from_dict(seed_data)
+
+    with patch.object(Path, "home", return_value=fake_home):
+        resolved = _resolve_cli_project_dir(seed, seed_file, seed_data=seed_data)
+
+    assert resolved == target_dir.resolve()
+
+
+def test_resolve_fat_harness_mode_defaults_to_enabled() -> None:
+    """Verify-by-default: fresh runs enforce fat-harness unless opted out."""
+    assert _resolve_fat_harness_mode(VALID_SEED_DATA) is True
+
+
+def test_resolve_fat_harness_mode_accepts_fat_harness_execution_mode() -> None:
+    """Explicit fat-harness mode remains accepted after #978 P5."""
+    seed_data = {**VALID_SEED_DATA, "orchestrator": {"execution_mode": "fat_harness"}}
+
+    assert _resolve_fat_harness_mode(seed_data) is True
+
+
+def test_resolve_fat_harness_mode_legacy_execution_mode_opts_out() -> None:
+    """`execution_mode: legacy` is the supported verify-by-default escape hatch."""
+    seed_data = {**VALID_SEED_DATA, "orchestrator": {"execution_mode": "legacy"}}
+
+    assert _resolve_fat_harness_mode(seed_data) is False
+
+
+def test_resolve_fat_harness_mode_rejects_unknown_execution_mode() -> None:
+    seed_data = {**VALID_SEED_DATA, "orchestrator": {"execution_mode": "mystery"}}
+
+    with pytest.raises(typer.Exit):
+        _resolve_fat_harness_mode(seed_data)
+
+
+def test_resolve_resume_fat_harness_mode_uses_persisted_contract() -> None:
+    """Resume prefers the durable session contract over seed selectors."""
+    seed_data = {**VALID_SEED_DATA, "orchestrator": {"execution_mode": "legacy"}}
+
+    assert _resolve_resume_fat_harness_mode(seed_data, {"fat_harness_mode": True}) is True
+    assert _resolve_resume_fat_harness_mode(seed_data, {"fat_harness_mode": False}) is False
+
+
+def test_resolve_resume_fat_harness_mode_migrates_missing_contract_to_default_runner() -> None:
+    """Sessions with no persisted contract resume verify-by-default unless opted out."""
+    fat_harness_seed = {**VALID_SEED_DATA, "orchestrator": {"execution_mode": "fat_harness"}}
+    legacy_seed = {**VALID_SEED_DATA, "orchestrator": {"execution_mode": "legacy"}}
+
+    assert _resolve_resume_fat_harness_mode(fat_harness_seed, {}) is True
+    assert _resolve_resume_fat_harness_mode(VALID_SEED_DATA, {}) is True
+    assert _resolve_resume_fat_harness_mode(legacy_seed, {}) is False
+
+
+@pytest.mark.parametrize(
+    ("persisted", "expected"),
+    [(False, False), (True, True), (0, True), ("false", True), (None, True)],
+)
+def test_resume_checkpoint_mode_only_accepts_a_persisted_boolean(
+    persisted: object, expected: bool
+) -> None:
+    progress = {
+        "execution_contract": {"execution_semantics": {"checkpoint_store_enabled": persisted}}
+    }
+
+    assert _resolve_resume_checkpoint_store_enabled(progress) is expected
+
+
+def test_resume_without_a_contract_keeps_default_mode_for_runner_validation() -> None:
+    assert _resolve_resume_checkpoint_store_enabled({}) is True
+
+
 def test_resolve_max_decomposition_depth_defaults_to_two(monkeypatch: pytest.MonkeyPatch) -> None:
     """The workflow depth cap should default to 2 when nothing overrides it."""
     monkeypatch.delenv("OUROBOROS_MAX_DECOMPOSITION_DEPTH", raising=False)
@@ -96,6 +452,85 @@ def test_resolve_max_decomposition_depth_prefers_cli_then_env_then_seed(
 
     assert _resolve_max_decomposition_depth(seed_data, None) == 4
     assert _resolve_max_decomposition_depth(seed_data, 1) == 1
+
+
+@pytest.mark.parametrize("source", ["cli", "env", "seed"])
+def test_resolve_max_decomposition_depth_admits_shared_maximum_for_every_source(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    """CLI, env, and Seed use one inclusive 0-4 admission contract."""
+
+    monkeypatch.delenv("OUROBOROS_MAX_DECOMPOSITION_DEPTH", raising=False)
+    cli_value: int | None = None
+    seed_data = dict(VALID_SEED_DATA)
+    if source == "cli":
+        cli_value = MAX_DECOMPOSITION_DEPTH
+    elif source == "env":
+        monkeypatch.setenv(
+            "OUROBOROS_MAX_DECOMPOSITION_DEPTH",
+            str(MAX_DECOMPOSITION_DEPTH),
+        )
+    else:
+        seed_data["orchestrator"] = {"max_decomposition_depth": MAX_DECOMPOSITION_DEPTH}
+
+    assert _resolve_max_decomposition_depth(seed_data, cli_value) == MAX_DECOMPOSITION_DEPTH == 4
+
+
+@pytest.mark.parametrize("source", ["cli", "env", "seed"])
+def test_resolve_max_decomposition_depth_preserves_larger_legacy_values_for_every_source(
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    """The historical non-negative contract remains valid above durable depth four."""
+
+    monkeypatch.delenv("OUROBOROS_MAX_DECOMPOSITION_DEPTH", raising=False)
+    cli_value: int | None = None
+    seed_data = dict(VALID_SEED_DATA)
+    if source == "cli":
+        cli_value = MAX_DECOMPOSITION_DEPTH + 1
+    elif source == "env":
+        monkeypatch.setenv(
+            "OUROBOROS_MAX_DECOMPOSITION_DEPTH",
+            str(MAX_DECOMPOSITION_DEPTH + 1),
+        )
+    else:
+        seed_data["orchestrator"] = {"max_decomposition_depth": MAX_DECOMPOSITION_DEPTH + 1}
+
+    assert _resolve_max_decomposition_depth(seed_data, cli_value) == MAX_DECOMPOSITION_DEPTH + 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["env", "seed"])
+async def test_run_orchestrator_rejects_negative_depth_before_runtime_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    """Invalid raw env/Seed values still fail before stores and providers."""
+
+    seed_file = tmp_path / "seed.yaml"
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    seed_data = dict(VALID_SEED_DATA)
+    monkeypatch.delenv("OUROBOROS_MAX_DECOMPOSITION_DEPTH", raising=False)
+    if source == "env":
+        monkeypatch.setenv(
+            "OUROBOROS_MAX_DECOMPOSITION_DEPTH",
+            "-1",
+        )
+    else:
+        seed_data["orchestrator"] = {"max_decomposition_depth": -1}
+
+    with (
+        patch("ouroboros.cli.commands.run._load_seed_from_yaml", return_value=seed_data),
+        patch("ouroboros.persistence.event_store.EventStore") as event_store_cls,
+        patch("ouroboros.orchestrator.create_agent_runtime") as create_agent_runtime,
+        pytest.raises(typer.Exit),
+    ):
+        await _run_orchestrator(seed_file)
+
+    event_store_cls.assert_not_called()
+    create_agent_runtime.assert_not_called()
 
 
 def test_load_skip_completed_markers_parses_yaml_metadata(tmp_path: Path) -> None:
@@ -187,7 +622,7 @@ async def test_run_orchestrator_passes_artifact_and_reference_to_qa(tmp_path: Pa
     with (
         patch("ouroboros.cli.commands.run._load_seed_from_yaml", return_value=VALID_SEED_DATA),
         patch("ouroboros.orchestrator.create_agent_runtime"),
-        patch("ouroboros.orchestrator.OrchestratorRunner", return_value=mock_runner),
+        patch("ouroboros.orchestrator.runner_factory.OrchestratorRunner", return_value=mock_runner),
         patch("ouroboros.persistence.event_store.EventStore") as mock_event_store_cls,
         patch(
             "ouroboros.cli.commands.run.build_verification_artifacts",
@@ -233,14 +668,14 @@ async def test_run_orchestrator_passes_resolved_execution_caps_to_runner(tmp_pat
     mock_runner.resume_session = AsyncMock()
     seed_data = {
         **VALID_SEED_DATA,
-        "orchestrator": {"max_decomposition_depth": 3},
+        "orchestrator": {"max_decomposition_depth": MAX_DECOMPOSITION_DEPTH},
     }
 
     with (
         patch("ouroboros.cli.commands.run._load_seed_from_yaml", return_value=seed_data),
         patch("ouroboros.orchestrator.create_agent_runtime"),
         patch(
-            "ouroboros.orchestrator.OrchestratorRunner", return_value=mock_runner
+            "ouroboros.orchestrator.runner_factory.OrchestratorRunner", return_value=mock_runner
         ) as mock_runner_cls,
         patch("ouroboros.cli.commands.run._resolve_max_parallel_workers", return_value=7),
         patch("ouroboros.persistence.event_store.EventStore") as mock_event_store_cls,
@@ -258,8 +693,189 @@ async def test_run_orchestrator_passes_resolved_execution_caps_to_runner(tmp_pat
         mock_event_store_cls.return_value.initialize = AsyncMock()
         await _run_orchestrator(seed_file)
 
-    assert mock_runner_cls.call_args.kwargs["max_decomposition_depth"] == 3
+    assert (
+        mock_runner_cls.call_args.kwargs["max_decomposition_depth"] == MAX_DECOMPOSITION_DEPTH == 4
+    )
     assert mock_runner_cls.call_args.kwargs["max_parallel_workers"] == 7
+    assert mock_runner_cls.call_args.kwargs["fat_harness_mode"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_orchestrator_passes_default_runner_mode_to_runner(tmp_path: Path) -> None:
+    """Verify-by-default: the default path enables fat-harness unless opted out."""
+    seed_file = tmp_path / "seed.yaml"
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+
+    fake_exec = SimpleNamespace(
+        success=True,
+        session_id="sess-test",
+        messages_processed=5,
+        duration_seconds=1.0,
+        execution_id="exec-test",
+        summary={"verification_report": "Parallel Execution Verification Report"},
+        final_message="fallback final message",
+    )
+    mock_runner = MagicMock()
+    mock_runner.execute_seed = AsyncMock(return_value=Result.ok(fake_exec))
+    mock_runner.resume_session = AsyncMock()
+    seed_data = {**VALID_SEED_DATA, "orchestrator": {"max_decomposition_depth": 2}}
+
+    with (
+        patch("ouroboros.cli.commands.run._load_seed_from_yaml", return_value=seed_data),
+        patch("ouroboros.orchestrator.create_agent_runtime"),
+        patch(
+            "ouroboros.orchestrator.runner_factory.OrchestratorRunner", return_value=mock_runner
+        ) as mock_runner_cls,
+        patch("ouroboros.persistence.event_store.EventStore") as mock_event_store_cls,
+        patch(
+            "ouroboros.cli.commands.run.build_verification_artifacts",
+            new_callable=AsyncMock,
+            return_value=FAKE_VERIFICATION_ARTIFACTS,
+        ),
+        patch(
+            "ouroboros.mcp.tools.qa.QAHandler.handle",
+            new_callable=AsyncMock,
+            return_value=FAKE_QA_RESULT,
+        ),
+    ):
+        mock_event_store_cls.return_value.initialize = AsyncMock()
+        await _run_orchestrator(seed_file)
+
+    assert mock_runner_cls.call_args.kwargs["fat_harness_mode"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_orchestrator_resume_uses_persisted_fat_harness_contract(
+    tmp_path: Path,
+) -> None:
+    """Resume trusts the stored session contract instead of revalidating old seed modes."""
+    seed_file = tmp_path / "seed.yaml"
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+
+    tracker = SessionTracker.create(
+        "exec-resume",
+        "test-seed-cli-qa",  # VALID_SEED_DATA's seed_id
+        session_id="sess-resume",
+    )
+    tracker.progress["execution_contract"] = {
+        "execution_semantics": {"checkpoint_store_enabled": False}
+    }
+    fake_exec = SimpleNamespace(
+        success=True,
+        session_id="sess-resume",
+        messages_processed=1,
+        duration_seconds=1.0,
+        execution_id="exec-resume",
+        summary={},
+        final_message="resumed",
+    )
+    mock_runner = MagicMock()
+    mock_runner.resume_session = AsyncMock(return_value=Result.ok(fake_exec))
+    seed_data = {**VALID_SEED_DATA, "orchestrator": {"execution_mode": "legacy"}}
+
+    with (
+        patch("ouroboros.cli.commands.run._load_seed_from_yaml", return_value=seed_data),
+        patch("ouroboros.orchestrator.create_agent_runtime"),
+        patch(
+            "ouroboros.orchestrator.runner_factory.OrchestratorRunner", return_value=mock_runner
+        ) as mock_runner_cls,
+        patch("ouroboros.persistence.event_store.EventStore") as mock_event_store_cls,
+        patch("ouroboros.orchestrator.session.SessionRepository") as mock_repo_cls,
+        patch("ouroboros.cli.commands.run.maybe_restore_task_workspace", return_value=None),
+    ):
+        mock_event_store_cls.return_value.initialize = AsyncMock()
+        # An empty journal: the original run bound no check package.
+        mock_event_store_cls.return_value.replay = AsyncMock(return_value=[])
+        mock_event_store_cls.return_value.query_events = AsyncMock(return_value=[])
+        mock_repo_cls.return_value.reconstruct_session = AsyncMock(return_value=Result.ok(tracker))
+
+        await _run_orchestrator(seed_file, resume_session="sess-resume", no_qa=True)
+
+    assert mock_runner_cls.call_args.kwargs["fat_harness_mode"] is False
+    assert mock_runner_cls.call_args.kwargs["checkpoint_store"] is None
+    mock_runner.resume_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_resume_whose_process_is_gone_starts_a_new_attempt(tmp_path: Path) -> None:
+    """A run resumed in a new process cannot continue; the CLI starts a new attempt."""
+    from ouroboros.orchestrator.runner import OrchestratorError
+
+    seed_file = tmp_path / "seed.yaml"
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    tracker = SessionTracker.create("exec-lost", "test-seed-cli-qa", session_id="sess-lost")
+    lost = OrchestratorError(
+        message="Cannot resume this process-local execution; start a new attempt.",
+        details={
+            "session_id": "sess-lost",
+            "execution_id": "exec-lost",
+            "resume_blocked": "process_local_resume_unavailable",
+        },
+    )
+    fake_exec = SimpleNamespace(
+        success=True,
+        session_id="sess-new",
+        messages_processed=1,
+        duration_seconds=1.0,
+        execution_id="exec-new",
+        summary={},
+        final_message="done",
+    )
+    mock_runner = MagicMock()
+    mock_runner.resume_session = AsyncMock(return_value=Result.err(lost))
+    mock_runner.execute_seed = AsyncMock(return_value=Result.ok(fake_exec))
+
+    with (
+        patch("ouroboros.cli.commands.run._load_seed_from_yaml", return_value=VALID_SEED_DATA),
+        patch("ouroboros.orchestrator.create_agent_runtime"),
+        patch("ouroboros.orchestrator.runner_factory.OrchestratorRunner", return_value=mock_runner),
+        patch("ouroboros.persistence.event_store.EventStore") as mock_event_store_cls,
+        patch("ouroboros.orchestrator.session.SessionRepository") as mock_repo_cls,
+        patch("ouroboros.cli.commands.run.maybe_restore_task_workspace", return_value=None),
+        patch("ouroboros.cli.commands.run.maybe_prepare_task_workspace", return_value=None),
+    ):
+        mock_event_store_cls.return_value.initialize = AsyncMock()
+        mock_event_store_cls.return_value.replay = AsyncMock(return_value=[])
+        mock_event_store_cls.return_value.query_events = AsyncMock(return_value=[])
+        mock_repo_cls.return_value.reconstruct_session = AsyncMock(return_value=Result.ok(tracker))
+
+        await _run_orchestrator(seed_file, resume_session="sess-lost", no_qa=True)
+
+    mock_runner.resume_session.assert_awaited_once()
+    new_attempt = mock_runner.execute_seed.await_args.kwargs
+    assert new_attempt["session_id"] != "sess-lost"
+    assert new_attempt["execution_id"] != "exec-lost"
+
+
+@pytest.mark.asyncio
+async def test_any_other_resume_failure_still_exits(tmp_path: Path) -> None:
+    from ouroboros.orchestrator.runner import OrchestratorError
+
+    seed_file = tmp_path / "seed.yaml"
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    tracker = SessionTracker.create("exec-x", "test-seed-cli-qa", session_id="sess-x")
+    mock_runner = MagicMock()
+    mock_runner.resume_session = AsyncMock(
+        return_value=Result.err(OrchestratorError(message="terminal", details={}))
+    )
+    mock_runner.execute_seed = AsyncMock()
+
+    with (
+        patch("ouroboros.cli.commands.run._load_seed_from_yaml", return_value=VALID_SEED_DATA),
+        patch("ouroboros.orchestrator.create_agent_runtime"),
+        patch("ouroboros.orchestrator.runner_factory.OrchestratorRunner", return_value=mock_runner),
+        patch("ouroboros.persistence.event_store.EventStore") as mock_event_store_cls,
+        patch("ouroboros.orchestrator.session.SessionRepository") as mock_repo_cls,
+        patch("ouroboros.cli.commands.run.maybe_restore_task_workspace", return_value=None),
+        pytest.raises(typer.Exit),
+    ):
+        mock_event_store_cls.return_value.initialize = AsyncMock()
+        mock_event_store_cls.return_value.replay = AsyncMock(return_value=[])
+        mock_event_store_cls.return_value.query_events = AsyncMock(return_value=[])
+        mock_repo_cls.return_value.reconstruct_session = AsyncMock(return_value=Result.ok(tracker))
+        await _run_orchestrator(seed_file, resume_session="sess-x", no_qa=True)
+
+    mock_runner.execute_seed.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -289,7 +905,7 @@ async def test_run_orchestrator_passes_skip_completed_markers_to_runner(tmp_path
     with (
         patch("ouroboros.cli.commands.run._load_seed_from_yaml", return_value=VALID_SEED_DATA),
         patch("ouroboros.orchestrator.create_agent_runtime"),
-        patch("ouroboros.orchestrator.OrchestratorRunner", return_value=mock_runner),
+        patch("ouroboros.orchestrator.runner_factory.OrchestratorRunner", return_value=mock_runner),
         patch("ouroboros.persistence.event_store.EventStore") as mock_event_store_cls,
         patch(
             "ouroboros.cli.commands.run.build_verification_artifacts",
@@ -320,6 +936,10 @@ async def test_run_orchestrator_uses_seed_relative_project_dir_for_runtime_and_q
     seed_dir.mkdir()
     seed_file = seed_dir / "seed.yaml"
     seed_file.write_text("goal: ignored\n", encoding="utf-8")
+    # The fixture seed declares ``context_references[0].path = "repo-root"``;
+    # after the central-seed cwd fix the resolver requires reference candidates
+    # to exist on disk, so materialize the target directory.
+    (seed_dir / "repo-root").mkdir()
     expected_project_dir = (seed_dir / "repo-root").resolve()
 
     fake_exec = SimpleNamespace(
@@ -341,7 +961,7 @@ async def test_run_orchestrator_uses_seed_relative_project_dir_for_runtime_and_q
             return_value=VALID_SEED_DATA_WITH_RELATIVE_PROJECT,
         ),
         patch("ouroboros.orchestrator.create_agent_runtime") as mock_runtime,
-        patch("ouroboros.orchestrator.OrchestratorRunner", return_value=mock_runner),
+        patch("ouroboros.orchestrator.runner_factory.OrchestratorRunner", return_value=mock_runner),
         patch("ouroboros.persistence.event_store.EventStore") as mock_event_store_cls,
         patch(
             "ouroboros.cli.commands.run.build_verification_artifacts",
@@ -357,12 +977,78 @@ async def test_run_orchestrator_uses_seed_relative_project_dir_for_runtime_and_q
         mock_event_store_cls.return_value.initialize = AsyncMock()
         await _run_orchestrator(seed_file)
 
-    mock_runtime.assert_called_once_with(backend=None, cwd=expected_project_dir)
+    mock_runtime.assert_called_once_with(backend=ANY, model=ANY, cwd=expected_project_dir)
     mock_verification.assert_awaited_once_with(
         "exec-test",
         "Parallel Execution Verification Report",
         expected_project_dir,
     )
+
+
+@pytest.mark.asyncio
+async def test_run_orchestrator_passes_execution_model_to_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI workflow execution honors OUROBOROS_EXECUTION_MODEL runtime pins."""
+    seed_file = tmp_path / "seed.yaml"
+    seed_file.write_text("goal: ignored\n", encoding="utf-8")
+
+    fake_exec = SimpleNamespace(
+        success=True,
+        session_id="sess-test",
+        messages_processed=5,
+        duration_seconds=1.0,
+        execution_id="exec-test",
+        summary={"verification_report": "Parallel Execution Verification Report"},
+        final_message="fallback final message",
+    )
+    mock_runner = MagicMock()
+    mock_runner.execute_seed = AsyncMock(return_value=Result.ok(fake_exec))
+    mock_runner.resume_session = AsyncMock()
+    monkeypatch.setenv("OUROBOROS_PIN_MODELS", "1")
+    monkeypatch.setenv("OUROBOROS_EXECUTION_MODEL", "openai-codex/gpt-5.4-mini")
+
+    with (
+        patch("ouroboros.cli.commands.run._load_seed_from_yaml", return_value=VALID_SEED_DATA),
+        patch("ouroboros.orchestrator.create_agent_runtime") as mock_runtime,
+        patch("ouroboros.orchestrator.runner_factory.OrchestratorRunner", return_value=mock_runner),
+        patch("ouroboros.persistence.event_store.EventStore") as mock_event_store_cls,
+        patch(
+            "ouroboros.cli.commands.run.build_verification_artifacts",
+            new_callable=AsyncMock,
+            return_value=FAKE_VERIFICATION_ARTIFACTS,
+        ),
+        patch(
+            "ouroboros.mcp.tools.qa.QAHandler.handle",
+            new_callable=AsyncMock,
+            return_value=FAKE_QA_RESULT,
+        ),
+    ):
+        mock_event_store_cls.return_value.initialize = AsyncMock()
+        await _run_orchestrator(seed_file, runtime_backend="pi")
+
+    assert mock_runtime.call_args.kwargs["backend"] == "pi"
+    assert mock_runtime.call_args.kwargs["model"] == "openai-codex/gpt-5.4-mini"
+
+
+def test_execution_model_status_marks_fixed_model() -> None:
+    assert _execution_model_status("codex", "terra") == "Execution model: terra (fixed)"
+
+
+def test_execution_model_status_does_not_invent_codex_automatic_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "ouroboros.backends.model_catalog.configured_default_model",
+        lambda _backend: "gpt-configured",
+    )
+
+    status = _execution_model_status("codex", None)
+
+    assert "follows Codex's currently selected model" in status
+    assert "config.toml: gpt-configured" in status
+    assert "not confirmed at runtime" in status
 
 
 @pytest.mark.asyncio
@@ -387,7 +1073,7 @@ async def test_run_orchestrator_falls_back_when_artifact_generation_fails(tmp_pa
     with (
         patch("ouroboros.cli.commands.run._load_seed_from_yaml", return_value=VALID_SEED_DATA),
         patch("ouroboros.orchestrator.create_agent_runtime"),
-        patch("ouroboros.orchestrator.OrchestratorRunner", return_value=mock_runner),
+        patch("ouroboros.orchestrator.runner_factory.OrchestratorRunner", return_value=mock_runner),
         patch("ouroboros.persistence.event_store.EventStore") as mock_event_store_cls,
         patch(
             "ouroboros.cli.commands.run.build_verification_artifacts",
@@ -406,3 +1092,205 @@ async def test_run_orchestrator_falls_back_when_artifact_generation_fails(tmp_pa
     qa_args = mock_qa_handle.call_args.args[0]
     assert qa_args["artifact"] == "Parallel Execution Verification Report"
     assert qa_args["reference"] == "Verification artifact generation failed: boom"
+
+
+# ---------------------------------------------------------------------------
+# Project-root detection (central seed cwd resolution)
+# ---------------------------------------------------------------------------
+
+
+class TestDetectProjectRootFromSeedPath:
+    """Tests for ouroboros.cli.commands.run._detect_project_root_from_seed_path."""
+
+    def test_returns_none_when_candidate_is_home_dir(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Seeds in ~/.ouroboros/seeds/ must not yield home dir as project root (issue #1312)."""
+        from ouroboros.cli.commands.run import _detect_project_root_from_seed_path
+
+        fake_home = tmp_path / "home"
+        global_seeds = fake_home / ".ouroboros" / "seeds" / "myfeat"
+        global_seeds.mkdir(parents=True)
+        seed_file = global_seeds / "seed.yaml"
+        seed_file.write_text("goal: x")
+
+        with patch.object(Path, "home", return_value=fake_home):
+            result = _detect_project_root_from_seed_path(seed_file)
+
+        assert result is None
+
+    def test_returns_root_when_seed_lives_under_dot_ouroboros_seeds(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Central seeds at ``<root>/.ouroboros/seeds/seed.yaml`` resolve to ``<root>``."""
+        from ouroboros.cli.commands.run import _detect_project_root_from_seed_path
+
+        root = tmp_path / "project"
+        seeds_dir = root / ".ouroboros" / "seeds"
+        seeds_dir.mkdir(parents=True)
+        seed_file = seeds_dir / "seed.yaml"
+        seed_file.write_text("goal: x")
+
+        assert _detect_project_root_from_seed_path(seed_file) == root.resolve()
+
+    def test_returns_none_when_no_marker_found(self, tmp_path: Path) -> None:
+        from ouroboros.cli.commands.run import _detect_project_root_from_seed_path
+
+        seed_file = tmp_path / "seed.yaml"
+        seed_file.write_text("goal: x")
+
+        assert _detect_project_root_from_seed_path(seed_file) is None
+
+    def test_respects_max_levels_bound(self, tmp_path: Path) -> None:
+        """The walk is bounded so deeply nested seeds without a marker terminate."""
+        from ouroboros.cli.commands.run import _detect_project_root_from_seed_path
+
+        deep = tmp_path
+        for level in range(8):
+            deep = deep / f"l{level}"
+        deep.mkdir(parents=True)
+        seed_file = deep / "seed.yaml"
+        seed_file.write_text("goal: x")
+
+        # marker only at tmp_path (9 levels up); max_levels=6 must give up
+        (tmp_path / ".ouroboros").mkdir()
+        assert _detect_project_root_from_seed_path(seed_file, max_levels=6) is None
+
+    def test_finds_marker_within_bound(self, tmp_path: Path) -> None:
+        from ouroboros.cli.commands.run import _detect_project_root_from_seed_path
+
+        root = tmp_path / "p"
+        (root / ".ouroboros").mkdir(parents=True)
+        nested = root / ".ouroboros" / "seeds" / "extra"
+        nested.mkdir(parents=True)
+        seed_file = nested / "seed.yaml"
+        seed_file.write_text("goal: x")
+
+        assert _detect_project_root_from_seed_path(seed_file) == root.resolve()
+
+
+class TestResolveCliProjectDirForCentralSeed:
+    """End-to-end: central seed with only context_references must not yield a file cwd."""
+
+    def test_central_seed_with_reference_only_returns_project_root(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Reproduces #978/#920 observation blocker on fresh worktree.
+
+        Seed lives at ``<root>/.ouroboros/seeds/seed.yaml`` and declares a
+        primary brownfield reference pointing at a file that does **not**
+        exist relative to the seed's parent. Pre-fix this returned
+        ``<root>/.ouroboros/seeds/<reference.path>`` — a non-existent
+        join — as the runtime cwd. Post-fix the resolver:
+
+        1. detects the project root via the ``.ouroboros/`` marker so the
+           stable_base is ``<root>``, not ``<root>/.ouroboros/seeds``;
+        2. when the reference still does not resolve to an existing path
+           under that root, falls through to the detected root instead of
+           returning a synthetic join.
+        """
+        root = tmp_path / "project"
+        (root / ".ouroboros" / "seeds").mkdir(parents=True)
+        # Intentionally do NOT create the events.py reference target —
+        # this is the regression case where the resolver previously
+        # synthesized a non-existent file path as runtime cwd.
+
+        seed_file = root / ".ouroboros" / "seeds" / "seed_central.yaml"
+        seed_file.write_text("goal: dummy")
+
+        seed = SimpleNamespace(
+            metadata=None,
+            brownfield_context=SimpleNamespace(
+                context_references=[
+                    SimpleNamespace(path="src/ouroboros/events.py", role="primary"),
+                ],
+            ),
+        )
+
+        resolved = _resolve_cli_project_dir(seed, seed_file, seed_data={})
+
+        assert resolved == root.resolve()
+        # Hard regression guard: never return a path under .ouroboros/seeds/.
+        assert ".ouroboros/seeds" not in str(resolved)
+
+    def test_central_seed_with_existing_file_reference_returns_project_root(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Existing file references must not pull cwd into a subdirectory.
+
+        Pre-fix the resolver accepted any existing ``context_references[].path``
+        and let ``_directory_for_runtime`` collapse it to its parent. For a
+        central seed at ``<root>/.ouroboros/seeds/seed.yaml`` with a reference
+        to ``src/ouroboros/core/project_paths.py`` this returned
+        ``<root>/src/ouroboros/core`` as runtime cwd, so the task workspace,
+        agent execution, and post-run verification all ran from the wrong
+        directory. Post-fix the detected project root wins over heuristic
+        file-reference collapse for central seeds.
+        """
+        root = tmp_path / "project"
+        seeds_dir = root / ".ouroboros" / "seeds"
+        seeds_dir.mkdir(parents=True)
+        # Create the existing file the reference points at — this is the
+        # boundary the previous behavior mis-handled.
+        source_file = root / "src" / "ouroboros" / "core" / "project_paths.py"
+        source_file.parent.mkdir(parents=True)
+        source_file.write_text("# stub\n", encoding="utf-8")
+
+        seed_file = seeds_dir / "seed_central.yaml"
+        seed_file.write_text("goal: dummy")
+
+        seed = SimpleNamespace(
+            metadata=None,
+            brownfield_context=SimpleNamespace(
+                context_references=[
+                    SimpleNamespace(
+                        path="src/ouroboros/core/project_paths.py",
+                        role="primary",
+                    ),
+                ],
+            ),
+        )
+
+        resolved = _resolve_cli_project_dir(seed, seed_file, seed_data={})
+
+        assert resolved == root.resolve()
+        # Hard regression guard: cwd must never collapse into a file's parent
+        # when the detected project root is available.
+        assert resolved != source_file.parent.resolve()
+
+
+class TestResolveCliProjectDirForNonCentralSeed:
+    """Non-central seeds must not adopt project-root detection from an unrelated ``.ouroboros/``."""
+
+    def test_example_seed_under_project_with_dot_ouroboros_uses_seed_parent(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A seed under ``examples/`` must resolve next to itself, not at repo root.
+
+        Without this scoping, any seed living inside a project tree whose root
+        contains ``.ouroboros/`` (e.g. running ``ooo run examples/dummy_seed.yaml``
+        from inside the Ouroboros repo) would have its runtime cwd silently
+        rewritten to the repository root. That would make example/local seeds
+        create or verify files at the wrong location.
+        """
+        from ouroboros.cli.commands.run import _resolve_cli_project_dir
+
+        repo_root = tmp_path / "repo"
+        # Marker dir exists, but seed does not live under .ouroboros/seeds/.
+        (repo_root / ".ouroboros").mkdir(parents=True)
+        examples_dir = repo_root / "examples"
+        examples_dir.mkdir()
+        seed_file = examples_dir / "dummy_seed.yaml"
+        seed_file.write_text("goal: dummy")
+
+        seed = SimpleNamespace(metadata=None, brownfield_context=None)
+
+        resolved = _resolve_cli_project_dir(seed, seed_file, seed_data={})
+
+        assert resolved == examples_dir.resolve()
+        assert resolved != repo_root.resolve()

@@ -441,7 +441,9 @@ class InputValidator:
 
     # Fields that carry freetext content (code, prompts, descriptions).
     # These are exempt from shell-metacharacter checks because no
-    # Ouroboros tool ever passes them to a shell.
+    # Ouroboros tool ever passes them to a shell. ``user_preferences``
+    # carries operator-supplied freetext per ledger section (see
+    # ``answerer.py``) and likewise never reaches a shell.
     FREETEXT_FIELDS: set[str] = {
         "artifact",
         "quality_bar",
@@ -449,16 +451,35 @@ class InputValidator:
         "seed_content",
         "current_output",
         "prompt",
+        "goal",
         "initial_context",
+        # Lane findings quote source, and source contains ``;``. They arrive
+        # here — a confirmed ``[from-code]`` finding is sent as the answer, on
+        # the one entrance every answer uses. A second field for the same
+        # payload was tried and removed; the exemption did not have to move with
+        # it, because it never left ``answer``.
         "answer",
+        # The question the answer belongs to, echoed back so the round is filed
+        # under it. A PM question quotes the code it is about, so it carries the
+        # same terms an answer does.
+        "last_question",
         "current_approach",
         "problem_context",
         "acceptance_criterion",
+        # The interview-less seed path (RFC D6) takes the session's settled
+        # goal / acceptance_criteria / constraints / decisions as one object.
+        # Every leaf is verbatim prose that lands in the Seed YAML -- the same
+        # bytes ``seed_content`` later carries back in, already exempt. A
+        # verifiable AC is very often a shell chain (``ruff check && pytest``),
+        # so scanning it here rejected the exact input the tool asks for while
+        # protecting nothing: no leaf of ``session_context`` reaches a shell.
+        "session_context",
         "message",
         "content",
         "desc",
         "entry",
         "reason",
+        "user_preferences",
     }
 
     def __init__(self) -> None:
@@ -508,21 +529,86 @@ class InputValidator:
         path_traversal_patterns = ["../", "..\\"]
         shell_metacharacters = [";", "|", "&&", "||"]
 
-        def _collect_strings(obj: Any, prefix: str = "") -> list[tuple[str, str]]:
+        def _collect_strings(
+            obj: Any,
+            prefix: str = "",
+            path: tuple[str | int, ...] = (),
+        ) -> list[tuple[str, str, tuple[str | int, ...]]]:
             """Recursively collect all string values with their key paths."""
-            pairs: list[tuple[str, str]] = []
+            pairs: list[tuple[str, str, tuple[str | int, ...]]] = []
             if isinstance(obj, str):
-                pairs.append((prefix, obj))
+                pairs.append((prefix, obj, path))
             elif isinstance(obj, dict):
                 for k, v in obj.items():
                     child_key = f"{prefix}.{k}" if prefix else k
-                    pairs.extend(_collect_strings(v, child_key))
+                    pairs.extend(_collect_strings(v, child_key, (*path, str(k))))
             elif isinstance(obj, (list, tuple)):
                 for i, v in enumerate(obj):
-                    pairs.extend(_collect_strings(v, f"{prefix}[{i}]"))
+                    pairs.extend(_collect_strings(v, f"{prefix}[{i}]", (*path, i)))
             return pairs
 
-        for key, value in _collect_strings(arguments):
+        def _is_freetext(key: str) -> bool:
+            """Whether this value is prose the server stores, never a thing it runs.
+
+            Matched on every segment of the path, not only the first. A freetext
+            field is freetext wherever it sits, and the fan-out submission puts
+            one inside a container: ``results[0].content`` carries a subagent's
+            finding, and judging by the root alone rejected it under the
+            container's name.
+            """
+            return bool(
+                self.FREETEXT_FIELDS.intersection(
+                    segment.split("[")[0] for segment in key.split(".")
+                )
+            )
+
+        def _is_tool_prose(path: tuple[str | int, ...]) -> bool:
+            """Exempt only the two tools' prose leaves, not their containers.
+
+            These values become lateral prompts or reference context. Structured
+            paths distinguish list indices from lookalike dictionary keys while
+            keeping reference IDs, URLs, and other siblings subject to scanning.
+            """
+            if tool_name == "ouroboros_lateral_think":
+                return len(path) == 2 and path[0] == "failed_attempts" and isinstance(path[1], int)
+            if tool_name == "ouroboros_interview":
+                return (
+                    len(path) == 3
+                    and path[0] == "references"
+                    and isinstance(path[1], int)
+                    and path[2] == "excerpt"
+                )
+            return False
+
+        for key, value, path in _collect_strings(arguments):
+            # The lexical scan below asks whether a value could be executed or
+            # could steer something that executes. For a freetext field the
+            # answer is no by construction: it is recorded and rendered back to
+            # a person, and no path takes it anywhere else. So the scan does not
+            # apply to it, and this is where that is decided — once, ahead of
+            # every check.
+            #
+            # It used to be decided at the last of the three, which made the
+            # exemption half true. Lane findings describe code, so they say
+            # ``subprocess``, ``open(`` and ``eval(`` the way any faithful
+            # description of code does; those went to ``dangerous_patterns``,
+            # which never consulted the exemption, and were rejected. The way
+            # through was to reword the finding — leaving the record saying
+            # something the lane never said, which is the exact harm the
+            # exemption was added to prevent, reached one check earlier.
+            #
+            # The repair is the boundary, not the wordlist. Adding terms to the
+            # exempt list would not have closed this (``dangerous_patterns``
+            # does not read that list), and removing terms from the patterns
+            # would strip the defence from fields that *are* executable. What is
+            # scoped is the question itself: fields that can reach execution or
+            # control are scanned, and evidence text is not one of them. The PM
+            # citation path, which does steer where a reader looks, is closed by
+            # its own contract instead — a pattern on the schema, checked at
+            # re-entry, where a value that must be structured can be required to
+            # be structured.
+            if _is_freetext(key) or _is_tool_prose(path):
+                continue
             for pattern in dangerous_patterns:
                 if pattern in value:
                     return Result.err(
@@ -539,18 +625,14 @@ class InputValidator:
                             details={"pattern": pattern},
                         )
                     )
-            # Skip shell-metachar check for known freetext fields —
-            # they carry code/prompts, never shell commands.
-            root_field = key.split(".")[0].split("[")[0]
-            if root_field not in self.FREETEXT_FIELDS:
-                for char in shell_metacharacters:
-                    if char in value:
-                        return Result.err(
-                            MCPServerError(
-                                f"Shell metacharacter detected in {key}",
-                                details={"pattern": char},
-                            )
+            for char in shell_metacharacters:
+                if char in value:
+                    return Result.err(
+                        MCPServerError(
+                            f"Shell metacharacter detected in {key}",
+                            details={"pattern": char},
                         )
+                    )
 
         # Run custom validator if registered
         if tool_name in self._validators:
@@ -589,6 +671,16 @@ class SecurityLayer:
                 self.rate_limit_config.burst_size,
             )
 
+    @property
+    def authenticator(self) -> Authenticator:
+        """Return the credential authority backing this layer.
+
+        Exposed so a transport that authenticates at its own edge (the MCP
+        SDK's HTTP boundary) can verify against the same credentials this
+        layer would, instead of maintaining a second set.
+        """
+        return self._authenticator
+
     def register_tool_permission(self, permission: ToolPermission) -> None:
         """Register permission requirements for a tool."""
         self._authorizer.register_tool_permission(permission)
@@ -606,6 +698,7 @@ class SecurityLayer:
         tool_name: str,
         arguments: dict[str, Any],
         credentials: dict[str, str] | None = None,
+        pre_authenticated: AuthContext | None = None,
     ) -> Result[AuthContext, MCPServerError]:
         """Check if a request passes all security checks.
 
@@ -613,16 +706,24 @@ class SecurityLayer:
             tool_name: Name of the tool being called.
             arguments: Arguments for the tool.
             credentials: Client credentials.
+            pre_authenticated: Context established by a transport that already
+                verified the caller's credentials against this layer's own
+                authenticator. When given, step 1 is skipped -- the credential
+                itself is gone by this point, so re-running it would fail a
+                request that was in fact authenticated.
 
         Returns:
             Result containing auth context or security error.
         """
         # 1. Authenticate
-        auth_result = self._authenticator.authenticate(credentials)
-        if auth_result.is_err:
-            return Result.err(auth_result.error)
+        if pre_authenticated is not None:
+            auth_context = pre_authenticated
+        else:
+            auth_result = self._authenticator.authenticate(credentials)
+            if auth_result.is_err:
+                return Result.err(auth_result.error)
 
-        auth_context = auth_result.value
+            auth_context = auth_result.value
 
         # 2. Rate limit (if enabled)
         if (

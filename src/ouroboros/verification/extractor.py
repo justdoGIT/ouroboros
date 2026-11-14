@@ -13,9 +13,15 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 import json
 import logging
+import re
 
-from ouroboros.config import get_assertion_extraction_model
+from pydantic import ValidationError
+
+from ouroboros.config import get_llm_backend_for_role, get_llm_model_for_role
+from ouroboros.core.json_utils import extract_json_payload
+from ouroboros.core.seed import AcceptanceCriterionInput, ac_texts
 from ouroboros.core.types import Result
+from ouroboros.evolution.provider_usage import tracked_complete
 from ouroboros.providers.base import (
     CompletionConfig,
     LLMAdapter,
@@ -25,6 +31,8 @@ from ouroboros.providers.base import (
 from ouroboros.verification.models import SpecAssertion, VerificationTier
 
 logger = logging.getLogger(__name__)
+
+MAX_PATTERN_LENGTH = 200
 
 _SYSTEM_PROMPT = """You are a spec verification assistant. Given acceptance criteria for a software project, extract machine-verifiable assertions.
 
@@ -42,6 +50,7 @@ Respond with a JSON array. Each element:
 {
     "ac_index": 0,
     "tier": "t1_constant",
+    "evidence_scope": "source",
     "pattern": "WARMUP_FRAMES\\s*=\\s*",
     "expected_value": "10",
     "file_hint": "*.py",
@@ -49,6 +58,7 @@ Respond with a JSON array. Each element:
 }
 
 Rules:
+- evidence_scope: "source" for facts about source/configuration; "execution" for observations of a run, test result, measurement, or terminal/report record. A numeric runtime result is execution evidence even when it can be expressed as a regex. Source scanning cannot establish these observations; they require executed checks or semantic analysis. Never classify a required source/configuration value as execution merely because a worker claims it passed.
 - pattern: A regex pattern to search for in source files. For t1, include the variable/constant name. For t2, use file or class name pattern.
 - expected_value: The expected value for t1 (the actual number/string). For t2, the expected name. Empty for t3/t4.
 - file_hint: Glob pattern for files to search (e.g., "*.py", "src/**/*.ts", "config.*"). Empty if unknown.
@@ -68,16 +78,24 @@ class AssertionExtractor:
     """
 
     llm_adapter: LLMAdapter
-    model: str = field(default_factory=get_assertion_extraction_model)
+    model: str | None = None
+    model_is_explicit: bool = field(default=False, init=False)
     max_cache_size: int = 64
     _cache: OrderedDict[str, tuple[SpecAssertion, ...]] = field(
         default_factory=OrderedDict, repr=False
     )
 
+    def __post_init__(self) -> None:
+        """Resolve implicit default model while preserving explicit caller pins."""
+        self.model_is_explicit = self.model is not None
+        if self.model is None:
+            backend = get_llm_backend_for_role("assertion_extraction")
+            self.model = get_llm_model_for_role("assertion_extraction", backend=backend)
+
     async def extract(
         self,
         seed_id: str,
-        acceptance_criteria: tuple[str, ...] | list[str],
+        acceptance_criteria: tuple[AcceptanceCriterionInput, ...] | list[AcceptanceCriterionInput],
     ) -> Result[tuple[SpecAssertion, ...], str]:
         """Extract assertions from ACs.
 
@@ -92,11 +110,12 @@ class AssertionExtractor:
             logger.debug("AssertionExtractor cache hit: %s", seed_id)
             return Result.ok(self._cache[seed_id])
 
-        if not acceptance_criteria:
+        acceptance_texts = ac_texts(acceptance_criteria)
+        if not acceptance_texts:
             return Result.ok(())
 
         prompt = "Extract verifiable assertions from these acceptance criteria:\n\n"
-        for i, ac in enumerate(acceptance_criteria):
+        for i, ac in enumerate(acceptance_texts):
             prompt += f"AC {i} (index {i}): {ac}\n"
 
         messages = [
@@ -104,18 +123,34 @@ class AssertionExtractor:
             Message(role=MessageRole.USER, content=prompt),
         ]
 
+        assert self.model is not None
         config = CompletionConfig(
             model=self.model,
+            role="assertion_extraction",
+            model_is_explicit=self.model_is_explicit,
             temperature=0.0,
             max_tokens=4096,
         )
 
-        result = await self.llm_adapter.complete(messages, config)
+        result = await tracked_complete(self.llm_adapter, messages, config)
         if result.is_err:
             logger.warning("AssertionExtractor LLM failed: %s", result.error)
             return Result.err(f"Extraction failed: {result.error}")
 
-        assertions = self._parse_response(result.value.content, acceptance_criteria)
+        assertions = self._parse_response(result.value.content, acceptance_texts)
+        if assertions is None:
+            # The response could not be read at all, which is not an answer
+            # about this seed — it is the absence of one. Remembering it would
+            # answer every later generation from a reply nobody understood, and
+            # the caller cannot tell that empty apart from "nothing here needs
+            # verifying", so spec verification would stay skipped for the life
+            # of the seed. The transport-failure path above already retries;
+            # this one now does too.
+            logger.warning("AssertionExtractor response unreadable, not caching: %s", seed_id)
+            return Result.err(
+                "Extraction response was unreadable or contained a rejected assertion"
+            )
+
         self._cache[seed_id] = assertions
         # LRU eviction: remove oldest entry if cache exceeds max size
         while len(self._cache) > self.max_cache_size:
@@ -125,43 +160,148 @@ class AssertionExtractor:
     def _parse_response(
         self,
         content: str,
-        acceptance_criteria: tuple[str, ...] | list[str],
-    ) -> tuple[SpecAssertion, ...]:
-        """Parse LLM response into SpecAssertions."""
-        try:
-            cleaned = content.strip()
-            if cleaned.startswith("```"):
-                lines = cleaned.split("\n")
-                cleaned = "\n".join(lines[1:-1])
+        acceptance_criteria: tuple[str, ...],
+    ) -> tuple[SpecAssertion, ...] | None:
+        """Parse LLM response into SpecAssertions.
 
-            data = json.loads(cleaned)
+        Returns ``None`` when the response could not be read as an extraction:
+        no JSON payload, malformed JSON, a payload that is not the expected
+        array, or an array containing any rejected assertion. Extraction is
+        atomic: accepting only the valid subset would erase offered evidence
+        and could let the surviving subset manufacture a formal PASS.
+
+        An empty tuple means the opposite — the array was read and was empty,
+        the model saying there is nothing here to verify. That is an answer,
+        and the caller is right to remember it.
+        """
+        try:
+            # Extract the JSON payload, tolerating markdown fences and prose
+            # that surround it (e.g. Gemini-style ``Here is ...`` prefixes).
+            json_str = extract_json_payload(content)
+            if json_str is None:
+                raise ValueError("No valid JSON payload found")
+            data = json.loads(json_str)
             if not isinstance(data, list):
                 logger.warning("Expected JSON array, got: %s", type(data))
-                return ()
+                return None
 
             assertions: list[SpecAssertion] = []
+            response_rejected = False
             for item in data:
-                ac_idx = item.get("ac_index", 0)
-                ac_text = acceptance_criteria[ac_idx] if ac_idx < len(acceptance_criteria) else ""
+                if not isinstance(item, dict):
+                    logger.warning("Expected assertion object, got: %s", type(item))
+                    response_rejected = True
+                    continue
+                if "ac_index" not in item:
+                    logger.warning("Ignoring assertion without explicit ac_index: %r", item)
+                    response_rejected = True
+                    continue
+                ac_idx = item["ac_index"]
+                if (
+                    not isinstance(ac_idx, int)
+                    or isinstance(ac_idx, bool)
+                    or ac_idx < 0
+                    or ac_idx >= len(acceptance_criteria)
+                ):
+                    logger.warning("Ignoring assertion with invalid ac_index: %r", ac_idx)
+                    response_rejected = True
+                    continue
+                ac_text = acceptance_criteria[ac_idx]
+                if "tier" not in item:
+                    logger.warning("Ignoring assertion without explicit tier: %r", item)
+                    response_rejected = True
+                    continue
+                raw_tier = item["tier"]
                 try:
-                    tier = VerificationTier(item.get("tier", "t4_unverifiable"))
-                except ValueError:
-                    tier = VerificationTier.T4_UNVERIFIABLE
-
-                assertions.append(
-                    SpecAssertion(
-                        ac_index=ac_idx,
-                        ac_text=ac_text,
-                        tier=tier,
-                        pattern=item.get("pattern", ""),
-                        expected_value=item.get("expected_value", ""),
-                        file_hint=item.get("file_hint", ""),
-                        description=item.get("description", ""),
+                    tier = VerificationTier(raw_tier)
+                except (TypeError, ValueError):
+                    logger.warning("Ignoring assertion with invalid tier: %r", raw_tier)
+                    response_rejected = True
+                    continue
+                text_fields = {
+                    name: item.get(name, "")
+                    for name in ("pattern", "expected_value", "file_hint", "description")
+                }
+                if not all(isinstance(value, str) for value in text_fields.values()):
+                    logger.warning("Ignoring assertion with invalid text fields: %r", item)
+                    response_rejected = True
+                    continue
+                if (
+                    tier
+                    in (
+                        VerificationTier.T1_CONSTANT,
+                        VerificationTier.T2_STRUCTURAL,
                     )
-                )
+                    and not text_fields["pattern"].strip()
+                ):
+                    logger.warning(
+                        "Ignoring %s assertion without verification pattern: %r",
+                        tier.value,
+                        item,
+                    )
+                    response_rejected = True
+                    continue
+                if tier in (
+                    VerificationTier.T1_CONSTANT,
+                    VerificationTier.T2_STRUCTURAL,
+                ) and not _is_usable_regex_pattern(text_fields["pattern"]):
+                    logger.warning(
+                        "Ignoring %s assertion with unusable verification pattern: %r",
+                        tier.value,
+                        item,
+                    )
+                    response_rejected = True
+                    continue
+                if (
+                    tier is VerificationTier.T1_CONSTANT
+                    and not text_fields["expected_value"].strip()
+                ):
+                    logger.warning(
+                        "Ignoring t1_constant assertion without expected_value: %r",
+                        item,
+                    )
+                    response_rejected = True
+                    continue
+
+                try:
+                    assertions.append(
+                        SpecAssertion(
+                            ac_index=ac_idx,
+                            ac_text=ac_text,
+                            tier=tier,
+                            pattern=text_fields["pattern"],
+                            expected_value=text_fields["expected_value"],
+                            file_hint=text_fields["file_hint"],
+                            description=text_fields["description"],
+                            evidence_scope=item.get("evidence_scope", "source"),
+                        )
+                    )
+                except ValidationError as e:
+                    logger.warning("Ignoring invalid assertion object: %s", e)
+                    response_rejected = True
+                    continue
+
+            if response_rejected:
+                # The model offered evidence that did not survive validation.
+                # Returning the surviving subset would make that loss invisible
+                # to coverage checks, especially when both entries belong to
+                # the same AC. Keep the whole response retryable instead.
+                logger.warning("Extraction response contained a rejected assertion")
+                return None
 
             return tuple(assertions)
 
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
+        except (ValueError, KeyError, TypeError, ValidationError) as e:
             logger.warning("Failed to parse extraction response: %s", e)
-            return ()
+            return None
+
+
+def _is_usable_regex_pattern(pattern: str) -> bool:
+    """Return whether a verifier regex can be compiled within verifier limits."""
+    if len(pattern) > MAX_PATTERN_LENGTH:
+        return False
+    try:
+        re.compile(pattern)
+    except (re.error, OverflowError):
+        return False
+    return True

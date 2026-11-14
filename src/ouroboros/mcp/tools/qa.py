@@ -10,22 +10,30 @@ https://github.com/Yeachan-Heo/oh-my-codex/commit/6fd5471
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
+import math
 import re
-from typing import Any
+from typing import Any, cast
 import uuid
 
 import structlog
 
-from ouroboros.config import get_qa_model
+from ouroboros.backends import backend_supports_tool_envelope
+from ouroboros.config import get_llm_backend_for_role, get_llm_model_for_role
+from ouroboros.core.json_utils import (
+    _bracket_extract,
+    _extract_fenced_json_payload,
+    _FenceScanState,
+    _non_answer_ranges,
+)
 from ouroboros.core.types import Result
 from ouroboros.evaluation.json_utils import extract_json_payload
 from ouroboros.mcp.errors import MCPServerError, MCPToolError
 from ouroboros.mcp.tools.subagent import (
+    DELEGATED_TO_SUBAGENT,
     build_qa_subagent,
-    build_subagent_result,
-    emit_subagent_dispatched_event,
+    dispatch_plugin_terminal,
     should_dispatch_via_plugin,
 )
 from ouroboros.mcp.types import (
@@ -37,7 +45,7 @@ from ouroboros.mcp.types import (
     ToolInputType,
 )
 from ouroboros.persistence.event_store import EventStore
-from ouroboros.providers import create_llm_adapter
+from ouroboros.providers import create_llm_adapter, resolve_llm_backend
 from ouroboros.providers.base import LLMAdapter
 
 log = structlog.get_logger(__name__)
@@ -78,7 +86,6 @@ QA_VERDICT_SCHEMA: dict[str, object] = {
 }
 
 VALID_ARTIFACT_TYPES = ("code", "api_response", "document", "screenshot", "test_output", "custom")
-VALID_VERDICTS = ("pass", "revise", "fail")
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +149,10 @@ def _build_qa_user_prompt(
 ```
 """
 
+    from ouroboros.evaluation.adversarial import render_adversarial_section
+
+    adversarial_section = "\n" + render_adversarial_section(artifact_type)
+
     return f"""## Quality Bar
 {quality_bar}
 
@@ -155,33 +166,69 @@ def _build_qa_user_prompt(
 ```
 {artifact}
 ```
-{reference_section}{history_section}{seed_section}
+{reference_section}{history_section}{seed_section}{adversarial_section}
 Provide your evaluation as a JSON object."""
 
 
-def _unwrap_verdict_data(data: dict[str, Any]) -> dict[str, Any]:
-    """Unwrap nested verdict objects.
+_VERDICT_WRAPPER_KEYS = ("qa_verdict", "verdict", "result", "evaluation")
+_VERDICT_FIELDS = frozenset(cast(dict[str, object], QA_VERDICT_SCHEMA["properties"]))
 
-    LLMs sometimes wrap the verdict in a key like ``{"qa_verdict": {...}}``.
-    This function detects that pattern and returns the inner dict.
+
+def _unwrap_verdict_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Unwrap a pure envelope such as ``{"qa_verdict": {...}}``.
+
+    Only an outer object that is nothing but the envelope is unwrapped: exactly
+    one named wrapper key holds a dict carrying ``score``, no other key is a
+    verdict-schema field, and no other value is an object carrying one. An outer
+    object that carries its own verdict fields (``verdict``, ``reasoning``,
+    ``differences``, ...) *is* the verdict, missing its score — promoting a nested
+    object's score over it would discard the model's own verdict, so it is
+    returned unchanged and fails validation. A second object carrying verdict
+    fields (``{"qa_verdict": {"verdict": "fail"}, "result": {"score": 0.95}}``)
+    is a competing verdict, not envelope metadata, so it blocks unwrapping too.
     """
     if "score" in data:
         return data
-    # Check for single-key wrapper containing the score field
-    for key in ("qa_verdict", "verdict", "result", "evaluation"):
-        if key in data and isinstance(data[key], dict) and "score" in data[key]:
-            return data[key]
-    # Fallback: if there's exactly one dict-valued key containing 'score', use it
-    dict_values = [(k, v) for k, v in data.items() if isinstance(v, dict) and "score" in v]
-    if len(dict_values) == 1:
-        return dict_values[0][1]
-    return data
+    wrappers = [
+        key
+        for key in _VERDICT_WRAPPER_KEYS
+        if isinstance(data.get(key), dict) and "score" in data[key]
+    ]
+    if len(wrappers) != 1:
+        return data
+    for key, value in data.items():
+        if key == wrappers[0]:
+            continue
+        if key in _VERDICT_FIELDS:
+            return data
+        if isinstance(value, dict) and any(field in _VERDICT_FIELDS for field in value):
+            return data
+    inner: dict[str, Any] = data[wrappers[0]]
+    return inner
+
+
+def _is_finite_number(value: object) -> bool:
+    """True for a finite int/float; a JSON boolean is not a number here."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 _LINE_DECORATION_RE = re.compile(r"^\s*(?:[-*]\s+|\d+[.)]\s+)")
 _BOLD_RE = re.compile(r"\*{1,2}([^*]+)\*{1,2}")
 _KV_RE = re.compile(r"(?im)^(\w[\w ]*?)[ \t]*[:=\-][ \t]*(.+)$")
-_SCORE_FALLBACK_RE = re.compile(r"(?im)\bscore\b[ \t]*(?:is|-)[ \t]*([0-9]*\.?[0-9]+)")
+# Unicode whitespace is allowed within a line, but never cross a line break.
+_HSPACE = r"[^\S\r\n\v\f\x85\u2028\u2029]"
+_SCORE_FIELD_RE = re.compile(rf"(?im)^{_HSPACE}*score{_HSPACE}*[:=\-]{_HSPACE}*([^\r\n]*)$")
+_SCORE_FALLBACK_RE = re.compile(rf"(?im)\bscore\b{_HSPACE}*(?:is\b|-){_HSPACE}*([^\r\n]*)")
+_PLAIN_SCORE_RE = re.compile(
+    r"\s*([0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?)\s*"
+    r"(?:/\s*1(?:\.0+)?\s*)?(?:\[(?:pass|revise|fail)\]\s*)?",
+    re.IGNORECASE,
+)
 
 
 def _strip_line_decorations(text: str) -> str:
@@ -213,13 +260,20 @@ def _parse_non_json_qa_response(response_text: str) -> dict[str, Any] | None:
     cleaned = _strip_line_decorations(response_text)
     fields = _extract_kv_fields(cleaned)
 
-    raw_score = fields.get("score")
-    if raw_score:
-        score_num = re.match(r"([0-9]*\.?[0-9]+)", raw_score)
-    else:
-        # Fallback: "score is 0.85" / "score - 0.85" (word-bounded, not in KV)
-        score_num = _SCORE_FALLBACK_RE.search(cleaned)
-
+    # Multiple score statements have no authoritative winner. In particular,
+    # retaining only the first key can turn a later correction into a pass.
+    key_matches = list(_SCORE_FIELD_RE.finditer(cleaned))
+    score_values = [m.group(1).strip() for m in key_matches]
+    for match in _SCORE_FALLBACK_RE.finditer(cleaned):
+        # ``Score - 0.85`` is also a key/value match, not a second statement.
+        if not any(m.start() <= match.start() < m.end() for m in key_matches):
+            score_values.append(match.group(1).strip())
+    if len(score_values) != 1:
+        return None
+    raw_score = score_values[0]
+    # Consume the complete score expression: accepting a numeric prefix turns
+    # 0.9e-2 or 0.9/10 into a false passing score of 0.9.
+    score_num = _PLAIN_SCORE_RE.fullmatch(raw_score) if raw_score else None
     if not score_num:
         return None
     try:
@@ -271,6 +325,135 @@ def _parse_non_json_qa_response(response_text: str) -> dict[str, Any] | None:
     }
 
 
+# These are complete prose candidates, not exemptions for opener fragments.
+_PROSE_LIST_NUMBER = r"-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?"
+_NUMERIC_PROSE_LIST_RE = re.compile(
+    rf"\[\s*{_PROSE_LIST_NUMBER}(?:\s*,\s*{_PROSE_LIST_NUMBER})*"
+    rf"(?:\s*,\s*|\s+)(?:and|or)\s+{_PROSE_LIST_NUMBER}\s*\]",
+    re.IGNORECASE,
+)
+# Detection only: a whole numeric atom supplies intent, never a decoded value.
+_NUMERIC_ATOM_RE = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d*)*")
+_NUMERIC_REFERENCE_RE = re.compile(r"\d+(?:[-./]\d+){2,}")
+
+
+def _explicit_correction(text: str, start: int, end: int) -> bool:
+    """A standalone labeled candidate declares answer intent, not descriptive prose."""
+    line_start = text.rfind("\n", 0, start) + 1
+    line_end = text.find("\n", end)
+    if line_end == -1:
+        line_end = len(text)
+    return text[line_start:start].strip().casefold() == "correction:" and not text[
+        end:line_end
+    ].strip(" ]}.,\t")
+
+
+def _is_attempted_answer(candidate: str, *, explicit: bool) -> bool:
+    """Classify one opaque boundary; never repair it or inspect nested fragments."""
+    try:
+        json.loads(candidate)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    else:
+        return True
+
+    contents = candidate[1:-1].strip()
+    if candidate[0] == "{":
+        if explicit or ":" in contents or contents.startswith(('"', "'")):
+            return True
+        # A known QA field followed by a value is still a QA mapping attempt
+        # when its colon is missing. A field name mentioned in prose is not.
+        fields = contents.split(None, 1)
+        return (
+            len(fields) == 2
+            and fields[0] in cast(dict[str, object], QA_VERDICT_SCHEMA["properties"])
+            and bool(fields[1])
+            and (fields[1][0].isalnum() or fields[1][0] in "\"'[{+-.")
+        )
+
+    if _NUMERIC_PROSE_LIST_RE.fullmatch(candidate):
+        return False
+    if not contents:
+        return False
+    if any(char in contents for char in "{}[]"):
+        return True
+    if contents[0] in "\"'":
+        return True
+    for literal in ("true", "false", "null"):
+        if not contents.startswith(literal):
+            continue
+        suffix = contents[len(literal) :]
+        if suffix and suffix[0].isalnum():
+            continue
+        if explicit or not suffix or not suffix[0].isspace():
+            return True
+        remainder = suffix.lstrip()
+        if not remainder or not remainder[0].isalpha():
+            return True
+        # A literal used before language is prose, not a JSON value list.
+        # Another scalar (including NaN/Infinity), a number or quoted value
+        # still establishes attempted array syntax. Decode only for evidence;
+        # never promote or repair any part of this malformed candidate.
+        try:
+            _, end = json.JSONDecoder().raw_decode(remainder)
+        except json.JSONDecodeError:
+            return False
+        return end == len(remainder) or not (remainder[end].isalnum() or remainder[end] == "_")
+    first_atom = re.split(r"[\s,\"'{}\[\]]", contents, maxsplit=1)[0]
+    if not (contents[0].isdigit() or contents[0] in "+-" or _NUMERIC_ATOM_RE.fullmatch(first_atom)):
+        return False
+    if explicit and all(char.isdigit() or char.isspace() or char in "eE+-.," for char in contents):
+        return True
+    if _NUMERIC_REFERENCE_RE.fullmatch(contents):
+        return False
+    if any(char in contents for char in ",\"'{}[]"):
+        return True
+    # Numeric-only malformed tokens and adjacent JSON literals are attempted
+    # arrays. Words in count/reference prose ("of", "edition", etc.) are not.
+    numeric = contents
+    for literal in ("true", "false", "null"):
+        numeric = numeric.replace(literal, "")
+    return all(char.isdigit() or char.isspace() or char in "eE+-." for char in numeric)
+
+
+def _carries_json_object(text: str, selected_payload: str | None = None) -> bool:
+    """Find an attempted answer outside the one selected unfenced boundary.
+
+    Reuse the extractor's fence, literal-range and balanced-bracket boundaries.
+    Each outer candidate is opaque, including malformed candidates. Selection
+    consumes exactly one matching span, never every occurrence of its text.
+    """
+    fence_state, _, segments = _extract_fenced_json_payload(text)
+    if fence_state is not _FenceScanState.NO_FENCE:
+        return True
+    selected = False
+    for segment in segments:
+        excluded = _non_answer_ranges(segment)
+        excluded_index = pos = 0
+        while pos < len(segment):
+            starts = [index for char in "{[" if (index := segment.find(char, pos)) != -1]
+            if not starts:
+                break
+            start = min(starts)
+            while excluded_index < len(excluded) and excluded[excluded_index][1] <= start:
+                excluded_index += 1
+            if excluded_index < len(excluded) and excluded[excluded_index][0] <= start:
+                pos = excluded[excluded_index][1]
+                continue
+            candidate = _bracket_extract(segment, start)
+            if candidate is None:
+                return True
+            end = start + len(candidate)
+            if not selected and candidate == selected_payload:
+                selected = True
+            elif _is_attempted_answer(
+                candidate, explicit=_explicit_correction(segment, start, end)
+            ):
+                return True
+            pos = end
+    return False
+
+
 def _parse_qa_response(
     response_text: str,
     pass_threshold: float = DEFAULT_PASS_THRESHOLD,
@@ -286,6 +469,22 @@ def _parse_qa_response(
             data = json.loads(json_str)
         except json.JSONDecodeError as e:
             return Result.err(f"Invalid JSON in QA response: {e}")
+        if not isinstance(data, dict):
+            return Result.err("QA response JSON must be an object, got " + type(data).__name__)
+        if _extract_fenced_json_payload(response_text)[1] is None and _carries_json_object(
+            response_text, selected_payload=json_str
+        ):
+            # The extractor counts only *valid* objects, so a malformed second
+            # verdict (``{"score": 0.1, "verdict": "fail",}``) beside a passing
+            # one leaves the passing one "unique". Only a supported answer
+            # fence can outrank surrounding objects; reuse the extractor's
+            # boundary rules rather than recognizing only labeled fences.
+            return Result.err("QA response contains JSON but no single unambiguous verdict object")
+    elif _carries_json_object(response_text):
+        # The model answered in JSON, but not with one authoritative object
+        # (competing fences, or several objects). Reading ``Score: 0.95`` out of
+        # the surrounding prose would let an example outrank that answer.
+        return Result.err("QA response contains JSON but no single unambiguous verdict object")
     else:
         data = _parse_non_json_qa_response(response_text)
         if data is None:
@@ -296,18 +495,16 @@ def _parse_qa_response(
 
     # Validate required fields
     score = data.get("score")
-    if not isinstance(score, (int, float)) or score < 0.0 or score > 1.0:
+    if not _is_finite_number(score) or score < 0.0 or score > 1.0:
         return Result.err(f"score must be a float between 0.0 and 1.0, got: {score}")
 
-    verdict = data.get("verdict", "").lower().strip()
-    if verdict not in VALID_VERDICTS:
-        # Derive verdict from score if LLM didn't produce a valid one
-        if score >= pass_threshold:
-            verdict = "pass"
-        elif score >= FAIL_THRESHOLD:
-            verdict = "revise"
-        else:
-            verdict = "fail"
+    # Score is authoritative for both the displayed verdict and loop outcome.
+    if score >= pass_threshold:
+        verdict = "pass"
+    elif score >= FAIL_THRESHOLD:
+        verdict = "revise"
+    else:
+        verdict = "fail"
 
     dimensions = data.get("dimensions", {})
     if not isinstance(dimensions, dict):
@@ -329,7 +526,7 @@ def _parse_qa_response(
         QAVerdict(
             score=float(score),
             verdict=verdict,
-            dimensions={k: float(v) for k, v in dimensions.items() if isinstance(v, (int, float))},
+            dimensions={k: float(v) for k, v in dimensions.items() if _is_finite_number(v)},
             differences=differences,
             suggestions=suggestions,
             reasoning=reasoning,
@@ -393,6 +590,11 @@ def _format_verdict_text(
     return "\n".join(lines)
 
 
+def _reject_json_constant(value: str) -> None:
+    """Reject NaN and infinities, which are not JSON values."""
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
 @dataclass
 class QAHandler:
     """Handler for the ouroboros_qa tool.
@@ -410,7 +612,7 @@ class QAHandler:
     @property
     def definition(self) -> MCPToolDefinition:
         """Return the tool definition."""
-        return MCPToolDefinition(
+        definition = MCPToolDefinition(
             name="ouroboros_qa",
             description=(
                 "General-purpose QA verdict for any artifact type. "
@@ -484,6 +686,22 @@ class QAHandler:
                 ),
             ),
         )
+        schema = definition.to_input_schema()
+        threshold_schema = schema["properties"]["pass_threshold"]
+        threshold_schema.pop("type")
+        threshold_schema["anyOf"] = [
+            {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            {
+                "type": "string",
+                "pattern": r"^[ \t\r\n]*-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?[ \t\r\n]*$",
+            },
+        ]
+        threshold_schema["description"] += " A JSON-encoded number is also accepted."
+        history_schema = schema["properties"]["iteration_history"]
+        history_schema.pop("type")
+        history_schema["anyOf"] = [{"type": "array"}, {"type": "string"}]
+        history_schema["description"] += " A JSON-encoded array is also accepted."
+        return replace(definition, input_schema=schema)
 
     async def handle(
         self,
@@ -491,7 +709,7 @@ class QAHandler:
     ) -> Result[MCPToolResult, MCPServerError]:
         """Handle a QA verdict request."""
         artifact = arguments.get("artifact")
-        if not artifact:
+        if "artifact" not in arguments or not isinstance(artifact, str):
             return Result.err(
                 MCPToolError(
                     "artifact is required",
@@ -510,9 +728,57 @@ class QAHandler:
 
         artifact_type = arguments.get("artifact_type", "code")
         reference = arguments.get("reference")
-        pass_threshold = float(arguments.get("pass_threshold", DEFAULT_PASS_THRESHOLD))
-        qa_session_id = arguments.get("qa_session_id") or f"qa-{uuid.uuid4().hex[:8]}"
-        iteration_history = arguments.get("iteration_history") or []
+        threshold = arguments.get("pass_threshold", DEFAULT_PASS_THRESHOLD)
+        if isinstance(threshold, str):
+            try:
+                threshold = json.loads(threshold, parse_constant=_reject_json_constant)
+            except (ValueError, RecursionError):
+                threshold = None
+        if not _is_finite_number(threshold) or not 0.0 <= threshold <= 1.0:
+            return Result.err(
+                MCPToolError(
+                    "pass_threshold must be a finite number between 0.0 and 1.0",
+                    tool_name="ouroboros_qa",
+                )
+            )
+        pass_threshold = float(threshold)
+        plugin_dispatch = should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode)
+        qa_session_id = arguments.get("qa_session_id")
+        if not qa_session_id:
+            random_id = uuid.uuid4().hex
+            qa_session_id = f"qa-{random_id[:8]}" if plugin_dispatch else f"qa-{random_id}"
+        iteration_history = arguments.get("iteration_history")
+        if isinstance(iteration_history, str):
+            try:
+                iteration_history = json.loads(
+                    iteration_history, parse_constant=_reject_json_constant
+                )
+            except (ValueError, RecursionError):
+                return Result.err(
+                    MCPToolError(
+                        "iteration_history must be a list of objects",
+                        tool_name="ouroboros_qa",
+                    )
+                )
+            # A serialized null is not an omitted optional parameter.
+            if iteration_history is None:
+                return Result.err(
+                    MCPToolError(
+                        "iteration_history must be a list of objects",
+                        tool_name="ouroboros_qa",
+                    )
+                )
+        if iteration_history is None:
+            iteration_history = []
+        if not isinstance(iteration_history, list) or not all(
+            isinstance(entry, dict) for entry in iteration_history
+        ):
+            return Result.err(
+                MCPToolError(
+                    "iteration_history must be a list of objects",
+                    tool_name="ouroboros_qa",
+                )
+            )
         seed_content = arguments.get("seed_content")
 
         iteration = len(iteration_history) + 1
@@ -536,23 +802,33 @@ class QAHandler:
             iteration_history=iteration_history,
             seed_content=seed_content,
         )
-        if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
-            await emit_subagent_dispatched_event(
+        if plugin_dispatch:
+            return await dispatch_plugin_terminal(
                 self.event_store,
                 session_id=qa_session_id,
                 payload=payload,
-            )
-            return build_subagent_result(
-                payload,
                 response_shape={
                     "qa_session_id": qa_session_id,
                     "artifact_type": artifact_type,
-                    "status": "delegated_to_subagent",
+                    "status": DELEGATED_TO_SUBAGENT,
                     "dispatch_mode": "plugin",
                 },
             )
 
         # Fall-through: real in-process QA LLM call (subprocess / non-opencode runtimes).
+
+        if (
+            not isinstance(qa_session_id, str)
+            or not qa_session_id.strip()
+            or qa_session_id != qa_session_id.strip()
+            or qa_session_id.startswith("auto_")
+        ):
+            return Result.err(
+                MCPToolError(
+                    "qa_session_id must be a nonblank session ID outside the auto_ namespace",
+                    tool_name="ouroboros_qa",
+                )
+            )
 
         try:
             from ouroboros.providers.base import CompletionConfig, Message, MessageRole
@@ -573,12 +849,21 @@ class QAHandler:
                 Message(role=MessageRole.USER, content=user_prompt),
             ]
 
+            # ``allowed_tools=[]`` paired with ``max_turns=1``: any tool-use
+            # block emitted by the model would consume the only allowed turn
+            # and the SDK then raises ``Reached maximum number of turns (1)``
+            # before a final text response can stream. See issue #781.
+            backend = get_llm_backend_for_role("qa", explicit_backend=self.llm_backend)
             llm_adapter = self.llm_adapter or create_llm_adapter(
-                backend=self.llm_backend,
+                backend=backend,
                 max_turns=1,
+                allowed_tools=[]
+                if backend_supports_tool_envelope(resolve_llm_backend(backend))
+                else None,
             )
             config = CompletionConfig(
-                model=get_qa_model(self.llm_backend),
+                model=get_llm_model_for_role("qa", backend=backend),
+                role="qa",
                 temperature=0.2,
                 max_tokens=2048,
                 response_format={"type": "json_schema", "json_schema": QA_VERDICT_SCHEMA},
@@ -632,6 +917,12 @@ class QAHandler:
                 "reasoning": verdict.reasoning,
                 "iteration_entry": iteration_entry,
             }
+
+            # Persist only completed in-process evaluations before reporting
+            # success; session status fails closed if ownership later conflicts.
+            from ouroboros.mcp.tools.qa_session import record_qa_evaluation
+
+            await record_qa_evaluation(self.event_store, qa_session_id, meta)
 
             return Result.ok(
                 MCPToolResult(

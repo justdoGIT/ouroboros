@@ -11,15 +11,50 @@ from enum import StrEnum
 import functools
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 import structlog
 
-from ouroboros.config import get_clarification_model
+from ouroboros.bigbang.answer_provenance import (
+    DECLARED_PROVENANCES,
+    AnswerProvenance,
+    classify_answer_provenance,
+)
+from ouroboros.config import get_llm_model_for_role
 from ouroboros.core.errors import ProviderError, ValidationError
 from ouroboros.core.file_lock import file_lock as _file_lock
+from ouroboros.core.owner_only import secure_directory, write_owner_only
+from ouroboros.core.requirement_candidate import (
+    RequirementDistillation,
+    compute_requirement_input_fingerprint,
+)
 from ouroboros.core.security import InputValidator
 from ouroboros.core.types import Result
+from ouroboros.interview_adapters import (
+    InterviewTurnContext,
+    ReferenceContrastResolution,
+    ReferenceCue,
+    ReferenceResolutionStatus,
+    build_reference_contrast_question,
+    next_unresolved_reference,
+    normalized_question_key,
+    reference_question_anchor,
+    select_glossary_injection,
+)
+from ouroboros.interview_adapters.first_question import (
+    FirstQuestionPresentation,
+    first_question_instruction,
+    validate_stored_selection,
+)
+from ouroboros.interview_adapters.inline_materials import InlineMaterial
+from ouroboros.interview_adapters.opening_interpretations import (
+    OpeningDecisionEvent,
+    ProposedOpening,
+    confirmed_interpretations,
+    opening_fingerprint_payload,
+)
+from ouroboros.interview_calibration import InterviewCalibration
 from ouroboros.providers.base import (
     CompletionConfig,
     LLMAdapter,
@@ -38,6 +73,7 @@ DEFAULT_INTERVIEW_ROUNDS = 10  # Reference value for prompts (not enforced)
 # Legacy alias for backward compatibility
 MAX_INTERVIEW_ROUNDS = DEFAULT_INTERVIEW_ROUNDS
 MAX_PROMPT_SAFE_INITIAL_CONTEXT_CHARS = 3500
+MAX_REPHRASE_QUESTION_CHARS = 4000
 INITIAL_CONTEXT_SUMMARY_QUESTION = (
     "Your saved initial context is too long to safely send to the interview "
     "model without risking CLI prompt failure. Please reply with a concise "
@@ -50,6 +86,53 @@ INITIAL_CONTEXT_SUMMARY_REQUIRED = (
     "generating a seed.]"
 )
 PROMPT_SAFE_CONTEXT_TRUNCATION_NOTICE = "\n\n[Context truncated for prompt safety.]"
+# Empirically, the local Agent SDK CLI path can return empty completions when
+# interview question prompts grow beyond roughly this serialized prompt size.
+# This is the observed failure ceiling, not a raw ``message.content`` budget:
+# CLI adapters add section headers, role prefixes, separators, and final
+# response instructions around each message before sending the real prompt.
+AGENT_SDK_CLI_EMPIRICAL_EMPTY_RESPONSE_CHARS = 16_000
+# Conservative serialization reserves used by interview prompt budgeting. The
+# fixed reserve covers adapter section headers/tool/execution instructions; the
+# per-message reserve covers role prefixes and separators so long interviews
+# with many short turns cannot pass raw-content checks while crossing the
+# observed CLI empty-response cliff after serialization.
+AGENT_SDK_CLI_FIXED_FRAMING_CHARS = 1_500
+AGENT_SDK_CLI_PER_MESSAGE_FRAMING_CHARS = 128
+# Keep estimated serialized prompts below the observed empty-response boundary;
+# the remaining 2k margin absorbs adapter/provider prompt text that is harder to
+# model locally while still tripling the original 4.8k interview budget.
+AGENT_SDK_CLI_SAFE_PROMPT_CHARS = 14_000
+
+# The two rules that make a generated turn a question at all. They live in the
+# dynamic header — which every build preserves first — instead of only inside
+# the loaded agent prompt, whose tail is the first thing the character budget
+# trims. Leaving them there made their survival depend on where they happen to
+# sit in a markdown file and on how large the header and perspective panel grew
+# that round: in a late round with a stored ambiguity snapshot, the response
+# format was silently dropped from the prompt that needed it most.
+RESPONSE_CONTRACT = (
+    "Response contract: emit exactly ONE question and end with it. "
+    "Never announce implementation work — another agent does that later."
+)
+
+_TOOLLESS_INTERVIEW_BASE_PROMPT = """## Role Boundaries
+- You are only an interviewer.
+- Generate exactly one Socratic question that reduces requirements ambiguity.
+- Do not explore files, commands, repositories, APIs, tools, or external systems.
+- Do not ask to inspect implementation details unless the caller already supplied those details.
+- The caller supplies any code or research context in answers.
+
+## Response Format
+- Ask one focused question in 1-2 sentences.
+- Do not include a preamble.
+- End with the question.
+
+## Questioning Strategy
+- Target the biggest unresolved decision.
+- Prefer scope, non-goal, success criteria, ownership, risk, and verification questions.
+- For brownfield work, focus on intent and decisions rather than discovering what exists.
+"""
 
 
 class InterviewPerspective(StrEnum):
@@ -115,13 +198,82 @@ class InterviewRound(BaseModel):
         round_number: 1-based round number (no upper limit - user controls).
         question: The question asked by the system.
         user_response: The user's response (None if not yet answered).
+        provenance: Whether the answer is a decision the caller made, a fact
+            the caller adopted from elsewhere, or a guess the caller declared as
+            an assumption (see ``answer_provenance``). Consumers read this field rather
+            than re-reading the ``[from-*]`` marker, which is what drifted
+            before (#1755).
         timestamp: When this round was created.
+
+    There is deliberately no ``evidence`` field. A lane finding the person
+    confirmed is an answer like any other and occupies its own round, marked by
+    ``provenance``; one they did not confirm is not recorded at all. A second
+    slot for the same material was tried and removed: it gave every caller two
+    places to put one payload, and the rules for the two never stayed in step.
     """
 
     round_number: int = Field(ge=1)  # No upper limit - user decides when to stop
     question: str
+    first_question_presentation: FirstQuestionPresentation | None = None
+    first_question_selected_indices: tuple[int, ...] | None = None
+    batch_id: str | None = None
+    batch_selected_indices: tuple[int, ...] | None = None
+    question_id: str | None = None
+    ambiguity_dimension: str | None = None
+    recommended_index: int | None = None
     user_response: str | None = None
+    provenance: AnswerProvenance = "user"
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @model_validator(mode="after")
+    def _settle_provenance(self) -> "InterviewRound":
+        """Settle provenance from the answer whenever a round is validated.
+
+        The field is written at ingestion, but interviews persisted before it
+        existed deserialize without it. Defaulting those to ``"user"`` would
+        leave every in-flight interview holding observations that still carry
+        requirement authority, so an answer's provenance is settled here too —
+        one classifier, still no consumer reading the marker.
+
+        A declared provenance (``"assumption"``, ``"requester"``) is not derived
+        from the answer, so it is kept as recorded rather than re-derived.
+        """
+        if (
+            self.first_question_presentation is not None
+            and self.first_question_presentation.question != self.question
+        ):
+            raise ValueError("structured presentation does not match the recorded question")
+        validate_stored_selection(
+            self.first_question_presentation,
+            self.first_question_selected_indices,
+            self.user_response,
+        )
+        from ouroboros.interview_adapters.independent_batch import validate_batch_selection
+
+        validate_batch_selection(
+            self.batch_id,
+            self.first_question_presentation,
+            self.batch_selected_indices,
+            self.user_response,
+        )
+        if self.user_response is not None and self.provenance not in DECLARED_PROVENANCES:
+            answer_for_classification = self.user_response
+            # PM interviews before #1823 decorated reframed answers after the
+            # provenance marker had already been supplied, producing
+            # ``PM answer: [from-code] ...``.  Recover that one canonical
+            # historical envelope using its paired question shape; accepting
+            # the wrapper globally would let arbitrary user prose redefine
+            # the marker grammar.
+            if (
+                self.question.startswith("[Original technical question: ")
+                and "\n[PM was asked (reframed): " in self.question
+                and answer_for_classification.startswith("PM answer: ")
+            ):
+                answer_for_classification = answer_for_classification.removeprefix("PM answer: ")
+            settled = classify_answer_provenance(answer_for_classification)
+            if settled != self.provenance:
+                self.provenance = settled
+        return self
 
 
 class InterviewState(BaseModel):
@@ -141,6 +293,12 @@ class InterviewState(BaseModel):
     """
 
     interview_id: str
+    persistence_revision: str = ""
+    inline_material: InlineMaterial | None = None
+    batch_confirmed_digest: str | None = None
+    proposed_opening: ProposedOpening | None = None
+    opening_decisions: tuple[OpeningDecisionEvent, ...] = ()
+    _loaded_revision: str | None = PrivateAttr(default=None)
     status: InterviewStatus = InterviewStatus.IN_PROGRESS
     rounds: list[InterviewRound] = Field(default_factory=list)
     initial_context: str = ""
@@ -153,11 +311,22 @@ class InterviewState(BaseModel):
     ambiguity_score: float | None = Field(default=None, ge=0.0, le=1.0)
     ambiguity_breakdown: dict[str, Any] | None = None
     completion_candidate_streak: int = Field(default=0, ge=0)
+    lateral_review_advised_milestones: list[str] = Field(default_factory=list)
+    reference_cues: tuple[ReferenceCue, ...] = Field(default_factory=tuple)
+    reference_resolutions: tuple[ReferenceContrastResolution, ...] = Field(default_factory=tuple)
+    pending_confused_terms: tuple[str, ...] = Field(default_factory=tuple)
+    requirement_input_revision: int = Field(default=0, ge=0)
+    requirement_distillation: RequirementDistillation | None = None
+
+    @model_validator(mode="after")
+    def validate_opening_history(self) -> "InterviewState":
+        confirmed_interpretations(self.proposed_opening, self.opening_decisions)
+        return self
 
     @property
     def current_round_number(self) -> int:
         """Get the current round number (1-based)."""
-        return len(self.rounds) + 1
+        return max((round_data.round_number for round_data in self.rounds), default=0) + 1
 
     @property
     def is_complete(self) -> bool:
@@ -202,6 +371,13 @@ class InterviewState(BaseModel):
         self.ambiguity_breakdown = breakdown
         self.mark_updated()
 
+    def note_lateral_review_advisory(self, milestone: str) -> None:
+        """Persist that a milestone transition advisory has been emitted."""
+        if milestone in self.lateral_review_advised_milestones:
+            return
+        self.lateral_review_advised_milestones.append(milestone)
+        self.mark_updated()
+
     def clear_stored_ambiguity(self) -> None:
         """Invalidate any persisted ambiguity snapshot after interview changes."""
         if self.ambiguity_score is None and self.ambiguity_breakdown is None:
@@ -210,6 +386,206 @@ class InterviewState(BaseModel):
         self.ambiguity_score = None
         self.ambiguity_breakdown = None
         self.mark_updated()
+
+    def requirement_input_fingerprint(self) -> str:
+        """Fingerprint canonical inputs used by the derived distillation cache."""
+        return compute_requirement_input_fingerprint(
+            {
+                "initial_context": self.initial_context,
+                **opening_fingerprint_payload(self.proposed_opening, self.opening_decisions),
+                "rounds": [
+                    {
+                        "round_number": round_data.round_number,
+                        "question": round_data.question,
+                        "user_response": round_data.user_response,
+                        # Provenance decides whether an answer may be promoted
+                        # at all, so it is a canonical input to the derived
+                        # distillation. Without it a distillation cached before
+                        # #1755 — one that promoted an observation — would be
+                        # judged current and reused.
+                        "provenance": round_data.provenance,
+                    }
+                    for round_data in self.rounds
+                ],
+                "reference_cues": self.reference_cues,
+                "reference_resolutions": self.reference_resolutions,
+                "codebase_context": self.codebase_context,
+                "codebase_paths": self.codebase_paths,
+            }
+        )
+
+    def invalidate_requirement_distillation(self) -> None:
+        """Advance canonical-input revision and clear derived cached output."""
+        self.requirement_input_revision += 1
+        self.requirement_distillation = None
+        self.mark_updated()
+
+    def discard_stale_requirement_distillation(self) -> bool:
+        """Discard a persisted cache that no longer matches canonical inputs."""
+        cached = self.requirement_distillation
+        if cached is None:
+            return False
+        if cached.is_current(
+            input_revision=self.requirement_input_revision,
+            input_fingerprint=self.requirement_input_fingerprint(),
+        ):
+            return False
+        self.requirement_distillation = None
+        self.mark_updated()
+        return True
+
+    def merge_turn_context(self, context: InterviewTurnContext | None) -> bool:
+        """Merge bounded adapter input and invalidate only requirement changes."""
+        if context is None:
+            return False
+
+        pending = list(self.pending_confused_terms)
+        seen_terms = {term.casefold() for term in pending}
+        for term in context.confused_terms:
+            if term.casefold() not in seen_terms:
+                pending.append(term)
+                seen_terms.add(term.casefold())
+        self.pending_confused_terms = tuple(pending)
+
+        cues_by_id = {cue.reference_id: cue for cue in self.reference_cues}
+        cue_order = [cue.reference_id for cue in self.reference_cues]
+        references_changed = False
+        changed_ids: set[str] = set()
+        for cue in context.references:
+            previous = cues_by_id.get(cue.reference_id)
+            if previous == cue:
+                continue
+            if previous is None:
+                cue_order.append(cue.reference_id)
+            cues_by_id[cue.reference_id] = cue
+            changed_ids.add(cue.reference_id)
+            references_changed = True
+
+        if references_changed:
+            self.reference_cues = tuple(cues_by_id[reference_id] for reference_id in cue_order)
+            self.reference_resolutions = tuple(
+                resolution
+                for resolution in self.reference_resolutions
+                if resolution.reference_id not in changed_ids
+            )
+            self.invalidate_requirement_distillation()
+        elif context.confused_terms:
+            self.mark_updated()
+        return references_changed or bool(context.confused_terms)
+
+    def next_adapter_question(self) -> str | None:
+        """Return one deterministic post-base-frame adapter question."""
+        base_question_answered = any(
+            round_data.question != INITIAL_CONTEXT_SUMMARY_QUESTION
+            and bool(round_data.user_response)
+            for round_data in self.rounds
+        )
+        if not base_question_answered:
+            return None
+
+        if self.pending_confused_terms:
+            context = InterviewTurnContext(confused_terms=self.pending_confused_terms)
+            injection = select_glossary_injection(
+                context=context,
+                base_question_answered=True,
+            )
+            self.pending_confused_terms = ()
+            if injection is not None:
+                self.mark_updated()
+                return (
+                    f"{injection.render()}\n\n"
+                    "Using your own words, what does that term need to mean for this project?"
+                )
+
+        cue = next_unresolved_reference(self.reference_cues, self.reference_resolutions)
+        if cue is None:
+            return None
+        question = build_reference_contrast_question(cue)
+        remaining = tuple(
+            resolution
+            for resolution in self.reference_resolutions
+            if resolution.reference_id != cue.reference_id
+        )
+        self.reference_resolutions = (
+            *remaining,
+            ReferenceContrastResolution(
+                reference_id=cue.reference_id,
+                status=ReferenceResolutionStatus.ASKED,
+                asked_question=question,
+            ),
+        )
+        self.mark_updated()
+        return question
+
+    def record_answer(
+        self, question: str, answer: str, *, question_id: str | None = None
+    ) -> InterviewRound:
+        """Record an answer to a pending round, optionally by stable batch ID."""
+        from ouroboros.bigbang.interview_answer_recording import record_interview_answer
+
+        return record_interview_answer(self, question, answer, question_id)
+
+    def record_adapter_answer(
+        self, question: str, answer: str, *, stored_question: str = ""
+    ) -> None:
+        """Resolve a persisted reference contrast when its question is answered.
+
+        Byte-exact matching against the caller-echoed ``last_question`` is not
+        a real invariant: MCP hosts re-render the question (whitespace reflow,
+        truncation, case drift) before echoing it back, and an unmatched
+        contrast is fatal — ``next_unresolved_reference`` skips ASKED
+        resolutions, so the cue is never re-asked and Seed generation stays
+        blocked on ``reference_confirmation_required`` forever. Matching is
+        therefore a deterministic cascade, per candidate question (the
+        engine-persisted round text first, then the caller's echo):
+
+        1. normalized equality (whitespace-collapse + casefold);
+        2. anchor containment — every contrast question deterministically
+           starts with ``Reference `<label>```, so an echo that was truncated
+           or reformatted still identifies its cue when it carries that anchor.
+
+        No similarity scoring: a question that matches neither rule resolves
+        nothing, exactly as before.
+        """
+        candidates = tuple(
+            key
+            for key in (
+                normalized_question_key(stored_question),
+                normalized_question_key(question),
+            )
+            if key
+        )
+        if not candidates:
+            return
+        cues_by_id = {cue.reference_id: cue for cue in self.reference_cues}
+
+        def _matches(resolution: ReferenceContrastResolution) -> bool:
+            asked_key = normalized_question_key(resolution.asked_question)
+            if asked_key and asked_key in candidates:
+                return True
+            cue = cues_by_id.get(resolution.reference_id)
+            if cue is None:
+                return False
+            anchor = reference_question_anchor(cue)
+            return bool(anchor) and any(anchor in key for key in candidates)
+
+        updated: list[ReferenceContrastResolution] = []
+        changed = False
+        for resolution in self.reference_resolutions:
+            if resolution.status is ReferenceResolutionStatus.ASKED and _matches(resolution):
+                updated.append(
+                    ReferenceContrastResolution(
+                        reference_id=resolution.reference_id,
+                        status=ReferenceResolutionStatus.RESOLVED,
+                        asked_question=resolution.asked_question,
+                        answer=answer,
+                    )
+                )
+                changed = True
+            else:
+                updated.append(resolution)
+        if changed:
+            self.reference_resolutions = tuple(updated)
 
 
 def prompt_safe_initial_context(state: InterviewState) -> str:
@@ -238,6 +614,236 @@ def _truncate_prompt_safe_context(context: str) -> str:
 def initial_context_summary_missing(state: InterviewState) -> bool:
     """Return True when a long initial context still needs a user summary."""
     return prompt_safe_initial_context(state) == INITIAL_CONTEXT_SUMMARY_REQUIRED
+
+
+# ---------------------------------------------------------------------------
+# Question candidate panel (K2)
+# ---------------------------------------------------------------------------
+#
+# Instead of one question per round, three persona candidates
+# (contrarian / architect / researcher) each propose a question aimed at a
+# specific ambiguity dimension. Selection is deterministic (no LLM judge): pick
+# the candidate targeting the WORST-scoring dimension; ties break by persona
+# priority contrarian > architect > researcher.
+
+# Persona priority order, most-preferred first.
+QUESTION_CANDIDATE_PERSONAS: tuple[str, ...] = ("contrarian", "architect", "researcher")
+_QUESTION_CANDIDATE_PRIORITY: dict[str, int] = {
+    persona: index for index, persona in enumerate(QUESTION_CANDIDATE_PERSONAS)
+}
+
+# Ambiguity dimension keys a candidate may target (same keys ScoreBreakdown
+# uses, so K1's per-dimension output selects K2's question directly).
+QUESTION_CANDIDATE_DIMENSIONS: tuple[str, ...] = (
+    "goal_clarity",
+    "constraint_clarity",
+    "success_criteria_clarity",
+    "context_clarity",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionCandidate:
+    """One persona-proposed interview question aimed at a dimension."""
+
+    persona: str
+    question: str
+    target_dimension: str
+
+
+def select_question_candidate(
+    candidates: list[QuestionCandidate],
+    dimension_clarity: dict[str, float],
+) -> QuestionCandidate:
+    """Deterministically select the best question candidate.
+
+    Selection rule (no LLM judge):
+
+    1. Prefer the candidate targeting the dimension with the WORST (lowest)
+       current clarity score. A candidate whose ``target_dimension`` is absent
+       from ``dimension_clarity`` is treated as least urgent.
+    2. Ties (candidates targeting the same worst dimension) break by persona
+       priority: contrarian > architect > researcher.
+
+    Args:
+        candidates: Non-empty candidate list.
+        dimension_clarity: Mapping of dimension key -> clarity score (0..1).
+
+    Returns:
+        The selected candidate.
+
+    Raises:
+        ValueError: If ``candidates`` is empty.
+    """
+    if not candidates:
+        raise ValueError("candidates must not be empty")
+
+    def _sort_key(candidate: QuestionCandidate) -> tuple[float, int]:
+        clarity = dimension_clarity.get(candidate.target_dimension)
+        # Lower clarity = worse = more urgent = preferred. Unknown dimension is
+        # least urgent (treated as maximally clear).
+        clarity_rank = clarity if clarity is not None else float("inf")
+        priority = _QUESTION_CANDIDATE_PRIORITY.get(
+            candidate.persona, len(_QUESTION_CANDIDATE_PRIORITY)
+        )
+        return (clarity_rank, priority)
+
+    return min(candidates, key=_sort_key)
+
+
+def _dimension_clarity_from_breakdown(breakdown: dict[str, Any] | None) -> dict[str, float]:
+    """Extract ``{dimension_key: clarity_score}`` from a stored breakdown dict.
+
+    Accepts the ``ScoreBreakdown.model_dump`` shape persisted by
+    ``InterviewState.store_ambiguity``. Non-numeric / missing entries are
+    skipped so selection only sees usable per-dimension scores.
+    """
+    clarity: dict[str, float] = {}
+    if not isinstance(breakdown, dict):
+        return clarity
+    for key, payload in breakdown.items():
+        if key not in QUESTION_CANDIDATE_DIMENSIONS or not isinstance(payload, dict):
+            continue
+        value = payload.get("clarity_score")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            clarity[key] = float(value)
+    return clarity
+
+
+def _question_candidate_persona_roles() -> dict[str, str]:
+    """Return persona -> role, sourced from the lateral persona metadata.
+
+    Reads ``orchestrator/capabilities`` persona metadata (read-only) so the
+    candidate lens descriptions reuse the same persona vocabulary as the lateral
+    system rather than duplicating role strings here.
+    """
+    try:
+        from ouroboros.orchestrator.capabilities.lateral_personas import (
+            _lateral_persona_panel_metadata,
+        )
+
+        metadata = _lateral_persona_panel_metadata()
+        roles = {persona.persona_id: persona.role for persona in metadata.personas}
+    except Exception:  # noqa: BLE001 - metadata is advisory; fall back to bare ids
+        roles = {}
+    for persona in QUESTION_CANDIDATE_PERSONAS:
+        roles.setdefault(persona, persona)
+    return roles
+
+
+def _parse_question_candidate(persona: str, response: str) -> QuestionCandidate | None:
+    """Parse a persona candidate JSON ``{question, target_dimension}``.
+
+    Returns ``None`` on any parse failure or missing question so a single bad
+    candidate never breaks the panel (the others still select).
+    """
+    import json
+
+    from ouroboros.core.json_utils import extract_json_payload
+
+    # One authoritative payload or nothing: an echoed schema example must
+    # not become a panel candidate (#1838).
+    text = extract_json_payload(response.strip())
+    if text is None:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    question = str(data.get("question") or "").strip()
+    if not question:
+        return None
+    target = str(data.get("target_dimension") or "").strip()
+    if target not in QUESTION_CANDIDATE_DIMENSIONS:
+        # Unknown/blank target is tolerated: it simply ranks least-urgent in
+        # selection rather than dropping an otherwise valid question.
+        target = ""
+    return QuestionCandidate(persona=persona, question=question, target_dimension=target)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedInterviewQuestion:
+    """Provider-ready question request or an immediate deterministic question."""
+
+    immediate_question: str | None = None
+    messages: tuple[Message, ...] = ()
+    config: CompletionConfig | None = None
+    system_prompt: str = ""
+    conversation_history: tuple[Message, ...] = ()
+    preserve_prefix_messages: int = 0
+
+
+def _write_interview_snapshot(file_path: Path, expected_revision: str | None, content: str) -> bool:
+    with _file_lock(file_path, exclusive=True):
+        if file_path.exists():
+            current = InterviewState.model_validate_json(file_path.read_text(encoding="utf-8"))
+            if expected_revision is None or current.persistence_revision != expected_revision:
+                raise ValueError("interview state changed; reload before retrying")
+        elif expected_revision is not None:
+            raise ValueError("interview state removed; reload before retrying")
+        return write_owner_only(file_path, content)
+
+
+def _interview_revision_matches(file_path: Path, revision: str) -> bool:
+    with _file_lock(file_path, exclusive=False):
+        if not file_path.exists():
+            return False
+        saved = InterviewState.model_validate_json(file_path.read_text(encoding="utf-8"))
+        return saved.persistence_revision == revision
+
+
+async def save_interview_state_checked(file_path: Path, state: InterviewState) -> bool:
+    """Save a snapshot with optimistic concurrency, under the shared lock."""
+    expected_revision = state._loaded_revision
+    new_revision = uuid4().hex
+    snapshot = state.model_copy(deep=True)
+    snapshot.persistence_revision = new_revision
+    content = snapshot.model_dump_json(indent=2)
+
+    async def settle(task: asyncio.Future[Any]) -> tuple[Any, bool, Exception | None]:
+        interrupted = False
+        while True:
+            try:
+                return await asyncio.shield(task), interrupted, None
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    caller = asyncio.current_task()
+                    interrupted = interrupted or bool(caller and caller.cancelling())
+                    return (
+                        None,
+                        interrupted,
+                        OSError("interview save worker cancelled; outcome unknown; reload"),
+                    )
+                interrupted = True
+            except Exception as exc:
+                return None, interrupted, exc
+
+    loop = asyncio.get_running_loop()
+    commit = loop.run_in_executor(
+        None, _write_interview_snapshot, file_path, expected_revision, content
+    )
+    durability, cancelled, error = await settle(commit)
+    if error is not None:
+        # A writer can fail after replacement. Settle the revision read even
+        # if the caller repeats cancellation while it is running.
+        check = loop.run_in_executor(None, _interview_revision_matches, file_path, new_revision)
+        committed, check_cancelled, check_error = await settle(check)
+        cancelled = cancelled or check_cancelled
+        if check_error is None and committed:
+            state.persistence_revision = new_revision
+            state._loaded_revision = new_revision
+        if cancelled:
+            raise asyncio.CancelledError from None
+        if check_error is not None:
+            raise OSError("interview save outcome unknown; reload before retrying") from error
+        raise error
+    state.persistence_revision = new_revision
+    state._loaded_revision = new_revision
+    if cancelled:
+        raise asyncio.CancelledError
+    return bool(durability)
 
 
 @dataclass
@@ -276,21 +882,50 @@ class InterviewEngine:
         or passed directly to the constructor.
     """
 
-    llm_adapter: LLMAdapter
+    llm_adapter: LLMAdapter | None = None
     state_dir: Path = field(default_factory=lambda: Path.home() / ".ouroboros" / "data")
-    model: str = field(default_factory=get_clarification_model)
+    model: str | None = None
+    model_is_explicit: bool = field(default=False, init=False)
     temperature: float = 0.7
     max_tokens: int = 2048
-    _MAX_TOTAL_PROMPT_CHARS = 4800
+    _MAX_TOTAL_PROMPT_CHARS = AGENT_SDK_CLI_SAFE_PROMPT_CHARS
     _MAX_SYSTEM_PROMPT_CHARS = 3500
     _MIN_SYSTEM_PROMPT_CHARS = 1200
     _MAX_INITIAL_CONTEXT_SYSTEM_CHARS = 1800
     _MAX_INITIAL_CONTEXT_TOTAL_CHARS = MAX_PROMPT_SAFE_INITIAL_CONTEXT_CHARS
     _INITIAL_CONTEXT_SUMMARY_QUESTION = INITIAL_CONTEXT_SUMMARY_QUESTION
+    suppress_tool_use_prompt_cues: bool = False
+    # When True, ``ask_next_question`` generates three persona candidates
+    # (contrarian / architect / researcher) concurrently and deterministically
+    # selects the one targeting the worst-scoring ambiguity dimension. Defaults
+    # to False so the single-call path — and every existing test — is preserved.
+    # Requires a stored per-dimension ambiguity breakdown; falls back to the
+    # single call when no breakdown or no valid candidate is available.
+    question_candidate_panel: bool = False
 
     def __post_init__(self) -> None:
         """Ensure state directory exists."""
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.model_is_explicit = self.model is not None
+        if self.model is None:
+            self.model = get_llm_model_for_role("interview")
+        secure_directory(self.state_dir)
+
+    def _require_llm_adapter(self) -> LLMAdapter:
+        """Return the LLM adapter or raise a clear error.
+
+        Read-only methods (``list_interviews``, ``save_state``, …) do not need
+        an LLM adapter.  Methods that call the LLM (``ask_next_question``,
+        ``_generate_question_candidates``, …) must call this guard first so the
+        error message explains *which* method requires an adapter and why.
+        """
+        if self.llm_adapter is None:
+            raise RuntimeError(
+                "This InterviewEngine method requires an llm_adapter, but none "
+                "was provided. Pass llm_adapter=... when constructing "
+                "InterviewEngine, or use a read-only method such as "
+                "list_interviews() that does not need one."
+            )
+        return self.llm_adapter
 
     def _state_file_path(self, interview_id: str) -> Path:
         """Get the path to the state file for an interview.
@@ -348,22 +983,52 @@ class InterviewEngine:
             is_brownfield=state.is_brownfield,
         )
 
+        # Persist the freshly-created state immediately so that downstream
+        # failures (e.g. a question-generation timeout) still leave a
+        # resumable handle on disk.  Hard-fail on save errors: the
+        # recovery contract downstream (recoverable ``MCPToolResult`` with
+        # ``meta.session_id`` returned from ``InterviewHandler`` on a
+        # first-question failure) assumes the on-disk state file exists.
+        # Returning ``Result.ok`` after a failed save would silently lie
+        # to callers that the session is resumable.  See Q00/ouroboros#687.
+        save_result = await self.save_state(state)
+        if save_result.is_err:
+            log.error(
+                "interview.start_save_failed",
+                interview_id=interview_id,
+                error=str(save_result.error),
+            )
+            return Result.err(
+                ValidationError(
+                    f"Failed to persist initial interview state: {save_result.error}",
+                    field="interview_id",
+                    value=interview_id,
+                )
+            )
+
         return Result.ok(state)
 
-    async def ask_next_question(
-        self, state: InterviewState
-    ) -> Result[str, ProviderError | ValidationError]:
-        """Generate the next question based on current state.
+    def prepare_next_question(
+        self,
+        state: InterviewState,
+        *,
+        language_calibration: InterviewCalibration | None = None,
+    ) -> Result[PreparedInterviewQuestion, ValidationError]:
+        """Build the canonical provider request for the next interview question.
 
-        Args:
-            state: Current interview state.
-
-        Returns:
-            Result containing the next question or error.
+        The ordinary question path and the atomic turn planner share this exact
+        prompt-budgeting boundary. This prevents a fused turn from drifting from
+        the long-context, glossary, reference, and PM-steering behavior already
+        owned by :class:`InterviewEngine`.
         """
-        if state.is_complete and state.needs_initial_context_summary:
-            return Result.ok(self._INITIAL_CONTEXT_SUMMARY_QUESTION)
+        from ouroboros.interview_adapters.independent_batch import has_pending_batch
 
+        if has_pending_batch(state):
+            return Result.err(ValidationError("Finish or discard the pending batch first"))
+        if state.is_complete and state.needs_initial_context_summary:
+            return Result.ok(
+                PreparedInterviewQuestion(immediate_question=self._INITIAL_CONTEXT_SUMMARY_QUESTION)
+            )
         if state.is_complete:
             return Result.err(
                 ValidationError(
@@ -372,11 +1037,17 @@ class InterviewEngine:
                     value=state.status,
                 )
             )
+
         effective_initial_context = self._effective_initial_context(state)
         if effective_initial_context is None:
-            return Result.ok(self._INITIAL_CONTEXT_SUMMARY_QUESTION)
+            return Result.ok(
+                PreparedInterviewQuestion(immediate_question=self._INITIAL_CONTEXT_SUMMARY_QUESTION)
+            )
 
-        # Build the context from previous rounds
+        adapter_question = state.next_adapter_question()
+        if adapter_question is not None:
+            return Result.ok(PreparedInterviewQuestion(immediate_question=adapter_question))
+
         conversation_history = self._build_conversation_history(
             state,
             initial_context=effective_initial_context,
@@ -384,34 +1055,76 @@ class InterviewEngine:
         preserve_prefix_messages = (
             1 if len(effective_initial_context) > self._MAX_INITIAL_CONTEXT_SYSTEM_CHARS else 0
         )
+        history_budget = (
+            self._MAX_TOTAL_PROMPT_CHARS
+            - self._MIN_SYSTEM_PROMPT_CHARS
+            - AGENT_SDK_CLI_FIXED_FRAMING_CHARS
+            - AGENT_SDK_CLI_PER_MESSAGE_FRAMING_CHARS
+        )
         conversation_history = self._trim_messages_to_budget(
             conversation_history,
-            max_chars=self._MAX_TOTAL_PROMPT_CHARS - self._MIN_SYSTEM_PROMPT_CHARS,
+            max_chars=history_budget,
             preserve_prefix_messages=preserve_prefix_messages,
         )
-
-        # Generate next question
-        history_chars = sum(len(message.content) for message in conversation_history)
+        history_cost = self._message_budget_cost(conversation_history)
         system_prompt_budget = min(
             self._MAX_SYSTEM_PROMPT_CHARS,
-            self._MAX_TOTAL_PROMPT_CHARS - history_chars,
+            self._MAX_TOTAL_PROMPT_CHARS
+            - AGENT_SDK_CLI_FIXED_FRAMING_CHARS
+            - AGENT_SDK_CLI_PER_MESSAGE_FRAMING_CHARS
+            - history_cost,
         )
         system_prompt = self._build_system_prompt(
             state,
             initial_context=effective_initial_context,
             max_chars=system_prompt_budget,
+            language_calibration=language_calibration,
         )
-        messages = [
+        messages = (
             Message(role=MessageRole.SYSTEM, content=system_prompt),
             *conversation_history,
-        ]
+        )
 
+        assert self.model is not None
         config = CompletionConfig(
             model=self.model,
+            role="clarification",
+            model_is_explicit=self.model_is_explicit,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
+        return Result.ok(
+            PreparedInterviewQuestion(
+                messages=messages,
+                config=config,
+                system_prompt=system_prompt,
+                conversation_history=tuple(conversation_history),
+                preserve_prefix_messages=preserve_prefix_messages,
+            )
+        )
 
+    async def ask_next_question(
+        self,
+        state: InterviewState,
+        *,
+        language_calibration: InterviewCalibration | None = None,
+    ) -> Result[str, ProviderError | ValidationError]:
+        """Generate the next question based on current state."""
+        if language_calibration is None:
+            prepared_result = self.prepare_next_question(state)
+        else:
+            prepared_result = self.prepare_next_question(
+                state,
+                language_calibration=language_calibration,
+            )
+        if prepared_result.is_err:
+            return Result.err(prepared_result.error)
+        prepared = prepared_result.value
+        if prepared.immediate_question is not None:
+            return Result.ok(prepared.immediate_question)
+
+        assert prepared.config is not None
+        messages = list(prepared.messages)
         log.debug(
             "interview.generating_question",
             interview_id=state.interview_id,
@@ -419,8 +1132,17 @@ class InterviewEngine:
             message_count=len(messages),
         )
 
-        result = await self.llm_adapter.complete(messages, config)
+        if self.question_candidate_panel:
+            candidate = await self._select_question_from_candidates(
+                state,
+                system_prompt=prepared.system_prompt,
+                conversation_history=list(prepared.conversation_history),
+                config=prepared.config,
+            )
+            if candidate is not None:
+                return Result.ok(candidate)
 
+        result = await self._require_llm_adapter().complete(messages, prepared.config)
         if result.is_err:
             log.warning(
                 "interview.question_generation_failed",
@@ -431,18 +1153,185 @@ class InterviewEngine:
             return Result.err(result.error)
 
         question = result.value.content.strip()
-
         log.info(
             "interview.question_generated",
             interview_id=state.interview_id,
             round_number=state.current_round_number,
             question_length=len(question),
         )
-
         return Result.ok(question)
 
+    async def ask_structured_first_question(
+        self,
+        state: InterviewState,
+        *,
+        language_calibration: InterviewCalibration | None = None,
+        multi_select: bool = False,
+    ) -> Result[FirstQuestionPresentation | None, ProviderError | ValidationError]:
+        """Generate the opt-in first presentation with a single provider call.
+
+        None means the existing deterministic length-guard question must be used.
+        Malformed provider output is an error, rather than user-visible JSON.
+        """
+        if state.rounds or self.question_candidate_panel:
+            return Result.err(ValidationError("Structured first question is unavailable"))
+        prepared_result = self.prepare_next_question(
+            state, language_calibration=language_calibration
+        )
+        if prepared_result.is_err:
+            return Result.err(prepared_result.error)
+        prepared = prepared_result.value
+        if prepared.immediate_question is not None:
+            return Result.ok(None)
+        assert prepared.config is not None
+        messages = list(prepared.messages)
+        messages.append(
+            Message(role=MessageRole.USER, content=first_question_instruction(multi_select))
+        )
+        result = await self._require_llm_adapter().complete(messages, prepared.config)
+        if result.is_err:
+            return Result.err(result.error)
+        try:
+            presentation = FirstQuestionPresentation.model_validate_json(result.value.content)
+        except ValueError:
+            return Result.err(ValidationError("Invalid structured first question"))
+        if presentation.multi_select != multi_select:
+            return Result.err(ValidationError("Invalid structured first question"))
+        return Result.ok(presentation)
+
+    async def rephrase_pending_question(
+        self,
+        question: str,
+        calibration: InterviewCalibration,
+    ) -> Result[str, ProviderError]:
+        """Reword a whole pending question, or return it unchanged if over budget."""
+        if len(question) > MAX_REPHRASE_QUESTION_CHARS:
+            # Optional wording must not omit constraints to fit the prompt budget.
+            # The calibration handler treats unchanged output as a truthful fallback.
+            return Result.ok(question)
+        messages = [
+            Message(
+                role=MessageRole.SYSTEM,
+                content=(
+                    "Rephrase exactly one requirements-interview question at the requested "
+                    "language level. Preserve every decision, constraint, and acceptance "
+                    "meaning. Define unfamiliar jargon inline, do not answer the question, "
+                    "do not add architecture recommendations, and return only the rephrased "
+                    "question in the user's language.\n\n"
+                    f"{calibration.prompt_guidance()}"
+                ),
+            ),
+            Message(
+                role=MessageRole.USER,
+                content=(
+                    f"User-stated evidence:\n{calibration.evidence}\n\n"
+                    f"Pending question:\n{question}"
+                ),
+            ),
+        ]
+        assert self.model is not None
+        result = await self._require_llm_adapter().complete(
+            messages,
+            CompletionConfig(
+                model=self.model,
+                role="clarification",
+                model_is_explicit=self.model_is_explicit,
+                temperature=0.1,
+                max_tokens=min(self.max_tokens, 600),
+            ),
+        )
+        if result.is_err:
+            return Result.err(result.error)
+        return Result.ok(result.value.content.strip())
+
+    async def _select_question_from_candidates(
+        self,
+        state: InterviewState,
+        *,
+        system_prompt: str,
+        conversation_history: list[Message],
+        config: CompletionConfig,
+    ) -> str | None:
+        """Generate persona candidates and deterministically select one.
+
+        Returns the selected question, or ``None`` to signal the caller should
+        fall back to the single-call path (no stored breakdown, or no valid
+        candidate produced).
+        """
+        dimension_clarity = _dimension_clarity_from_breakdown(state.ambiguity_breakdown)
+        if not dimension_clarity:
+            return None
+
+        candidates = await self._generate_question_candidates(
+            state,
+            system_prompt=system_prompt,
+            conversation_history=conversation_history,
+            config=config,
+        )
+        if not candidates:
+            return None
+
+        selected = select_question_candidate(candidates, dimension_clarity)
+        log.info(
+            "interview.question_candidate_selected",
+            interview_id=state.interview_id,
+            persona=selected.persona,
+            target_dimension=selected.target_dimension,
+            candidate_count=len(candidates),
+        )
+        return selected.question
+
+    async def _generate_question_candidates(
+        self,
+        state: InterviewState,
+        *,
+        system_prompt: str,
+        conversation_history: list[Message],
+        config: CompletionConfig,
+    ) -> list[QuestionCandidate]:
+        """Generate one persona question candidate per persona, concurrently."""
+        persona_roles = _question_candidate_persona_roles()
+
+        async def _one(persona: str) -> QuestionCandidate | None:
+            role = persona_roles.get(persona, persona)
+            persona_prompt = (
+                f"{system_prompt}\n\n"
+                f"## Persona Lens: {persona} — {role}\n"
+                "Propose ONE clarifying question through this persona's lens, "
+                "aimed at the single ambiguity dimension you judge weakest.\n\n"
+                "Respond ONLY with JSON, no other text:\n"
+                '{"question": "string", "target_dimension": "goal_clarity" | '
+                '"constraint_clarity" | "success_criteria_clarity" | '
+                '"context_clarity"}'
+            )
+            messages = [
+                Message(role=MessageRole.SYSTEM, content=persona_prompt),
+                *conversation_history,
+            ]
+            try:
+                result = await self._require_llm_adapter().complete(messages, config)
+            except Exception as exc:  # noqa: BLE001 - candidate is best-effort
+                log.warning(
+                    "interview.question_candidate_failed",
+                    interview_id=state.interview_id,
+                    persona=persona,
+                    error=str(exc),
+                )
+                return None
+            if result.is_err:
+                return None
+            return _parse_question_candidate(persona, result.value.content)
+
+        results = await asyncio.gather(*(_one(persona) for persona in QUESTION_CANDIDATE_PERSONAS))
+        return [candidate for candidate in results if candidate is not None]
+
     async def record_response(
-        self, state: InterviewState, user_response: str, question: str
+        self,
+        state: InterviewState,
+        user_response: str,
+        question: str,
+        *,
+        question_id: str | None = None,
     ) -> Result[InterviewState, ValidationError]:
         """Record the user's response to the current question.
 
@@ -485,15 +1374,10 @@ class InterviewEngine:
                 prior_completion_candidate_streak=prior_streak,
             )
 
-        # Create new round
-        round_data = InterviewRound(
-            round_number=state.current_round_number,
-            question=question,
-            user_response=user_response,
-        )
-
-        state.rounds.append(round_data)
-        state.mark_updated()
+        try:
+            round_data = state.record_answer(question, user_response, question_id=question_id)
+        except ValueError as exc:
+            return Result.err(ValidationError(str(exc), field="question_id"))
 
         log.info(
             "interview.response_recorded",
@@ -523,14 +1407,14 @@ class InterviewEngine:
         try:
             file_path = self._state_file_path(state.interview_id)
             state.mark_updated()
-            # Serialize while still on the event-loop (CPU-bound, not I/O)
-            content = state.model_dump_json(indent=2)
+            durability_confirmed = await save_interview_state_checked(file_path, state)
 
-            def _sync_write() -> None:
-                with _file_lock(file_path, exclusive=True):
-                    file_path.write_text(content, encoding="utf-8")
-
-            await asyncio.to_thread(_sync_write)
+            if not durability_confirmed:
+                log.warning(
+                    "interview.state_save_durability_uncertain",
+                    interview_id=state.interview_id,
+                    file_path=str(file_path),
+                )
 
             log.info(
                 "interview.state_saved",
@@ -540,17 +1424,9 @@ class InterviewEngine:
 
             return Result.ok(file_path)
         except (OSError, ValueError) as e:
-            log.exception(
-                "interview.state_save_failed",
-                interview_id=state.interview_id,
-                error=str(e),
-            )
-            return Result.err(
-                ValidationError(
-                    f"Failed to save interview state: {e}",
-                    details={"interview_id": state.interview_id},
-                )
-            )
+            from ouroboros.bigbang.interview_state_errors import save_error
+
+            return save_error(e, state.interview_id)
 
     async def load_state(self, interview_id: str) -> Result[InterviewState, ValidationError]:
         """Load interview state from disk.
@@ -585,6 +1461,8 @@ class InterviewEngine:
             content = await asyncio.to_thread(_sync_read)
 
             state = InterviewState.model_validate_json(content)
+            state._loaded_revision = state.persistence_revision
+            state.discard_stale_requirement_distillation()
 
             log.info(
                 "interview.state_loaded",
@@ -594,25 +1472,16 @@ class InterviewEngine:
 
             return Result.ok(state)
         except (OSError, ValueError) as e:
-            log.exception(
-                "interview.state_load_failed",
-                interview_id=interview_id,
-                error=str(e),
-            )
-            return Result.err(
-                ValidationError(
-                    f"Failed to load interview state: {e}",
-                    field="interview_id",
-                    value=interview_id,
-                    details={"file_path": str(file_path)},
-                )
-            )
+            from ouroboros.bigbang.interview_state_errors import load_error
+
+            return load_error(e, interview_id, file_path)
 
     def _build_system_prompt(
         self,
         state: InterviewState,
         initial_context: str | None = None,
         max_chars: int | None = None,
+        language_calibration: InterviewCalibration | None = None,
     ) -> str:
         """Build the system prompt for question generation.
 
@@ -629,9 +1498,14 @@ class InterviewEngine:
         from ouroboros.agents.loader import load_agent_prompt
 
         max_prompt_chars = max_chars or self._MAX_SYSTEM_PROMPT_CHARS
-        round_info = f"Round {state.current_round_number}"
+        effective_round_number = self._next_conversation_round_number(state)
+        round_info = f"Round {effective_round_number}"
 
-        base_prompt = load_agent_prompt("socratic-interviewer")
+        base_prompt = (
+            _TOOLLESS_INTERVIEW_BASE_PROMPT
+            if self.suppress_tool_use_prompt_cues
+            else load_agent_prompt("socratic-interviewer")
+        )
 
         context_for_prompt = (
             initial_context if initial_context is not None else state.initial_context
@@ -639,37 +1513,57 @@ class InterviewEngine:
         prompt_initial_context = self._initial_context_for_system_prompt(context_for_prompt)
 
         # For first round, add explicit instruction to start directly with a question
-        if state.current_round_number == 1:
+        if effective_round_number == 1:
             dynamic_header = (
                 f"You are an expert requirements engineer conducting a Socratic interview.\n\n"
                 f"CRITICAL: Start your FIRST response with a DIRECT QUESTION about the project. "
                 f'Do NOT introduce yourself. Do NOT say "I\'ll conduct" or "Let me ask". '
                 f"Just ask a specific, clarifying question immediately.\n\n"
                 f"This is {round_info}. Your ONLY job is to ask questions that reduce ambiguity.\n\n"
+                f"{RESPONSE_CONTRACT}\n\n"
                 f"Initial context: {prompt_initial_context}\n"
             )
         else:
             dynamic_header = (
                 f"You are an expert requirements engineer conducting a Socratic interview.\n\n"
                 f"This is {round_info}. Your ONLY job is to ask questions that reduce ambiguity.\n\n"
+                f"{RESPONSE_CONTRACT}\n\n"
                 f"Initial context: {prompt_initial_context}\n"
             )
 
+        if language_calibration is not None:
+            dynamic_header += f"\n\n{language_calibration.prompt_guidance()}"
+
         # Answer prefix hints — always present so the question generator
         # can interpret enriched answers regardless of brownfield status.
-        dynamic_header += (
-            "\n\nAnswer prefixes the caller may use:\n"
-            "- [from-code]: Existing codebase state (factual, read from files).\n"
-            "- [from-user]: Human decisions/judgments.\n"
-            "- [from-research]: Externally researched information (API docs, pricing, compatibility)."
-        )
+        if self.suppress_tool_use_prompt_cues:
+            dynamic_header += (
+                "\n\nAnswer prefixes the caller may use:\n"
+                "- [from-code]: Caller-supplied existing-system context (factual).\n"
+                "- [from-user]: Human decisions/judgments.\n"
+                "- [from-research]: Caller-supplied external context."
+            )
+        else:
+            dynamic_header += (
+                "\n\nAnswer prefixes the caller may use:\n"
+                "- [from-code]: Existing codebase state (factual, read from files).\n"
+                "- [from-user]: Human decisions/judgments.\n"
+                "- [from-research]: Externally researched information (API docs, pricing, compatibility)."
+            )
         # Brownfield hint: main session handles code reading, MCP just asks questions
         if state.is_brownfield:
-            dynamic_header += (
-                "\n\nThis is a BROWNFIELD project. The caller (main session) has direct "
-                "codebase access and will enrich answers with code context. Focus your "
-                "questions on INTENT and DECISIONS, not on discovering what exists."
-            )
+            if self.suppress_tool_use_prompt_cues:
+                dynamic_header += (
+                    "\n\nThis is a BROWNFIELD project. The caller will enrich answers "
+                    "with existing-system context. Focus your questions on INTENT and "
+                    "DECISIONS, not on discovering what exists."
+                )
+            else:
+                dynamic_header += (
+                    "\n\nThis is a BROWNFIELD project. The caller (main session) has direct "
+                    "codebase access and will enrich answers with code context. Focus your "
+                    "questions on INTENT and DECISIONS, not on discovering what exists."
+                )
 
         ambiguity_snapshot = self._build_ambiguity_snapshot_prompt(state)
         if ambiguity_snapshot:
@@ -682,6 +1576,12 @@ class InterviewEngine:
         # Preserve the dynamic header first; it contains the capped initial
         # context and first-turn instructions. Trim the optional panel/base
         # prompt before falling back to hard-truncating the header.
+        #
+        # The interviewer contract does not compete for this budget: it rides in
+        # the dynamic header, which is preserved first. Reserving a slice of the
+        # base agent prompt for the same rules was tried and removed — it bought
+        # one guarantee twice and took the characters from the perspective panel
+        # and, at saturated caps, from the user's own retained context.
         available_after_header = max_prompt_chars - len(dynamic_header) - _OVERHEAD
         if available_after_header <= 0:
             dynamic_header = dynamic_header[: max_prompt_chars - _OVERHEAD]
@@ -801,14 +1701,15 @@ class InterviewEngine:
 
         perspectives: list[InterviewPerspective] = [InterviewPerspective.BREADTH_KEEPER]
 
-        if state.current_round_number <= 2:
+        effective_round_number = self._next_conversation_round_number(state)
+        if effective_round_number <= 2:
             perspectives.extend(
                 [
                     InterviewPerspective.RESEARCHER,
                     InterviewPerspective.SIMPLIFIER,
                 ]
             )
-        elif state.current_round_number <= 5:
+        elif effective_round_number <= 5:
             perspectives.extend(
                 [
                     InterviewPerspective.RESEARCHER,
@@ -829,7 +1730,17 @@ class InterviewEngine:
             state.ambiguity_score is not None
             and state.ambiguity_score <= SEED_CLOSER_ACTIVATION_THRESHOLD
         ):
-            perspectives.append(InterviewPerspective.SEED_CLOSER)
+            # Closure rounds run a narrower panel, led by the closer. Two
+            # reasons, one budget and one substantive: the panel is trimmed
+            # from the tail, so appending the closer would drop it in exactly
+            # the rounds it exists for; and researcher/simplifier drilling is
+            # the behavior closure is meant to stop. The characters this frees
+            # are what let the base agent prompt survive the same round.
+            perspectives = [
+                InterviewPerspective.SEED_CLOSER,
+                InterviewPerspective.BREADTH_KEEPER,
+                InterviewPerspective.ARCHITECT,
+            ]
 
         if state.is_brownfield and InterviewPerspective.ARCHITECT not in perspectives:
             perspectives.append(InterviewPerspective.ARCHITECT)
@@ -839,6 +1750,21 @@ class InterviewEngine:
 
     def _build_perspective_panel_prompt(self, state: InterviewState) -> str:
         """Build instructions for the internal perspective panel."""
+        if self.suppress_tool_use_prompt_cues:
+            return "\n".join(
+                [
+                    "## Perspective Panel",
+                    "Silently check breadth, simplicity, architecture, and closure readiness.",
+                    "Use those perspectives only to choose one clarifying question.",
+                    "",
+                    "## Panel Synthesis Rules",
+                    "- Keep independent ambiguity tracks visible instead of collapsing onto one favorite subtopic.",
+                    "- Preserve both implementation and written-output requirements when the user asked for both.",
+                    "- Prefer breadth recap questions when multiple unresolved tracks still exist.",
+                    "- Only ask a closure question when closure mode is active; otherwise keep drilling into the weakest area.",
+                    "- Even when the score is seed-ready, do not end the interview on the first low-ambiguity turn.",
+                ]
+            )
         strategies = _load_interview_perspective_strategies()
         sections = [
             "## Perspective Panel",
@@ -873,10 +1799,21 @@ class InterviewEngine:
 
         return "\n".join(sections)
 
+    def _next_conversation_round_number(self, state: InterviewState) -> int:
+        """Return the next real interview round, ignoring summary sentinels."""
+        return (
+            sum(
+                1
+                for round_data in state.rounds
+                if round_data.question != self._INITIAL_CONTEXT_SUMMARY_QUESTION
+            )
+            + 1
+        )
+
     # Agent SDK CLI can return empty responses when the combined prompt
     # (system_prompt + conversation history) exceeds an internal threshold.
     # Cap each user response to keep the total prompt within safe limits.
-    _MAX_USER_RESPONSE_CHARS = 800
+    _MAX_USER_RESPONSE_CHARS = 4000
 
     def _build_conversation_history(
         self,
@@ -901,9 +1838,22 @@ class InterviewEngine:
             initial_context if initial_context is not None else state.initial_context
         )
 
+        has_conversation_rounds = self._next_conversation_round_number(state) > 1
         overflow = self._initial_context_overflow_message(context_for_prompt)
         if overflow:
             messages.append(Message(role=MessageRole.USER, content=overflow))
+        elif not has_conversation_rounds and context_for_prompt:
+            # Some chat providers reject a first request that contains only a
+            # system message. Mirror the user's initial context as the first
+            # user turn so provider adapters always receive a non-system
+            # conversation message on round one. Summary-recovery sentinel
+            # rounds do not count as conversation because they are skipped
+            # below. Long contexts keep using the overflow path above to
+            # preserve prompt-budget caps.
+            user_content = context_for_prompt
+            if len(user_content) > self._MAX_USER_RESPONSE_CHARS:
+                user_content = user_content[: self._MAX_USER_RESPONSE_CHARS] + "..."
+            messages.append(Message(role=MessageRole.USER, content=user_content))
 
         for round_data in state.rounds:
             if round_data.question == self._INITIAL_CONTEXT_SUMMARY_QUESTION:
@@ -917,6 +1867,12 @@ class InterviewEngine:
 
         return messages
 
+    def _message_budget_cost(self, messages: list[Message]) -> int:
+        """Estimate serialized CLI prompt cost for message content and framing."""
+        return sum(
+            len(message.content) + AGENT_SDK_CLI_PER_MESSAGE_FRAMING_CHARS for message in messages
+        )
+
     def _trim_messages_to_budget(
         self,
         messages: list[Message],
@@ -924,23 +1880,25 @@ class InterviewEngine:
         max_chars: int,
         preserve_prefix_messages: int = 0,
     ) -> list[Message]:
-        """Keep durable prefix messages plus newest conversation within a budget."""
-        if sum(len(message.content) for message in messages) <= max_chars:
+        """Keep durable prefix messages plus newest conversation within a CLI budget."""
+        if self._message_budget_cost(messages) <= max_chars:
             return messages
 
         prefix = messages[:preserve_prefix_messages]
         remaining_messages = messages[preserve_prefix_messages:]
-        prefix_chars = sum(len(message.content) for message in prefix)
+        prefix_chars = self._message_budget_cost(prefix)
         if prefix_chars >= max_chars:
             retained_prefix: list[Message] = []
             used_prefix_chars = 0
             for message in prefix:
-                remaining = max_chars - used_prefix_chars
+                remaining = max_chars - used_prefix_chars - AGENT_SDK_CLI_PER_MESSAGE_FRAMING_CHARS
                 if remaining <= 0:
                     break
                 if len(message.content) <= remaining:
                     retained_prefix.append(message)
-                    used_prefix_chars += len(message.content)
+                    used_prefix_chars += (
+                        len(message.content) + AGENT_SDK_CLI_PER_MESSAGE_FRAMING_CHARS
+                    )
                 else:
                     retained_prefix.append(
                         Message(role=message.role, content=message.content[:remaining])
@@ -951,12 +1909,12 @@ class InterviewEngine:
         retained: list[Message] = []
         used_chars = prefix_chars
         for message in reversed(remaining_messages):
-            remaining = max_chars - used_chars
+            remaining = max_chars - used_chars - AGENT_SDK_CLI_PER_MESSAGE_FRAMING_CHARS
             if remaining <= 0:
                 break
             if len(message.content) <= remaining:
                 retained.append(message)
-                used_chars += len(message.content)
+                used_chars += len(message.content) + AGENT_SDK_CLI_PER_MESSAGE_FRAMING_CHARS
             else:
                 retained.append(Message(role=message.role, content=message.content[-remaining:]))
                 break
@@ -1009,11 +1967,9 @@ class InterviewEngine:
                     }
                 )
             except (OSError, ValueError) as e:
-                log.warning(
-                    "interview.list_failed_for_file",
-                    file_path=str(file_path),
-                    error=str(e),
-                )
+                from ouroboros.bigbang.interview_state_errors import list_error
+
+                list_error(e, file_path)
                 continue
 
         return sorted(interviews, key=lambda x: x["updated_at"], reverse=True)

@@ -1,7 +1,7 @@
 """Skill Registry with auto-discovery and hot-reload.
 
 This module provides a skill registry that:
-- Auto-discovers skills from .claude-plugin/skills/ directory
+- Auto-discovers skills from the skills/ directory
 - Hot-reloads skills when SKILL.md files change
 - Validates skill metadata from frontmatter
 - Provides trigger pattern matching for magic keywords
@@ -173,7 +173,7 @@ else:
 class SkillRegistry:
     """Auto-discovering, hot-reloading skill registry.
 
-    The registry scans .claude-plugin/skills/ for skill definitions,
+    The registry scans the skills/ directory for skill definitions,
     parses SKILL.md frontmatter, and maintains an index of
     trigger patterns for fast matching.
 
@@ -190,7 +190,7 @@ class SkillRegistry:
         """Initialize the skill registry.
 
         Args:
-            skill_dir: Path to skills directory. Defaults to .claude-plugin/skills/.
+            skill_dir: Path to skills directory. Defaults to skills/.
         """
         self._skill_dir = skill_dir or self.DEFAULT_SKILL_DIR
         self._skills: dict[str, SkillInstance] = {}
@@ -681,10 +681,18 @@ class SkillRegistry:
         """
         prefixes = list(self._normalize_string_sequence(frontmatter.get("magic_prefixes")))
 
-        # Auto-generate from skill name
-        prefixes.append(f"ouroboros:{skill_name}")
-        prefixes.append(f"ooo:{skill_name}")
-        prefixes.append(f"/ouroboros:{skill_name}")
+        # The directory name is the stable runtime identity. Frontmatter may
+        # expose a different host-facing registration name to avoid reserved
+        # commands, so accept both spellings and resolve both to ``skill_name``.
+        command_names = [skill_name]
+        display_name = frontmatter.get("name")
+        if isinstance(display_name, str) and display_name.strip():
+            command_names.append(display_name.strip())
+
+        for command_name in dict.fromkeys(command_names):
+            prefixes.append(f"ouroboros:{command_name}")
+            prefixes.append(f"ooo:{command_name}")
+            prefixes.append(f"/ouroboros:{command_name}")
 
         return tuple(dict.fromkeys(prefixes))
 

@@ -8,6 +8,8 @@ deliberately left untouched here.
 
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,11 +18,13 @@ from ouroboros.core.types import Result
 from ouroboros.evaluation.models import (
     CheckResult,
     CheckType,
+    ConsensusResult,
     EvaluationResult,
     MechanicalResult,
     SemanticResult,
+    Vote,
 )
-from ouroboros.mcp.tools.evaluation_handlers import EvaluateHandler
+from ouroboros.mcp.tools.evaluation_handlers import EvaluateHandler, _resolve_evaluate_working_dir
 from ouroboros.mcp.types import ToolInputType
 
 
@@ -49,7 +53,9 @@ def _passing_eval(execution_id: str) -> EvaluationResult:
         execution_id=execution_id,
         stage1_result=MechanicalResult(
             passed=True,
-            checks=(CheckResult(check_type=CheckType.LINT, passed=True, message="ok"),),
+            checks=(
+                CheckResult(check_type=CheckType.LINT, passed=True, message="ok", executed=True),
+            ),
         ),
         stage2_result=_semantic_result(
             ac_compliance=True,
@@ -70,6 +76,189 @@ def _failing_eval(execution_id: str, *, reason: str) -> EvaluationResult:
         ),
         final_approved=False,
     )
+
+
+def _stage1_failing_eval(execution_id: str) -> EvaluationResult:
+    return EvaluationResult(
+        execution_id=execution_id,
+        stage1_result=MechanicalResult(
+            passed=False,
+            checks=(CheckResult(check_type=CheckType.TEST, passed=False, message="failed"),),
+        ),
+        final_approved=False,
+    )
+
+
+def _stage3_failing_eval(execution_id: str) -> EvaluationResult:
+    return EvaluationResult(
+        execution_id=execution_id,
+        stage1_result=MechanicalResult(
+            passed=True,
+            checks=(
+                CheckResult(check_type=CheckType.TEST, passed=True, message="ok", executed=True),
+            ),
+        ),
+        stage2_result=_semantic_result(
+            ac_compliance=True,
+            score=0.9,
+            reasoning="AC met before consensus",
+        ),
+        stage3_result=ConsensusResult(
+            approved=False,
+            votes=(Vote(model="reviewer", approved=False, confidence=0.9, reasoning="no"),),
+            majority_ratio=0.0,
+        ),
+        final_approved=False,
+    )
+
+
+class TestEvaluateWorkingDirResolution:
+    """Working dir fallback keeps Stage 2 pointed at the project root."""
+
+    async def test_explicit_working_dir_wins(self, tmp_path: Path) -> None:
+        explicit = tmp_path / "project"
+        explicit.mkdir()
+
+        with patch(
+            "ouroboros.mcp.tools.evaluation_handlers._default_brownfield_project_dir",
+            new=AsyncMock(return_value=tmp_path / "default"),
+        ):
+            resolved = await _resolve_evaluate_working_dir(str(explicit), None)
+
+        assert resolved == explicit.resolve()
+
+    async def test_brownfield_default_used_before_cwd(self, tmp_path: Path, monkeypatch) -> None:
+        cwd = tmp_path / "hermes"
+        default = tmp_path / "repo"
+        cwd.mkdir()
+        default.mkdir()
+        monkeypatch.chdir(cwd)
+
+        with patch(
+            "ouroboros.mcp.tools.evaluation_handlers._default_brownfield_project_dir",
+            new=AsyncMock(return_value=default),
+        ):
+            resolved = await _resolve_evaluate_working_dir(None, None)
+
+        assert resolved == default.resolve()
+
+    async def test_seed_metadata_used_when_no_default(self, tmp_path: Path, monkeypatch) -> None:
+        cwd = tmp_path / "hermes"
+        project = cwd / "project"
+        project.mkdir(parents=True)
+        monkeypatch.chdir(cwd)
+        seed = SimpleNamespace(
+            metadata=SimpleNamespace(project_dir="project", working_directory=None),
+            brownfield_context=None,
+        )
+
+        with patch(
+            "ouroboros.mcp.tools.evaluation_handlers._default_brownfield_project_dir",
+            new=AsyncMock(return_value=None),
+        ):
+            resolved = await _resolve_evaluate_working_dir(None, seed)
+
+        assert resolved == project.resolve()
+
+    async def test_brownfield_default_wins_over_seed_metadata(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        cwd = tmp_path / "hermes"
+        default = tmp_path / "repo-default"
+        seed_project = cwd / "seed-project"
+        cwd.mkdir()
+        default.mkdir()
+        seed_project.mkdir()
+        monkeypatch.chdir(cwd)
+        seed = SimpleNamespace(
+            metadata=SimpleNamespace(project_dir="seed-project", working_directory=None),
+            brownfield_context=None,
+        )
+
+        with patch(
+            "ouroboros.mcp.tools.evaluation_handlers._default_brownfield_project_dir",
+            new=AsyncMock(return_value=default),
+        ):
+            resolved = await _resolve_evaluate_working_dir(None, seed)
+
+        assert resolved == default.resolve()
+
+    async def test_stale_brownfield_default_falls_back_to_seed(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        cwd = tmp_path / "hermes"
+        stale_default = tmp_path / "missing-default"
+        seed_project = cwd / "seed-project"
+        cwd.mkdir()
+        seed_project.mkdir()
+        monkeypatch.chdir(cwd)
+        seed = SimpleNamespace(
+            metadata=SimpleNamespace(project_dir="seed-project", working_directory=None),
+            brownfield_context=None,
+        )
+
+        with patch(
+            "ouroboros.mcp.tools.evaluation_handlers._default_brownfield_project_dir",
+            new=AsyncMock(return_value=stale_default),
+        ):
+            resolved = await _resolve_evaluate_working_dir(None, seed)
+
+        assert resolved == seed_project.resolve()
+
+    async def test_non_directory_brownfield_default_falls_back_to_seed(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        cwd = tmp_path / "hermes"
+        file_default = tmp_path / "default-file"
+        seed_project = cwd / "seed-project"
+        cwd.mkdir()
+        file_default.write_text("not a directory")
+        seed_project.mkdir()
+        monkeypatch.chdir(cwd)
+        seed = SimpleNamespace(
+            metadata=SimpleNamespace(project_dir="seed-project", working_directory=None),
+            brownfield_context=None,
+        )
+
+        with patch(
+            "ouroboros.mcp.tools.evaluation_handlers._default_brownfield_project_dir",
+            new=AsyncMock(return_value=file_default),
+        ):
+            resolved = await _resolve_evaluate_working_dir(None, seed)
+
+        assert resolved == seed_project.resolve()
+
+    async def test_seed_metadata_escape_falls_back_to_cwd(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        cwd = tmp_path / "hermes"
+        outside = tmp_path / "outside"
+        cwd.mkdir()
+        outside.mkdir()
+        monkeypatch.chdir(cwd)
+        seed = SimpleNamespace(
+            metadata=SimpleNamespace(project_dir=str(outside), working_directory=None),
+            brownfield_context=None,
+        )
+
+        with patch(
+            "ouroboros.mcp.tools.evaluation_handlers._default_brownfield_project_dir",
+            new=AsyncMock(return_value=None),
+        ):
+            resolved = await _resolve_evaluate_working_dir(None, seed)
+
+        assert resolved == cwd.resolve()
+
+    async def test_cwd_fallback_last(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.chdir(tmp_path)
+
+        with patch(
+            "ouroboros.mcp.tools.evaluation_handlers._default_brownfield_project_dir",
+            new=AsyncMock(return_value=None),
+        ):
+            resolved = await _resolve_evaluate_working_dir(None, None)
+
+        assert resolved == tmp_path.resolve()
 
 
 class TestDefinitionAcceptsMultiAC:
@@ -253,7 +442,57 @@ class TestMultiACRoutingBoundary:
         assert meta["run_feedback"] == []
         assert len(meta["checklist"]) == 2
         assert all(item["passed"] for item in meta["checklist"])
+        assert set(meta["checklist"][0]) == {
+            "ac_text",
+            "passed",
+            "reasoning",
+            "evidence",
+            "questions_used",
+            "failure_reason",
+        }
         assert "ALL PASSED" in result.value.text_content
+
+    async def test_seed_acceptance_criteria_used_when_explicit_ac_absent(self) -> None:
+        mock_pipeline = self._install_pipeline_mock(
+            [_passing_eval("s_seed"), _passing_eval("s_seed")]
+        )
+        seed_content = (
+            "goal: Build a CLI task manager\n"
+            "acceptance_criteria:\n"
+            "  - Tasks can be created\n"
+            "  - Tasks can be listed\n"
+            "ontology_schema:\n"
+            "  name: TaskManager\n"
+            "  description: Task management domain\n"
+            "metadata:\n"
+            "  ambiguity_score: 0.15\n"
+        )
+
+        with (
+            patch("ouroboros.evaluation.EvaluationPipeline") as MockPipeline,
+            patch(
+                "ouroboros.persistence.event_store.EventStore",
+                return_value=AsyncMock(initialize=AsyncMock()),
+            ),
+        ):
+            MockPipeline.return_value = mock_pipeline
+            handler = EvaluateHandler()
+            result = await handler.handle(
+                {
+                    "session_id": "s_seed",
+                    "artifact": "def f(): pass",
+                    "seed_content": seed_content,
+                }
+            )
+
+        assert result.is_ok
+        meta = result.value.meta
+        assert meta["multi_ac"] is True
+        assert meta["ac_count"] == 2
+        assert [item["ac_text"] for item in meta["checklist"]] == [
+            "Tasks can be created",
+            "Tasks can be listed",
+        ]
 
     async def test_mixed_outcomes_produce_incomplete_checklist(self) -> None:
         """One passing + one failing AC → run_feedback lists the failure."""
@@ -287,10 +526,42 @@ class TestMultiACRoutingBoundary:
         assert meta["ac_count"] == 2
         assert meta["passed_count"] == 1
         assert meta["final_approved"] is False
+        assert meta["highest_stage"] == 2
         assert len(meta["run_feedback"]) == 1
         assert "Webhook validated" in meta["run_feedback"][0]
         assert "INCOMPLETE" in result.value.text_content
         assert "[ ] 2. Webhook validated" in result.value.text_content
+
+    @pytest.mark.parametrize(
+        ("evaluation", "expected_stage"),
+        [(_stage1_failing_eval("stage1"), 1), (_stage3_failing_eval("stage3"), 3)],
+    )
+    async def test_multi_ac_meta_preserves_rejected_pipeline_stage(
+        self,
+        evaluation: EvaluationResult,
+        expected_stage: int,
+    ) -> None:
+        mock_pipeline = self._install_pipeline_mock([evaluation, evaluation])
+
+        with (
+            patch("ouroboros.evaluation.EvaluationPipeline") as MockPipeline,
+            patch(
+                "ouroboros.persistence.event_store.EventStore",
+                return_value=AsyncMock(initialize=AsyncMock()),
+            ),
+        ):
+            MockPipeline.return_value = mock_pipeline
+            result = await EvaluateHandler().handle(
+                {
+                    "session_id": f"s-stage-{expected_stage}",
+                    "artifact": "artifact",
+                    "acceptance_criteria": ["AC one", "AC two"],
+                }
+            )
+
+        assert result.is_ok
+        assert result.value.meta["final_approved"] is False
+        assert result.value.meta["highest_stage"] == expected_stage
 
     async def test_empty_strings_in_list_are_filtered(self) -> None:
         """Whitespace/empty entries in acceptance_criteria are ignored.

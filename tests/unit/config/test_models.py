@@ -1,9 +1,13 @@
 """Unit tests for ouroboros.config.models module."""
 
+from pathlib import Path
+from typing import get_args
+
 from pydantic import ValidationError
 import pytest
 
 from ouroboros.config.models import (
+    VALID_RUNTIME_BACKENDS,
     ClarificationConfig,
     ConsensusConfig,
     CredentialsConfig,
@@ -12,6 +16,8 @@ from ouroboros.config.models import (
     EvaluationConfig,
     ExecutionConfig,
     LLMConfig,
+    LLMProviderProfileConfig,
+    LLMTaskProfileConfig,
     LoggingConfig,
     ModelConfig,
     OrchestratorConfig,
@@ -20,10 +26,13 @@ from ouroboros.config.models import (
     ProviderCredentials,
     ResilienceConfig,
     RuntimeControlsConfig,
+    RuntimeProfileConfig,
     TierConfig,
+    event_store_path_from_config,
     get_config_dir,
     get_default_config,
     get_default_credentials,
+    resolve_event_store_path,
 )
 
 
@@ -169,6 +178,21 @@ class TestClarificationConfig:
         assert config.ambiguity_threshold == 0.2
         assert config.max_interview_rounds == 10
         assert config.model_tier == "standard"
+        assert config.default_model == "auto"
+
+
+class TestModelsConfig:
+    """Test the automatic model selection section."""
+
+    def test_models_config_defaults_to_auto_without_pin(self) -> None:
+        config = OuroborosConfig()
+        assert config.models.default == "auto"
+        assert config.models.pin is False
+
+    def test_models_config_accepts_pin(self) -> None:
+        config = OuroborosConfig.model_validate({"models": {"default": "frontier", "pin": True}})
+        assert config.models.default == "frontier"
+        assert config.models.pin is True
 
     def test_clarification_ambiguity_threshold_bounds(self) -> None:
         """ClarificationConfig ambiguity_threshold must be in [0, 1]."""
@@ -198,10 +222,12 @@ class TestLLMConfig:
         assert config.backend == "claude_code"
         assert config.permission_mode == "default"
         assert config.opencode_permission_mode == "acceptEdits"
-        assert config.qa_model == "claude-sonnet-4-20250514"
-        assert config.dependency_analysis_model == "claude-opus-4-6"
-        assert config.ontology_analysis_model == "claude-opus-4-6"
-        assert config.context_compression_model == "gpt-4"
+        assert config.qa_model == "auto"
+        # Every model field defaults to automatic selection; the standard tier
+        # for these meta-tasks lives in ``config.model_selection.ROLE_TIERS``.
+        assert config.dependency_analysis_model == "auto"
+        assert config.ontology_analysis_model == "auto"
+        assert config.context_compression_model == "auto"
 
     def test_llm_config_accepts_claude_shorthand(self) -> None:
         """LLMConfig accepts 'claude' as a backend alias."""
@@ -213,6 +239,82 @@ class TestLLMConfig:
         config = LLMConfig(backend="opencode")
         assert config.backend == "opencode"
 
+    def test_llm_config_accepts_pi_backend(self) -> None:
+        """LLMConfig accepts Pi as a local CLI backend."""
+        config = LLMConfig(backend="pi")
+        assert config.backend == "pi"
+
+    def test_llm_config_accepts_omp_backend(self) -> None:
+        """LLMConfig accepts OMP as a local CLI backend."""
+        config = LLMConfig(backend="omp")
+        assert config.backend == "omp"
+
+    def test_llm_config_accepts_gjc_backend(self) -> None:
+        """LLMConfig accepts GJC now that the GJC LLM adapter is registered."""
+        config = LLMConfig(backend="gjc")
+        assert config.backend == "gjc"
+
+    def test_llm_config_accepts_zcode_backend(self) -> None:
+        """LLMConfig accepts zcode now that the zcode LLM adapter is registered."""
+        config = LLMConfig(backend="zcode")
+        assert config.backend == "zcode"
+
+    def test_llm_config_zcode_persists_in_orchestrator_config(self) -> None:
+        """zcode LLM backend survives persisted-config validation (OuroborosConfig).
+
+        Regression for the end-to-end gap where the capability/factory/loader
+        layers advertised zcode as an LLM backend but ``LLMConfig.backend``
+        rejected it, so a saved ``llm.backend: zcode`` could not load.
+        """
+        config = OuroborosConfig(llm=LLMConfig(backend="zcode"))
+        assert config.llm.backend == "zcode"
+
+
+class TestLLMTaskProfileConfig:
+    """Test provider-neutral LLM task profile configuration."""
+
+    def test_llm_task_profile_config_creation(self) -> None:
+        """Task profiles store portable defaults and provider overrides."""
+        profile = LLMTaskProfileConfig(
+            temperature=0.2,
+            max_tokens=2048,
+            max_turns=1,
+            providers={
+                "codex": LLMProviderProfileConfig(
+                    profile="ouroboros-fast",
+                    model="gpt-5.3-codex-spark",
+                ),
+            },
+        )
+
+        assert profile.temperature == 0.2
+        assert profile.max_tokens == 2048
+        assert profile.max_turns == 1
+        assert profile.providers["codex"].profile == "ouroboros-fast"
+        assert profile.providers["codex"].model == "gpt-5.3-codex-spark"
+
+    def test_llm_task_profile_bounds(self) -> None:
+        """Task profile numeric fields are validated."""
+        with pytest.raises(ValidationError):
+            LLMTaskProfileConfig(temperature=3.0)
+        with pytest.raises(ValidationError):
+            LLMProviderProfileConfig(max_turns=0)
+
+    def test_provider_profile_accepts_codex_native_xhigh_effort(self) -> None:
+        """Codex task profiles can use their native maximum effort level."""
+        profile = LLMTaskProfileConfig(
+            providers={"codex": LLMProviderProfileConfig(reasoning_effort="xhigh")}
+        )
+
+        assert profile.providers["codex"].reasoning_effort == "xhigh"
+
+    def test_provider_profile_rejects_codex_native_xhigh_for_non_codex(self) -> None:
+        """Non-Codex providers must not accept Codex-only reasoning efforts."""
+        with pytest.raises(ValidationError, match="only supported for Codex"):
+            LLMTaskProfileConfig(
+                providers={"anthropic": LLMProviderProfileConfig(reasoning_effort="xhigh")}
+            )
+
 
 class TestExecutionConfig:
     """Test ExecutionConfig for Phase 2 settings."""
@@ -222,18 +324,73 @@ class TestExecutionConfig:
         config = ExecutionConfig(
             max_iterations_per_ac=20,
             retrospective_interval=5,
+            tui_autolaunch=True,
+            auto_evaluate=False,
+            auto_evolve=False,
+            auto_evolve_max_generations=7,
+            decomposition_mode="bounce_only",
+            context_pack=False,
         )
         assert config.max_iterations_per_ac == 20
         assert config.retrospective_interval == 5
+        assert config.tui_autolaunch is True
+        assert config.auto_evaluate is False
+        assert config.auto_evolve is False
+        assert config.auto_evolve_max_generations == 7
+        assert config.default_model is None
+        assert config.decomposition_mode == "bounce_only"
+        assert config.context_pack is False
 
     def test_execution_config_defaults(self) -> None:
         """ExecutionConfig has sensible defaults."""
         config = ExecutionConfig()
         assert config.max_iterations_per_ac == 10
         assert config.retrospective_interval == 3
-        assert config.atomicity_model == "claude-opus-4-6"
-        assert config.decomposition_model == "claude-opus-4-6"
-        assert config.double_diamond_model == "claude-opus-4-6"
+        assert config.tui_autolaunch is False
+        assert config.auto_evaluate is True
+        assert config.auto_evolve is True
+        assert config.auto_evolve_max_generations == 3
+        assert config.default_model is None
+        assert config.decomposition_mode == "bounce_only"
+        assert config.cross_harness_redispatch is False
+        assert config.context_pack is True
+
+    @pytest.mark.parametrize(("raw", "expected"), [(0, 1), (11, 10), (4, 4)])
+    def test_auto_evolve_generation_budget_is_clamped(self, raw: int, expected: int) -> None:
+        assert (
+            ExecutionConfig(auto_evolve_max_generations=raw).auto_evolve_max_generations == expected
+        )
+
+    def test_default_policy_defaults_to_quality_first_and_validates(self) -> None:
+        """#1733: the persistent fresh-run policy defaults to ask, accepts the
+        two documented alternatives, and rejects everything else — strict can
+        never be configured as a default policy."""
+        assert ExecutionConfig().default_policy == "quality_first"
+        assert ExecutionConfig(default_policy="ask").default_policy == "ask"
+        assert ExecutionConfig(default_policy="efficient").default_policy == "efficient"
+        assert ExecutionConfig(default_policy="quality_first").default_policy == "quality_first"
+        with pytest.raises(ValidationError):
+            ExecutionConfig(default_policy="strict")  # type: ignore[arg-type]
+        with pytest.raises(ValidationError):
+            ExecutionConfig(default_policy="adaptive")  # type: ignore[arg-type]
+
+    def test_transcript_verifier_records_by_default_and_decides_when_set(self) -> None:
+        """The evidence verifier only records unless explicitly set to decide."""
+        assert ExecutionConfig().transcript_verifier == "record"
+        assert ExecutionConfig(transcript_verifier="decide").transcript_verifier == "decide"
+        with pytest.raises(ValidationError):
+            ExecutionConfig(transcript_verifier="warn")  # type: ignore[arg-type]
+
+    def test_execution_config_migrates_legacy_preflight_to_bounce_only(self) -> None:
+        """Stored preflight settings cannot re-enable pre-execution splitting."""
+        config = ExecutionConfig(decomposition_mode="preflight")  # type: ignore[arg-type]
+
+        assert config.decomposition_mode == "bounce_only"
+
+    def test_execution_config_rejects_invalid_decomposition_mode(self) -> None:
+        """ExecutionConfig only accepts known decomposition modes."""
+        with pytest.raises(ValidationError):
+            ExecutionConfig(decomposition_mode="invalid")  # type: ignore[arg-type]
 
 
 class TestResilienceConfig:
@@ -259,8 +416,8 @@ class TestResilienceConfig:
         assert config.lateral_thinking_enabled is True
         assert config.lateral_model_tier == "frontier"
         assert config.lateral_temperature == 0.8
-        assert config.wonder_model == "claude-opus-4-6"
-        assert config.reflect_model == "claude-opus-4-6"
+        assert config.wonder_model == "auto"
+        assert config.reflect_model == "auto"
 
     def test_resilience_temperature_bounds(self) -> None:
         """ResilienceConfig lateral_temperature must be in [0, 2]."""
@@ -333,8 +490,8 @@ class TestEvaluationConfig:
         assert config.stage3_enabled is True
         assert config.satisfaction_threshold == 0.8
         assert config.uncertainty_threshold == 0.3
-        assert config.semantic_model == "claude-opus-4-6"
-        assert config.assertion_extraction_model == "claude-sonnet-4-6"
+        assert config.semantic_model == "auto"
+        assert config.assertion_extraction_model == "auto"
 
 
 class TestConsensusConfig:
@@ -357,10 +514,10 @@ class TestConsensusConfig:
         assert config.min_models == 3
         assert config.threshold == 0.67
         assert config.diversity_required is True
-        assert len(config.models) == 3
-        assert config.advocate_model == "openrouter/anthropic/claude-opus-4-6"
-        assert config.devil_model == "openrouter/openai/gpt-4o"
-        assert config.judge_model == "openrouter/google/gemini-2.5-pro"
+        assert config.models == ("auto",)
+        assert config.advocate_model == "auto"
+        assert config.devil_model == "auto"
+        assert config.judge_model == "auto"
 
     def test_consensus_min_models_minimum(self) -> None:
         """ConsensusConfig min_models must be >= 2."""
@@ -385,6 +542,104 @@ class TestPersistenceConfig:
         config = PersistenceConfig()
         assert config.enabled is True
         assert config.database_path == "data/ouroboros.db"
+
+
+def _write_persistence_config(config_path, database_path: str) -> None:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(f"persistence:\n  database_path: {database_path}\n")
+
+
+def test_resolve_event_store_path_uses_configured_target_for_new_install(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    _write_persistence_config(config_path, "data/events.db")
+
+    assert resolve_event_store_path(config_path) == tmp_path / "data" / "events.db"
+
+
+def test_resolve_event_store_path_preserves_existing_legacy_database(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    legacy_path = tmp_path / "ouroboros.db"
+    _write_persistence_config(config_path, "data/events.db")
+    legacy_path.touch()
+
+    assert resolve_event_store_path(config_path) == legacy_path
+
+
+def test_resolve_event_store_path_prefers_existing_configured_database(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    configured_path = tmp_path / "data" / "events.db"
+    _write_persistence_config(config_path, "data/events.db")
+    configured_path.parent.mkdir()
+    configured_path.touch()
+    (tmp_path / "ouroboros.db").touch()
+
+    assert resolve_event_store_path(config_path) == configured_path
+
+
+@pytest.mark.parametrize(
+    "database_path",
+    [None, True, 1, ["events.db"], {"path": "events.db"}, ""],
+)
+def test_event_store_path_rejects_invalid_database_path(tmp_path, database_path) -> None:
+    config_path = tmp_path / "config.yaml"
+
+    with pytest.raises(ValueError, match="database_path"):
+        event_store_path_from_config(
+            {"persistence": {"database_path": database_path}},
+            config_path,
+        )
+
+
+def test_event_store_path_rejects_existing_directory(tmp_path: Path) -> None:
+    directory = tmp_path / "events.db"
+    directory.mkdir()
+
+    with pytest.raises(ValueError, match="EventStore"):
+        event_store_path_from_config(
+            {"persistence": {"database_path": str(directory)}},
+            tmp_path / "config.yaml",
+        )
+
+
+def test_event_store_path_rejects_directory_at_default_target(tmp_path: Path) -> None:
+    (tmp_path / "ouroboros.db").mkdir()
+
+    with pytest.raises(ValueError, match="EventStore"):
+        event_store_path_from_config({}, tmp_path / "config.yaml")
+
+
+def test_event_store_path_ignores_non_file_legacy_when_new_target_is_configured(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "ouroboros.db").mkdir()
+
+    assert (
+        event_store_path_from_config(
+            {"persistence": {"database_path": "data/events.db"}},
+            tmp_path / "config.yaml",
+        )
+        == tmp_path / "data" / "events.db"
+    )
+
+
+def test_event_store_path_redacts_unknown_user_expansion(tmp_path) -> None:
+    private_user = "ouroboros-user-that-must-not-exist-1817"
+
+    with pytest.raises(ValueError, match="invalid EventStore configuration") as exc_info:
+        event_store_path_from_config(
+            {"persistence": {"database_path": f"~{private_user}/events.db"}},
+            tmp_path / "config.yaml",
+        )
+
+    assert private_user not in str(exc_info.value)
+
+
+def test_resolve_event_store_path_rejects_explicit_yaml_null(tmp_path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("persistence:\n  database_path:\n")
+
+    with pytest.raises(ValueError, match="database_path"):
+        resolve_event_store_path(config_path)
 
 
 class TestDriftConfig:
@@ -460,10 +715,44 @@ class TestOuroborosConfig:
         assert config.resilience is not None
         assert config.evaluation is not None
         assert config.consensus is not None
+        assert config.llm_profiles == {}
+        assert config.llm_role_profiles == {}
         assert config.persistence is not None
         assert config.drift is not None
         assert config.runtime_controls is not None
         assert config.logging is not None
+
+    def test_execution_config_project_guidance_defaults_empty(self) -> None:
+        config = OuroborosConfig()
+        assert config.execution.project_guidance == ()
+
+    def test_execution_config_accepts_project_guidance_allowlist(self) -> None:
+        config = ExecutionConfig(project_guidance=["security", "team.rules"])
+        assert config.project_guidance == ("security", "team.rules")
+
+    def test_execution_config_rejects_path_like_project_guidance_ids(self) -> None:
+        with pytest.raises(ValidationError):
+            ExecutionConfig(project_guidance=["../escape"])
+
+    def test_execution_config_rejects_duplicate_project_guidance_ids(self) -> None:
+        with pytest.raises(ValidationError):
+            ExecutionConfig(project_guidance=["security", "security"])
+
+    def test_ouroboros_config_accepts_llm_profiles(self) -> None:
+        """OuroborosConfig stores task profiles and role mappings."""
+        config = OuroborosConfig(
+            llm_profiles={
+                "fast": {
+                    "temperature": 0.2,
+                    "providers": {"codex": {"profile": "ouroboros-fast"}},
+                },
+            },
+            llm_role_profiles={"qa": "fast"},
+        )
+
+        assert config.llm_role_profiles["qa"] == "fast"
+        assert config.llm_profiles["fast"].temperature == 0.2
+        assert config.llm_profiles["fast"].providers["codex"].profile == "ouroboros-fast"
 
     def test_ouroboros_config_is_frozen(self) -> None:
         """OuroborosConfig is immutable."""
@@ -476,13 +765,30 @@ class TestOrchestratorConfig:
     """Test OrchestratorConfig runtime settings."""
 
     def test_orchestrator_config_defaults(self) -> None:
-        """Defaults to the Claude runtime."""
+        """Defaults to the isolated Claude SDK runtime."""
         config = OrchestratorConfig()
         assert config.runtime_backend == "claude"
         assert config.permission_mode == "acceptEdits"
         assert config.opencode_permission_mode == "bypassPermissions"
         assert config.codex_cli_path is None
         assert config.opencode_cli_path is None
+        assert config.usage_limit_pause_hours == 5.0
+
+    def test_orchestrator_config_rejects_nonpositive_usage_limit_pause(self) -> None:
+        """Usage-limit pause duration must be positive."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(usage_limit_pause_hours=0)
+
+    def test_orchestrator_config_accepts_worktree_cleanup_policies(self) -> None:
+        """Worktree cleanup policy accepts keep, remove, and prune-merged."""
+        for policy in ("keep", "remove", "prune-merged"):
+            config = OrchestratorConfig(worktree_cleanup=policy)
+            assert config.worktree_cleanup == policy
+
+    def test_orchestrator_config_rejects_unknown_worktree_cleanup_policy(self) -> None:
+        """Worktree cleanup policy rejects unknown values."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(worktree_cleanup="delete")  # type: ignore[arg-type]
 
     def test_orchestrator_config_expands_codex_cli_path(self) -> None:
         """Expands ~ in codex_cli_path."""
@@ -514,6 +820,59 @@ class TestOrchestratorConfig:
         assert config.runtime_backend == "gemini"
         assert config.gemini_cli_path is not None
         assert "~" not in config.gemini_cli_path
+
+    def test_orchestrator_config_accepts_pi_backend(self) -> None:
+        """Pi is a valid runtime-only backend."""
+        config = OrchestratorConfig(runtime_backend="pi", pi_cli_path="~/bin/pi")
+        assert config.runtime_backend == "pi"
+        assert config.pi_cli_path is not None
+        assert "~" not in config.pi_cli_path
+
+    def test_orchestrator_config_accepts_omp_backend(self) -> None:
+        """OMP is a valid runtime backend."""
+        config = OrchestratorConfig(runtime_backend="omp", omp_cli_path="~/bin/omp")
+        assert config.runtime_backend == "omp"
+        assert config.omp_cli_path is not None
+        assert "~" not in config.omp_cli_path
+
+    def test_orchestrator_config_accepts_gjc_backend(self) -> None:
+        """GJC is a valid runtime-only backend."""
+        config = OrchestratorConfig(runtime_backend="gjc", gjc_cli_path="~/bin/gjc")
+        assert config.runtime_backend == "gjc"
+        assert config.gjc_cli_path is not None
+        assert "~" not in config.gjc_cli_path
+
+    def test_orchestrator_config_accepts_antigravity_backend(self) -> None:
+        """Antigravity is a valid runtime-only backend."""
+        config = OrchestratorConfig(runtime_backend="antigravity")
+        assert config.runtime_backend == "antigravity"
+        assert config.antigravity_cli_path is None
+
+    def test_orchestrator_config_expands_antigravity_cli_path(self) -> None:
+        """Expands ~ in antigravity_cli_path."""
+        config = OrchestratorConfig(
+            runtime_backend="antigravity",
+            antigravity_cli_path="~/bin/agy",
+        )
+        assert config.runtime_backend == "antigravity"
+        assert config.antigravity_cli_path is not None
+        assert "~" not in config.antigravity_cli_path
+
+    def test_orchestrator_config_accepts_grok_backend(self) -> None:
+        """Grok is a valid runtime-only backend."""
+        config = OrchestratorConfig(runtime_backend="grok")
+        assert config.runtime_backend == "grok"
+        assert config.grok_cli_path is None
+
+    def test_orchestrator_config_expands_grok_cli_path(self) -> None:
+        """Expands ~ in grok_cli_path."""
+        config = OrchestratorConfig(
+            runtime_backend="grok",
+            grok_cli_path="~/bin/grok",
+        )
+        assert config.runtime_backend == "grok"
+        assert config.grok_cli_path is not None
+        assert "~" not in config.grok_cli_path
 
 
 class TestGetDefaultConfig:
@@ -599,3 +958,86 @@ class TestGetConfigDir:
         config_dir = get_config_dir()
         assert config_dir.parent == Path.home()
         assert config_dir.name == ".ouroboros"
+
+
+class TestRuntimeProfileConfig:
+    def test_runtime_profile_backend_profile_accepts_future_values(self) -> None:
+        profile = RuntimeProfileConfig(backend_profile="future-worker")
+        assert profile.backend_profile == "future-worker"
+
+    def test_runtime_profile_backend_profile_strips_whitespace(self) -> None:
+        profile = RuntimeProfileConfig(backend_profile=" worker ")
+        assert profile.backend_profile == "worker"
+
+    def test_runtime_profile_backend_profile_rejects_empty_string(self) -> None:
+        with pytest.raises(ValueError) as exc_info:
+            RuntimeProfileConfig(backend_profile="   ")
+        assert "runtime_profile.backend_profile" in str(exc_info.value)
+
+    def test_runtime_profile_default_accepts_copilot_backends(self) -> None:
+        config = RuntimeProfileConfig(default="copilot", stages={"execute": "copilot_cli"})
+
+        assert config.default == "copilot"
+        assert config.stages == {"execute": "copilot_cli"}
+
+    def test_runtime_profile_default_accepts_kiro_backends(self) -> None:
+        assert RuntimeProfileConfig(default="kiro").default == "kiro"
+        assert RuntimeProfileConfig(default="kiro_cli").default == "kiro_cli"
+
+    def test_runtime_profile_stages_accept_kiro_backends(self) -> None:
+        profile = RuntimeProfileConfig(stages={"execute": "kiro", "reflect": "kiro_cli"})
+        assert profile.stages == {"execute": "kiro", "reflect": "kiro_cli"}
+
+    def test_runtime_profile_default_accepts_goose_backends(self) -> None:
+        assert RuntimeProfileConfig(default="goose").default == "goose"
+        assert RuntimeProfileConfig(default="goose_cli").default == "goose_cli"
+
+    def test_runtime_profile_stages_accept_goose_backends(self) -> None:
+        profile = RuntimeProfileConfig(stages={"execute": "goose", "reflect": "goose_cli"})
+        assert profile.stages == {"execute": "goose", "reflect": "goose_cli"}
+
+    def test_runtime_profile_accepts_pi_backends(self) -> None:
+        profile = RuntimeProfileConfig(default="pi", stages={"execute": "pi_cli"})
+        assert profile.default == "pi"
+        assert profile.stages == {"execute": "pi_cli"}
+
+    def test_runtime_profile_accepts_omp_backends(self) -> None:
+        profile = RuntimeProfileConfig(default="omp", stages={"execute": "omp_cli"})
+        assert profile.default == "omp"
+        assert profile.stages == {"execute": "omp_cli"}
+
+    def test_runtime_profile_accepts_gjc_backends(self) -> None:
+        profile = RuntimeProfileConfig(default="gjc", stages={"execute": "gjc_cli"})
+        assert profile.default == "gjc"
+        assert profile.stages == {"execute": "gjc_cli"}
+
+    def test_runtime_profile_accepts_claude_mcp_backend(self) -> None:
+        profile = RuntimeProfileConfig(
+            default="claude_mcp",
+            stages={"execute": "claude_mcp"},
+        )
+        assert profile.default == "claude_mcp"
+        assert profile.stages == {"execute": "claude_mcp"}
+
+    def test_runtime_profile_allowlist_covers_every_persisted_backend(self) -> None:
+        persisted_backends = set(
+            get_args(OrchestratorConfig.model_fields["runtime_backend"].annotation)
+        )
+
+        assert persisted_backends <= VALID_RUNTIME_BACKENDS
+
+    @pytest.mark.parametrize(
+        "profile",
+        [
+            {"default": "unknown-runtime"},
+            {"stages": {"execute": "unknown-runtime"}},
+        ],
+    )
+    def test_runtime_profile_rejects_unknown_backends(self, profile: dict[str, object]) -> None:
+        with pytest.raises(ValidationError, match="must be one of"):
+            RuntimeProfileConfig.model_validate(profile)
+
+    def test_orchestrator_runtime_profile_string_shorthand(self) -> None:
+        config = OrchestratorConfig(runtime_profile="worker")
+        assert config.runtime_profile is not None
+        assert config.runtime_profile.backend_profile == "worker"

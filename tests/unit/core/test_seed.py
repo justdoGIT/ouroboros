@@ -4,18 +4,42 @@ Tests the immutable Seed schema and related types.
 """
 
 from datetime import UTC, datetime
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 from pydantic import ValidationError as PydanticValidationError
 import pytest
 
 from ouroboros.core.seed import (
+    _PARTIAL_SEED_GENERATION_MODE,
+    MAX_AC_SUCCESS_CONTRACT_ARTIFACT_CHARS,
+    MAX_AC_SUCCESS_CONTRACT_ARTIFACT_PATH_BYTES,
+    MAX_AC_SUCCESS_CONTRACT_ARTIFACTS,
+    MAX_AC_SUCCESS_CONTRACT_CHARS,
+    AcceptanceCriterionSpec,
     EvaluationPrinciple,
     ExitCondition,
+    InvestmentSpec,
     OntologyField,
     OntologySchema,
     Seed,
     SeedMetadata,
+    ac_texts,
+    derive_semantic_ac_key,
+    expected_artifact_path_error,
+    expected_artifact_workspace_path_error,
+    parse_expected_artifact_list,
 )
+
+
+def _multibyte_artifact_at_byte_budget(*, overflow_bytes: int = 0) -> str:
+    """Build a component-valid UTF-8 path at the total artifact budget."""
+    path = "/".join(("😀" * 62, "a" * (6 + overflow_bytes)))
+    assert len(path.encode("utf-8")) == MAX_AC_SUCCESS_CONTRACT_ARTIFACT_PATH_BYTES + overflow_bytes
+    return path
 
 
 class TestSeedMetadata:
@@ -54,6 +78,20 @@ class TestSeedMetadata:
 
         assert metadata.ambiguity_score == 0.18
 
+    def test_metadata_gate_forced_defaults_to_unknown(self) -> None:
+        """Seeds without gate provenance remain explicitly unknown."""
+        metadata = SeedMetadata(ambiguity_score=0.18)
+
+        assert metadata.gate_forced is None
+        assert "gate_forced" not in metadata.model_dump(mode="json")
+
+    @pytest.mark.parametrize("gate_forced", [True, False])
+    def test_metadata_serializes_gate_forced(self, gate_forced: bool) -> None:
+        """Known gate decisions survive Seed metadata serialization."""
+        metadata = SeedMetadata(ambiguity_score=0.18, gate_forced=gate_forced)
+
+        assert metadata.model_dump(mode="json")["gate_forced"] is gate_forced
+
     def test_metadata_optional_interview_id(self) -> None:
         """SeedMetadata interview_id is optional."""
         metadata = SeedMetadata(ambiguity_score=0.15)
@@ -79,6 +117,104 @@ class TestSeedMetadata:
 
         with pytest.raises(PydanticValidationError):
             metadata.ambiguity_score = 0.20  # type: ignore[misc]
+
+
+class TestSeedMetadataRecoveryInvariants:
+    """Regression tests for the degraded-provenance invariants (#1257 / #1302).
+
+    The docstring on ``SeedMetadata`` has always documented these invariants;
+    before this suite existed no validator enforced them, so a recovery-path
+    Seed with ``degraded`` unset could pass the run gate and auto-RUN a partial
+    product.
+    """
+
+    def test_degraded_requires_non_default_generation_mode(self) -> None:
+        with pytest.raises(PydanticValidationError, match="non-default generation_mode"):
+            SeedMetadata(degraded=True)
+
+    def test_degraded_partial_mode_requires_unresolved_slots(self) -> None:
+        with pytest.raises(PydanticValidationError, match="unresolved_slots entry"):
+            SeedMetadata(
+                degraded=True,
+                generation_mode="partial_seed_from_evidence",
+                unresolved_slots=(),
+            )
+
+    def test_unresolved_slots_require_degraded(self) -> None:
+        """A partial Seed cannot hide its partiality by leaving ``degraded`` unset."""
+        with pytest.raises(PydanticValidationError, match="unresolved_slots requires degraded"):
+            SeedMetadata(
+                degraded=False,
+                generation_mode="partial_seed_from_evidence",
+                unresolved_slots=("acceptance_criteria",),
+            )
+
+    def test_degraded_partial_seed_with_slots_is_accepted(self) -> None:
+        metadata = SeedMetadata(
+            degraded=True,
+            generation_mode="partial_seed_from_evidence",
+            unresolved_slots=("outputs",),
+            recovery_reason="interview_phase_deadline",
+        )
+
+        assert metadata.unresolved_slots == ("outputs",)
+
+    def test_degraded_complete_ledger_seed_needs_no_slots(self) -> None:
+        """Case (b): deadline closure over a fully resolved ledger."""
+        metadata = SeedMetadata(
+            degraded=True,
+            generation_mode="interview_deadline_complete_ledger",
+            recovery_reason="interview_phase_deadline",
+        )
+
+        assert metadata.unresolved_slots == ()
+
+    def test_non_degraded_recovery_path_seed_is_still_accepted(self) -> None:
+        """``partial_seed_from_evidence`` over a complete ledger stays valid.
+
+        ``ledger_seed.partial_seed_from_evidence`` derives
+        ``degraded = bool(unresolved_slots)``, so a complete ledger routed
+        through the recovery helper is deliberately tagged with the partial
+        ``generation_mode`` while remaining non-degraded. The invariants are
+        scoped to ``degraded=True`` precisely so that audit trail survives.
+        """
+        metadata = SeedMetadata(
+            generation_mode="partial_seed_from_evidence",
+            recovery_reason="forced_review",
+        )
+
+        assert metadata.degraded is False
+
+    def test_partial_generation_mode_constant_matches_ledger_seed(self) -> None:
+        """Pin the duplicated constant to its ``auto.ledger_seed`` source."""
+        from ouroboros.auto.ledger_seed import PARTIAL_SEED_GENERATION_MODE
+
+        assert _PARTIAL_SEED_GENERATION_MODE == PARTIAL_SEED_GENERATION_MODE
+
+    def test_decision_provenance_is_frozen(self) -> None:
+        """The histogram is the only dict field on a ``frozen=True`` model."""
+        metadata = SeedMetadata(decision_provenance={"user_confirmed": 3})
+
+        with pytest.raises(TypeError, match="immutable"):
+            metadata.decision_provenance["user_confirmed"] = 99
+        with pytest.raises(TypeError, match="immutable"):
+            metadata.decision_provenance.update({"timeout_default": 1})
+        with pytest.raises(TypeError, match="immutable"):
+            metadata.decision_provenance.pop("user_confirmed")
+        with pytest.raises(TypeError, match="immutable"):
+            metadata.decision_provenance.clear()
+
+        assert metadata.decision_provenance == {"user_confirmed": 3}
+
+    def test_decision_provenance_round_trips_and_stays_additive(self) -> None:
+        populated = SeedMetadata(decision_provenance={"model_inferred": 2})
+        assert json.loads(populated.model_dump_json())["decision_provenance"] == {
+            "model_inferred": 2
+        }
+
+        empty = SeedMetadata()
+        assert empty.decision_provenance == {}
+        assert "decision_provenance" not in json.loads(empty.model_dump_json())
 
 
 class TestOntologyField:
@@ -349,9 +485,554 @@ class TestSeed:
         assert full_seed.goal.startswith("Build a CLI task management")
         assert len(full_seed.constraints) == 3
         assert len(full_seed.acceptance_criteria) == 4
+        assert ac_texts(full_seed.acceptance_criteria) == (
+            "Tasks can be created",
+            "Tasks can be listed",
+            "Tasks can be marked complete",
+            "Tasks can be grouped by project",
+        )
         assert len(full_seed.ontology_schema.fields) == 2
         assert len(full_seed.evaluation_principles) == 2
         assert len(full_seed.exit_conditions) == 1
+
+    def test_seed_coerces_string_acceptance_criteria(self) -> None:
+        """Legacy string ACs are lifted into structured specs."""
+        seed = Seed(
+            goal="Build a CLI task manager",
+            acceptance_criteria=("Tasks can be created",),
+            ontology_schema=OntologySchema(
+                name="TaskManager",
+                description="Task management domain",
+            ),
+            metadata=SeedMetadata(ambiguity_score=0.15),
+        )
+
+        assert isinstance(seed.acceptance_criteria[0], AcceptanceCriterionSpec)
+        assert seed.acceptance_criteria[0].description == "Tasks can be created"
+        assert seed.acceptance_criteria[0].verify_command is None
+        assert seed.acceptance_criteria[0].expected_artifacts == ()
+
+    def test_seed_acceptance_criterion_spec_fields_are_optional(self) -> None:
+        """Structured ACs can carry any subset of success-contract fields."""
+        seed = Seed(
+            goal="Build a CLI task manager",
+            acceptance_criteria=(
+                {
+                    "description": "Task list command exits 0",
+                    "verify_command": "uv run task list",
+                    "expected_artifacts": "tasks.json, logs/task.log",
+                    "output_assertion": "No tasks",
+                },
+                {"description": "Tasks can be created"},
+            ),
+            ontology_schema=OntologySchema(
+                name="TaskManager",
+                description="Task management domain",
+            ),
+            metadata=SeedMetadata(ambiguity_score=0.15),
+        )
+
+        first, second = seed.acceptance_criteria
+        assert first.verify_command == "uv run task list"
+        assert first.expected_artifacts == ("tasks.json", "logs/task.log")
+        assert first.output_assertion == "No tasks"
+        assert second.description == "Tasks can be created"
+        assert second.verify_command is None
+
+    def test_expected_artifacts_schema_documents_literal_workspace_paths(self) -> None:
+        field = AcceptanceCriterionSpec.model_fields["expected_artifacts"]
+
+        assert field.description is not None
+        assert "Exact file or directory paths" in field.description
+        assert "relative to the run workspace" in field.description
+        assert "resolved literally" in field.description
+        assert "255 UTF-8 bytes" in field.description
+        assert "complete canonical path at most 255" in field.description
+        assert "prefix top-level paths containing spaces with ./" in field.description
+
+    def test_expected_artifact_path_grammar_is_portable(self) -> None:
+        for artifact in (
+            ".",
+            "./",
+            "././",
+            ".//",
+            r".\.",
+            ".\\",
+            "bad\x00path",
+            "../outside",
+            r"D:outside",
+            r"\outside.txt",
+            r"\\server\share\outside.txt",
+            r"docs\User Guide.md",
+            "schema v2 outputs.json",
+            "reports/summary,v2.json",
+            "NUL",
+            "nul.txt",
+            "dir/CON",
+            "COM1.log",
+            "foo.",
+            "docs/a:b",
+            "docs/a?.txt",
+            "a" * 256,
+            "docs/" + ("\u00e9" * 128),
+            "NONE",
+            "none",
+        ):
+            assert expected_artifact_path_error(artifact) is not None
+
+        for artifact in (
+            "README.md",
+            "docs",
+            "docs/User Guide.md",
+            "./Build Outputs",
+            "é" * 127 + "a",
+            _multibyte_artifact_at_byte_budget(),
+            "./" + _multibyte_artifact_at_byte_budget(),
+        ):
+            assert expected_artifact_path_error(artifact) is None
+
+    def test_expected_artifact_path_rejects_component_and_total_byte_overflow(self) -> None:
+        component_overflow = "é" * 128
+        total_overflow = _multibyte_artifact_at_byte_budget(overflow_bytes=1)
+
+        assert len(component_overflow.encode("utf-8")) == 256
+        assert "component longer than 255 filesystem bytes" in (
+            expected_artifact_path_error(component_overflow) or ""
+        )
+        assert "canonical path longer than 255 portable filesystem bytes" in (
+            expected_artifact_path_error(total_overflow) or ""
+        )
+
+    @pytest.mark.parametrize(
+        ("platform", "workspace", "artifact", "capacity", "expected_error"),
+        (
+            ("posix", "/" + "w" * 900, "a" * 200, 1_024, "POSIX capacity"),
+            ("windows", "C:\\" + "w" * 250, "out.txt", 260, "Windows capacity"),
+        ),
+    )
+    def test_expected_artifact_workspace_capacity_fails_closed_by_platform(
+        self,
+        platform: str,
+        workspace: str,
+        artifact: str,
+        capacity: int,
+        expected_error: str,
+    ) -> None:
+        error = expected_artifact_workspace_path_error(
+            artifact,
+            workspace,
+            platform=platform,  # type: ignore[arg-type]
+            path_capacity=capacity,
+        )
+
+        assert expected_error in (error or "")
+
+    def test_expected_artifact_list_uses_comma_whitespace_delimiter(self) -> None:
+        assert parse_expected_artifact_list("tasks.json, logs/task.log, ./Build Outputs") == (
+            "tasks.json",
+            "logs/task.log",
+            "./Build Outputs",
+        )
+
+    def test_set_expected_artifacts_materialize_one_semantic_key_across_hash_seeds(self) -> None:
+        """Unordered artifacts normalize before Seed materializes their identity."""
+        source_root = Path(__file__).parents[3] / "src"
+        expected_artifacts = (
+            "artifacts/alpha.txt",
+            "artifacts/beta.txt",
+            "artifacts/delta.txt",
+            "artifacts/epsilon.txt",
+            "artifacts/gamma.txt",
+            "artifacts/zeta.txt",
+        )
+        script = """
+import json
+from ouroboros.core.seed import OntologySchema, Seed, SeedMetadata
+
+seed = Seed(
+    goal="Deterministic key test",
+    acceptance_criteria=({"description": "Produce all artifacts", "expected_artifacts": {
+        "artifacts/alpha.txt", "artifacts/beta.txt", "artifacts/gamma.txt",
+        "artifacts/delta.txt", "artifacts/epsilon.txt", "artifacts/zeta.txt",
+    }},),
+    ontology_schema=OntologySchema(name="T", description="T"),
+    metadata=SeedMetadata(ambiguity_score=0.15),
+)
+criterion = seed.acceptance_criteria[0]
+print(json.dumps({"expected_artifacts": criterion.expected_artifacts, "semantic_ac_key": criterion.semantic_ac_key}))
+"""
+        outputs = []
+        for hash_seed in ("1", "2"):
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                check=True,
+                capture_output=True,
+                cwd=source_root.parent,
+                env={**os.environ, "PYTHONHASHSEED": hash_seed, "PYTHONPATH": str(source_root)},
+                text=True,
+            )
+            outputs.append(json.loads(result.stdout))
+
+        assert len({output["semantic_ac_key"] for output in outputs}) == 1
+        assert {tuple(output["expected_artifacts"]) for output in outputs} == {expected_artifacts}
+
+    def test_expected_artifacts_preserve_list_and_tuple_order(self) -> None:
+        expected_artifacts = ("artifacts/zeta.txt", "artifacts/alpha.txt")
+
+        for artifacts in (list(expected_artifacts), expected_artifacts):
+            criterion = AcceptanceCriterionSpec(
+                description="Preserve caller order",
+                expected_artifacts=artifacts,
+            )
+
+            assert criterion.expected_artifacts == expected_artifacts
+
+    def test_success_contract_accepts_exact_capsule_artifact_limit(self) -> None:
+        spec = AcceptanceCriterionSpec(
+            description="bounded artifact contract",
+            expected_artifacts=tuple(
+                f"out/artifact-{index}.txt" for index in range(MAX_AC_SUCCESS_CONTRACT_ARTIFACTS)
+            ),
+        )
+
+        assert len(spec.expected_artifacts) == MAX_AC_SUCCESS_CONTRACT_ARTIFACTS
+
+    def test_success_contract_rejects_artifacts_beyond_capsule_limit(self) -> None:
+        with pytest.raises(PydanticValidationError, match="artifact limit exceeded"):
+            AcceptanceCriterionSpec(
+                description="oversized artifact contract",
+                expected_artifacts=tuple(
+                    f"out/artifact-{index}.txt"
+                    for index in range(MAX_AC_SUCCESS_CONTRACT_ARTIFACTS + 1)
+                ),
+            )
+
+    def test_success_contract_rejects_portable_path_overflow_before_capsule_locator(self) -> None:
+        artifact = "/".join(
+            "a" * 250 for _ in range(MAX_AC_SUCCESS_CONTRACT_ARTIFACT_CHARS // 251 + 1)
+        )
+        assert len(artifact) > MAX_AC_SUCCESS_CONTRACT_ARTIFACT_CHARS
+
+        with pytest.raises(
+            PydanticValidationError,
+            match="canonical path longer than 255 portable filesystem bytes",
+        ):
+            AcceptanceCriterionSpec(
+                description="oversized artifact locator",
+                expected_artifacts=(artifact,),
+            )
+
+    def test_success_contract_accepts_exact_multibyte_artifact_byte_budget(self) -> None:
+        artifact = _multibyte_artifact_at_byte_budget()
+
+        spec = AcceptanceCriterionSpec(
+            description="maximum encoded artifact locator",
+            expected_artifacts=(artifact,),
+        )
+
+        assert spec.expected_artifacts == (artifact,)
+
+    def test_success_contract_rejects_multibyte_artifact_byte_overflow(self) -> None:
+        artifact = _multibyte_artifact_at_byte_budget(overflow_bytes=1)
+
+        with pytest.raises(
+            PydanticValidationError,
+            match="canonical path longer than 255 portable filesystem bytes",
+        ):
+            AcceptanceCriterionSpec(
+                description="oversized encoded artifact locator",
+                expected_artifacts=(artifact,),
+            )
+
+    def test_success_contract_rejects_total_capsule_character_overflow(self) -> None:
+        with pytest.raises(PydanticValidationError, match="character budget exceeded"):
+            AcceptanceCriterionSpec(
+                description="oversized contract",
+                verify_command="x" * (MAX_AC_SUCCESS_CONTRACT_CHARS + 1),
+            )
+
+    @pytest.mark.parametrize(
+        "artifact",
+        (
+            ".",
+            "../outside",
+            r"D:outside",
+            r"\\server\share\outside.txt",
+            "schema v2 outputs.json",
+            "reports/summary,v2.json",
+            "NUL",
+            "nul.txt",
+            "dir/CON",
+            "foo.",
+            "docs/a:b",
+            r"docs\User Guide.md",
+        ),
+    )
+    def test_expected_artifacts_reject_nonportable_paths_at_schema_ingress(
+        self,
+        artifact: str,
+    ) -> None:
+        with pytest.raises(PydanticValidationError, match="portable workspace-relative paths"):
+            AcceptanceCriterionSpec(
+                description="artifact contract",
+                expected_artifacts=(artifact,),
+            )
+
+    @pytest.mark.parametrize(
+        "artifacts",
+        [
+            ("",),
+            ("report.txt\n",),
+            ("report.txt\t",),
+            ("report.txt\x7f",),
+            ("reports/summary,v2.json",),
+            (r"docs\User Guide.md",),
+            (None,),
+            ("NONE", "report.txt"),
+            "report.txt\n",
+            "reports/summary,v2.json",
+            "NONE, report.txt",
+            "report.txt, NONE",
+        ],
+    )
+    def test_expected_artifacts_reject_malformed_raw_entries(self, artifacts: object) -> None:
+        with pytest.raises(PydanticValidationError):
+            AcceptanceCriterionSpec(
+                description="artifact contract",
+                expected_artifacts=artifacts,  # type: ignore[arg-type]
+            )
+
+    def test_output_assertion_requires_verify_command_at_schema_ingress(self) -> None:
+        with pytest.raises(PydanticValidationError, match="requires verify_command"):
+            AcceptanceCriterionSpec(
+                description="Command output contains READY",
+                output_assertion="READY",
+            )
+
+    def test_output_assertion_condition_phrase_requires_raw_verify_command(self) -> None:
+        with pytest.raises(PydanticValidationError, match="requires verify_command"):
+            AcceptanceCriterionSpec(
+                description="Command exits successfully",
+                output_assertion="success",
+            )
+
+        with pytest.raises(PydanticValidationError, match="requires verify_command"):
+            AcceptanceCriterionSpec(
+                description="Command exits successfully",
+                verify_command="NONE",
+                output_assertion="exit code 0",
+            )
+
+    def test_output_assertion_schema_documents_combined_command_output(self) -> None:
+        field = AcceptanceCriterionSpec.model_fields["output_assertion"]
+
+        assert field.description is not None
+        assert "combined stdout and stderr" in field.description
+
+    def test_output_assertion_normalizes_exit_status_conditions_to_none(self) -> None:
+        """Exit-code success phrases are redundant with verify_command exit status."""
+        for phrase in (
+            "exit code 0",
+            "exit status 0",
+            "exit 0",
+            "returns 0",
+            "return 0",
+            "success",
+            "succeeds",
+            "passed",
+            "passes",
+            "ok exit",
+            "no error",
+            "no errors",
+        ):
+            spec = AcceptanceCriterionSpec(
+                description="Command exits successfully",
+                verify_command="python -c 'pass'",
+                output_assertion=phrase,
+            )
+            assert spec.output_assertion is None
+            assert spec.to_seed_value() == {
+                "description": "Command exits successfully",
+                "verify_command": "python -c 'pass'",
+            }
+
+    def test_output_assertion_preserves_distinctive_stdout_literals(self) -> None:
+        """Real stdout literals survive normalization."""
+        ok = AcceptanceCriterionSpec(
+            description="Command prints OK",
+            verify_command="python -c \"print('OK')\"",
+            output_assertion="OK",
+        )
+        pytest_literal = AcceptanceCriterionSpec(
+            description="Pytest summary is asserted",
+            verify_command="pytest -q",
+            output_assertion="5 passed",
+        )
+
+        assert ok.output_assertion == "OK"
+        assert pytest_literal.output_assertion == "5 passed"
+
+    def test_seed_acceptance_criteria_materialize_semantic_keys(self) -> None:
+        """Legacy description-only ACs gain deterministic persisted identities."""
+        seed = Seed(
+            goal="Build a CLI task manager",
+            acceptance_criteria=(
+                "Tasks can be created",
+                AcceptanceCriterionSpec(description="Tasks can be listed"),
+            ),
+            ontology_schema=OntologySchema(
+                name="TaskManager",
+                description="Task management domain",
+            ),
+            metadata=SeedMetadata(ambiguity_score=0.15),
+        )
+
+        serialized = seed.to_dict()["acceptance_criteria"]
+        assert [item["description"] for item in serialized] == [
+            "Tasks can be created",
+            "Tasks can be listed",
+        ]
+        assert all(item["semantic_ac_key"].startswith("ac_") for item in serialized)
+        assert Seed.from_dict(seed.to_dict()).to_dict() == seed.to_dict()
+        assert all(criterion.investment is None for criterion in seed.acceptance_criteria)
+
+    def test_seed_acceptance_criteria_serialize_optional_investment_metadata(self) -> None:
+        """Investment metadata is additive and keeps authority explicit."""
+        seed = Seed(
+            goal="Build a CLI task manager",
+            acceptance_criteria=(
+                AcceptanceCriterionSpec(
+                    description="Rotate production payment signing keys",
+                    investment=InvestmentSpec(
+                        difficulty="medium",
+                        stakes="high",
+                        provenance="declared",
+                        confidence="high",
+                    ),
+                ),
+            ),
+            ontology_schema=OntologySchema(
+                name="TaskManager",
+                description="Task management domain",
+            ),
+            metadata=SeedMetadata(ambiguity_score=0.15),
+        )
+
+        criterion = seed.acceptance_criteria[0]
+        assert criterion.investment is not None
+        assert criterion.investment.stakes == "high"
+        serialized = seed.to_dict()["acceptance_criteria"][0]
+        assert serialized["description"] == "Rotate production payment signing keys"
+        assert serialized["semantic_ac_key"].startswith("ac_")
+        assert serialized["investment"] == {
+            "confidence": "high",
+            "difficulty": "medium",
+            "provenance": "declared",
+            "stakes": "high",
+        }
+
+    def test_investment_defaults_cannot_authorize_cheaper_execution(self) -> None:
+        """Omitted confidence stays low rather than silently becoming trusted."""
+        spec = InvestmentSpec(difficulty="low", stakes="low")
+
+        assert spec.provenance == "declared"
+        assert spec.confidence == "low"
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("difficulty", "trivial"),
+            ("stakes", "critical"),
+            ("provenance", "guessed"),
+            ("confidence", "certain"),
+        ],
+    )
+    def test_investment_rejects_unbounded_vocabulary(self, field: str, value: str) -> None:
+        data = {
+            "difficulty": "low",
+            "stakes": "low",
+            "provenance": "declared",
+            "confidence": "high",
+            field: value,
+        }
+
+        with pytest.raises(PydanticValidationError):
+            InvestmentSpec.model_validate(data)
+
+    def test_seed_acceptance_criteria_serialize_structured_contract(self) -> None:
+        """Contract-bearing ACs dump only populated fields."""
+        seed = Seed(
+            goal="Build a CLI task manager",
+            acceptance_criteria=(
+                AcceptanceCriterionSpec(
+                    description="Task list command exits 0",
+                    verify_command="uv run task list",
+                    expected_artifacts=("tasks.json",),
+                ),
+            ),
+            ontology_schema=OntologySchema(
+                name="TaskManager",
+                description="Task management domain",
+            ),
+            metadata=SeedMetadata(ambiguity_score=0.15),
+        )
+
+        assert seed.to_dict()["acceptance_criteria"] == [
+            {
+                "description": "Task list command exits 0",
+                "expected_artifacts": ["tasks.json"],
+                "semantic_ac_key": seed.acceptance_criteria[0].semantic_ac_key,
+                "verify_command": "uv run task list",
+            }
+        ]
+
+    def test_legacy_seed_json_materializes_semantic_keys_once(self) -> None:
+        """An old bare-string fixture upgrades once and is then stable."""
+        fixture = Path(__file__).parents[2] / "fixtures" / "seeds" / "legacy-seed-minimal.json"
+        original = fixture.read_text()
+        seed = Seed.from_dict(json.loads(original))
+
+        round_tripped = json.dumps(seed.to_dict(), indent=2, sort_keys=True) + "\n"
+
+        assert round_tripped != original
+        assert all(
+            item["semantic_ac_key"].startswith("ac_")
+            for item in seed.to_dict()["acceptance_criteria"]
+        )
+        assert Seed.from_dict(json.loads(round_tripped)).to_dict() == seed.to_dict()
+
+    def test_seed_coerces_string_evaluation_principles(self) -> None:
+        """Hand-written seed principle string lists are lifted into objects."""
+        seed = Seed(
+            goal="Build a CLI task manager",
+            ontology_schema=OntologySchema(
+                name="TaskManager",
+                description="Task management domain",
+            ),
+            evaluation_principles=("Prefer simple code", "Keep UX clear"),
+            metadata=SeedMetadata(ambiguity_score=0.15),
+        )
+
+        assert seed.evaluation_principles[0].name == "principle_1"
+        assert seed.evaluation_principles[0].description == "Prefer simple code"
+        assert seed.evaluation_principles[0].weight == 1.0
+        assert seed.evaluation_principles[1].name == "principle_2"
+
+    def test_seed_coerces_string_exit_conditions(self) -> None:
+        """Hand-written seed exit condition string lists are lifted into objects."""
+        seed = Seed(
+            goal="Build a CLI task manager",
+            ontology_schema=OntologySchema(
+                name="TaskManager",
+                description="Task management domain",
+            ),
+            exit_conditions=("All invariant tests are green",),
+            metadata=SeedMetadata(ambiguity_score=0.15),
+        )
+
+        assert seed.exit_conditions[0].name == "condition_1"
+        assert seed.exit_conditions[0].description == "All invariant tests are green"
+        assert seed.exit_conditions[0].evaluation_criteria == "All invariant tests are green"
 
     def test_seed_goal_immutability(self, minimal_seed: Seed) -> None:
         """Seed.goal cannot be modified (frozen=True raises error)."""
@@ -397,7 +1078,17 @@ class TestSeed:
         assert isinstance(seed_dict, dict)
         assert seed_dict["goal"] == full_seed.goal
         assert seed_dict["constraints"] == list(full_seed.constraints)
-        assert seed_dict["acceptance_criteria"] == list(full_seed.acceptance_criteria)
+        assert [item["description"] for item in seed_dict["acceptance_criteria"]] == list(
+            ac_texts(full_seed.acceptance_criteria)
+        )
+        assert all(
+            item["semantic_ac_key"] == criterion.semantic_ac_key
+            for item, criterion in zip(
+                seed_dict["acceptance_criteria"],
+                full_seed.acceptance_criteria,
+                strict=True,
+            )
+        )
         assert seed_dict["ontology_schema"]["name"] == full_seed.ontology_schema.name
         assert seed_dict["metadata"]["ambiguity_score"] == full_seed.metadata.ambiguity_score
 
@@ -413,6 +1104,30 @@ class TestSeed:
         assert reconstructed.ontology_schema.name == full_seed.ontology_schema.name
         assert reconstructed.metadata.ambiguity_score == full_seed.metadata.ambiguity_score
 
+    def test_seed_from_dict_coerces_string_principles_and_conditions(self) -> None:
+        """Seed.from_dict() accepts prose lists from hand-written seed YAML."""
+        reconstructed = Seed.from_dict(
+            {
+                "goal": "Build a CLI task manager",
+                "ontology_schema": {
+                    "name": "TaskManager",
+                    "description": "Task management domain",
+                },
+                "evaluation_principles": ["Prefer simple code"],
+                "exit_conditions": ["All invariant tests are green"],
+                "metadata": {"ambiguity_score": 0.15},
+            }
+        )
+
+        assert reconstructed.evaluation_principles[0].name == "principle_1"
+        assert reconstructed.evaluation_principles[0].description == "Prefer simple code"
+        assert reconstructed.evaluation_principles[0].weight == 1.0
+        assert reconstructed.exit_conditions[0].name == "condition_1"
+        assert reconstructed.exit_conditions[0].description == "All invariant tests are green"
+        assert (
+            reconstructed.exit_conditions[0].evaluation_criteria == "All invariant tests are green"
+        )
+
     def test_seed_roundtrip_serialization(self, full_seed: Seed) -> None:
         """Seed can roundtrip through dict serialization."""
         seed_dict = full_seed.to_dict()
@@ -420,6 +1135,96 @@ class TestSeed:
         second_dict = reconstructed.to_dict()
 
         assert seed_dict == second_dict
+
+    def test_seed_roundtrip_preserves_plugin_extra_fields(self, full_seed: Seed) -> None:
+        """Seed preserves structured plugin-owned fields without core-specific hooks."""
+        seed_dict = full_seed.to_dict()
+        seed_dict["plugin_contract"] = {
+            "plugin": "example",
+            "handoff_version": 1,
+            "candidate_sequence": [{"name": "baseline"}],
+        }
+
+        reconstructed = Seed.from_dict(seed_dict)
+
+        assert reconstructed.to_dict()["plugin_contract"] == seed_dict["plugin_contract"]
+
+    def test_seed_plugin_extra_fields_are_deeply_immutable(self, full_seed: Seed) -> None:
+        """Seed extras cannot drift through nested container mutation."""
+        seed_dict = full_seed.to_dict()
+        seed_dict["plugin_contract"] = {
+            "plugin": "example",
+            "candidate_sequence": [{"name": "baseline"}],
+        }
+        reconstructed = Seed.from_dict(seed_dict)
+
+        with pytest.raises(TypeError):
+            reconstructed.plugin_contract["plugin"] = "mutated"
+        with pytest.raises(TypeError):
+            reconstructed.plugin_contract["candidate_sequence"][0]["name"] = "mutated"
+
+        assert reconstructed.to_dict()["plugin_contract"] == seed_dict["plugin_contract"]
+
+    def test_seed_model_extra_mapping_is_immutable(self, full_seed: Seed) -> None:
+        """Seed.model_extra cannot bypass plugin extra validation."""
+        seed_dict = full_seed.to_dict()
+        seed_dict["plugin_contract"] = {"plugin": "example"}
+        reconstructed = Seed.from_dict(seed_dict)
+
+        with pytest.raises(TypeError):
+            reconstructed.model_extra["plugin_contract"] = {"plugin": "mutated"}  # type: ignore[index]
+        with pytest.raises(TypeError):
+            reconstructed.model_extra["bad"] = object()  # type: ignore[index]
+
+        assert reconstructed.to_dict()["plugin_contract"] == seed_dict["plugin_contract"]
+        assert "bad" not in reconstructed.to_dict()
+
+    def test_seed_model_copy_preserves_immutable_plugin_extra_fields(self, full_seed: Seed) -> None:
+        """Pydantic model_copy works after plugin extras are frozen."""
+        seed_dict = full_seed.to_dict()
+        seed_dict["plugin_contract"] = {"plugin": "example"}
+        reconstructed = Seed.from_dict(seed_dict)
+
+        copied = reconstructed.model_copy(
+            update={"acceptance_criteria": ("Updated observable criterion.",)}
+        )
+
+        assert copied.acceptance_criteria == ("Updated observable criterion.",)
+        assert copied.to_dict()["plugin_contract"] == {"plugin": "example"}
+        with pytest.raises(TypeError):
+            copied.model_extra["plugin_contract"] = {"plugin": "mutated"}  # type: ignore[index]
+
+    def test_seed_plugin_extra_fields_use_standard_pydantic_serialization(
+        self, full_seed: Seed
+    ) -> None:
+        """Seed extras remain safe through the public Pydantic JSON API."""
+        seed_dict = full_seed.to_dict()
+        seed_dict["plugin_contract"] = {
+            "plugin": "example",
+            "candidate_sequence": [{"name": "baseline"}],
+        }
+        reconstructed = Seed.from_dict(seed_dict)
+
+        assert (
+            reconstructed.model_dump(mode="json")["plugin_contract"] == seed_dict["plugin_contract"]
+        )
+        assert '"plugin_contract"' in reconstructed.model_dump_json()
+
+    def test_seed_rejects_non_serializable_plugin_extra_fields(self, full_seed: Seed) -> None:
+        """Seed extras fail early when plugin data cannot be persisted."""
+        seed_dict = full_seed.to_dict()
+        seed_dict["plugin_contract"] = {"callback": object()}
+
+        with pytest.raises(PydanticValidationError, match="JSON/YAML-serializable"):
+            Seed.from_dict(seed_dict)
+
+    def test_seed_rejects_non_finite_plugin_extra_float(self, full_seed: Seed) -> None:
+        """Seed extras cannot contain floats that are invalid JSON values."""
+        seed_dict = full_seed.to_dict()
+        seed_dict["plugin_contract"] = {"score": float("nan")}
+
+        with pytest.raises(PydanticValidationError, match="finite float"):
+            Seed.from_dict(seed_dict)
 
     def test_seed_validation_empty_goal(self) -> None:
         """Seed validates goal is not empty."""
@@ -531,3 +1336,236 @@ class TestSeedImmutabilityComprehensive:
         assert isinstance(seed.constraints, tuple)
         assert not hasattr(seed.constraints, "append")
         assert not hasattr(seed.constraints, "extend")
+
+
+class TestAcceptanceCriterionVerifyCwd:
+    """verify_cwd: the workspace-relative directory verify_command runs in."""
+
+    def test_verify_cwd_accepted_with_verify_command(self) -> None:
+        spec = AcceptanceCriterionSpec(
+            description="tests pass",
+            verify_command="npx playwright test",
+            verify_cwd="app",
+        )
+        assert spec.verify_cwd == "app"
+        value = spec.to_seed_value()
+        assert isinstance(value, dict)
+        assert value["verify_cwd"] == "app"
+
+    def test_explicit_root_cwd_roundtrips_and_differs_from_inference(self) -> None:
+        inferred = AcceptanceCriterionSpec(description="tests pass", verify_command="npm test")
+        root = AcceptanceCriterionSpec(
+            description="tests pass", verify_command="npm test", verify_cwd="."
+        )
+        assert AcceptanceCriterionSpec.model_validate(root.to_seed_value()) == root
+        assert derive_semantic_ac_key(root) != derive_semantic_ac_key(inferred)
+        with pytest.raises(PydanticValidationError, match="resolves to the workspace root"):
+            AcceptanceCriterionSpec(description="root artifact", expected_artifacts=(".",))
+
+    def test_verify_cwd_requires_verify_command(self) -> None:
+        with pytest.raises(PydanticValidationError, match="verify_cwd requires verify_command"):
+            AcceptanceCriterionSpec(description="tests pass", verify_cwd="app")
+
+    def test_verify_cwd_rejects_workspace_escape(self) -> None:
+        with pytest.raises(PydanticValidationError, match="portable workspace-relative"):
+            AcceptanceCriterionSpec(
+                description="tests pass",
+                verify_command="npm test",
+                verify_cwd="../outside",
+            )
+
+    def test_verify_cwd_rejects_absolute_path(self) -> None:
+        with pytest.raises(PydanticValidationError, match="portable workspace-relative"):
+            AcceptanceCriterionSpec(
+                description="tests pass",
+                verify_command="npm test",
+                verify_cwd="/etc",
+            )
+
+    def test_blank_verify_cwd_normalizes_to_none(self) -> None:
+        spec = AcceptanceCriterionSpec(
+            description="tests pass",
+            verify_command="npm test",
+            verify_cwd="  ",
+        )
+        assert spec.verify_cwd is None
+
+    def test_verify_cwd_round_trips_through_seed_value(self) -> None:
+        spec = AcceptanceCriterionSpec(
+            description="tests pass",
+            verify_command="npm test",
+            verify_cwd="app",
+        )
+        rebuilt = AcceptanceCriterionSpec.model_validate(spec.to_seed_value())
+        assert rebuilt == spec
+
+    def test_verify_cwd_changes_semantic_identity(self) -> None:
+        app = AcceptanceCriterionSpec(
+            description="tests pass",
+            verify_command="npm test",
+            verify_cwd="app",
+        )
+        site = app.model_copy(update={"verify_cwd": "site", "semantic_ac_key": None})
+
+        assert derive_semantic_ac_key(app) != derive_semantic_ac_key(site)
+
+
+class TestAcceptanceCriterionDescriptionRequired:
+    """``description`` is the semantic identity of an AC, so it cannot be blank.
+
+    ``derive_semantic_ac_key`` hashes the description; a whitespace-only value
+    used to normalize to ``""`` and give every such criterion an identical
+    ``semantic_ac_key``, cross-contaminating AC-keyed retry/successor state.
+    """
+
+    @pytest.mark.parametrize("blank", ["", " ", "   ", "\t", "\n", " \t\n "])
+    def test_blank_description_rejected(self, blank: str) -> None:
+        with pytest.raises(PydanticValidationError, match="cannot be empty or whitespace-only"):
+            AcceptanceCriterionSpec(description=blank)
+
+    def test_blank_legacy_string_criterion_rejected_by_seed(self) -> None:
+        with pytest.raises(PydanticValidationError, match="cannot be empty or whitespace-only"):
+            Seed(
+                goal="Test goal",
+                acceptance_criteria=("Real criterion", "   "),
+                ontology_schema=OntologySchema(name="T", description="T"),
+                metadata=SeedMetadata(ambiguity_score=0.1),
+            )
+
+    def test_description_is_still_stripped(self) -> None:
+        criterion = AcceptanceCriterionSpec(description="  Tasks can be created  ")
+
+        assert criterion.description == "Tasks can be created"
+
+    def test_distinct_criteria_keep_distinct_semantic_keys(self) -> None:
+        first = AcceptanceCriterionSpec(description="a").with_materialized_semantic_key()
+        second = AcceptanceCriterionSpec(description="b").with_materialized_semantic_key()
+
+        assert first.semantic_ac_key != second.semantic_ac_key
+        assert first.semantic_ac_key == derive_semantic_ac_key(first)
+
+
+class TestSeedTaskType:
+    """``task_type`` is a closed set matching the execution strategy registry."""
+
+    @pytest.mark.parametrize(
+        "task_type",
+        ["code", "research", "analysis", "artifact", "document", "documentation", "presentation"],
+    )
+    def test_documented_task_types_accepted(self, task_type: str) -> None:
+        seed = Seed(
+            goal="Test goal",
+            task_type=task_type,
+            ontology_schema=OntologySchema(name="T", description="T"),
+            metadata=SeedMetadata(ambiguity_score=0.1),
+        )
+
+        assert seed.task_type == task_type
+
+    def test_every_builtin_task_type_resolves_to_a_strategy(self) -> None:
+        """The built-in set may not drift from the strategy registry."""
+        from ouroboros.core.seed import BUILTIN_TASK_TYPES
+        from ouroboros.orchestrator.execution_strategy import get_strategy
+
+        for task_type in BUILTIN_TASK_TYPES:
+            assert get_strategy(task_type) is not None
+
+    @pytest.mark.parametrize("bad", ["cod", "Coding", "codee", "", "test"])
+    def test_typo_task_type_rejected(self, bad: str) -> None:
+        with pytest.raises(PydanticValidationError):
+            Seed(
+                goal="Test goal",
+                task_type=bad,
+                ontology_schema=OntologySchema(name="T", description="T"),
+                metadata=SeedMetadata(ambiguity_score=0.1),
+            )
+
+    def test_case_and_whitespace_tolerated_for_hand_authored_seeds(self) -> None:
+        seed = Seed(
+            goal="Test goal",
+            task_type="  Research ",
+            ontology_schema=OntologySchema(name="T", description="T"),
+            metadata=SeedMetadata(ambiguity_score=0.1),
+        )
+
+        assert seed.task_type == "research"
+
+    def test_registered_custom_strategy_accepted_in_seed(self) -> None:
+        """A dynamically registered custom strategy passes Seed validation.
+
+        Regression for the blocker: static Literal broke register_strategy().
+        """
+        from ouroboros.orchestrator.execution_strategy import (
+            _STRATEGY_REGISTRY,
+            register_strategy,
+        )
+        from ouroboros.orchestrator.workflow_state import ActivityType
+
+        class _TestCustomStrategy:
+            def get_tools(self) -> list[str]:
+                return ["Read"]
+
+            def get_system_prompt_fragment(self) -> str:
+                return "custom"
+
+            def get_task_prompt_suffix(self) -> str:
+                return "custom"
+
+            def get_activity_map(self) -> dict[str, ActivityType]:
+                return {"Read": ActivityType.EXPLORING}
+
+        register_strategy("my_plugin_task", _TestCustomStrategy())
+        try:
+            seed = Seed(
+                goal="Custom strategy test",
+                task_type="my_plugin_task",
+                ontology_schema=OntologySchema(name="T", description="T"),
+                metadata=SeedMetadata(ambiguity_score=0.1),
+            )
+            assert seed.task_type == "my_plugin_task"
+        finally:
+            # Clean up to avoid polluting other tests.
+            _STRATEGY_REGISTRY.pop("my_plugin_task", None)
+
+    def test_registered_custom_strategy_case_normalized(self) -> None:
+        """Custom strategies are normalized like built-ins."""
+        from ouroboros.orchestrator.execution_strategy import (
+            _STRATEGY_REGISTRY,
+            register_strategy,
+        )
+        from ouroboros.orchestrator.workflow_state import ActivityType
+
+        class _TestCustomStrategy:
+            def get_tools(self) -> list[str]:
+                return ["Read"]
+
+            def get_system_prompt_fragment(self) -> str:
+                return "custom"
+
+            def get_task_prompt_suffix(self) -> str:
+                return "custom"
+
+            def get_activity_map(self) -> dict[str, ActivityType]:
+                return {"Read": ActivityType.EXPLORING}
+
+        register_strategy("my_plugin", _TestCustomStrategy())
+        try:
+            seed = Seed(
+                goal="Custom strategy case test",
+                task_type="  My_Plugin  ",
+                ontology_schema=OntologySchema(name="T", description="T"),
+                metadata=SeedMetadata(ambiguity_score=0.1),
+            )
+            assert seed.task_type == "my_plugin"
+        finally:
+            _STRATEGY_REGISTRY.pop("my_plugin", None)
+
+    def test_unregistered_custom_identifier_rejected(self) -> None:
+        """An identifier that is neither built-in nor registered is rejected."""
+        with pytest.raises(PydanticValidationError):
+            Seed(
+                goal="Test goal",
+                task_type="never_registered_xyz",
+                ontology_schema=OntologySchema(name="T", description="T"),
+                metadata=SeedMetadata(ambiguity_score=0.1),
+            )

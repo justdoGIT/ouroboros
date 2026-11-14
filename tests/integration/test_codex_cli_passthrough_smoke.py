@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -57,6 +57,13 @@ class _FakeProcess:
         return self._returncode
 
 
+def _make_fake_codex_cli(tmp_path: Path) -> Path:
+    cli_path = tmp_path / "codex"
+    cli_path.write_text("#!/bin/sh\nprintf '%s\\n' 'codex 0.0.0-test'\n", encoding="utf-8")
+    cli_path.chmod(0o755)
+    return cli_path
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("prompt", "expected_warning", "expected_error"),
@@ -80,19 +87,8 @@ async def test_unhandled_ooo_commands_pass_through_to_codex_unchanged(
     expected_error: str | None,
 ) -> None:
     """Unsupported and plugin-only `ooo` commands should bypass intercept dispatch."""
-    runtime = create_agent_runtime(
-        backend="codex",
-        cli_path="/tmp/codex",
-        permission_mode="acceptEdits",
-        cwd=tmp_path,
-    )
-
-    assert isinstance(runtime, CodexCliRuntime)
-    assert runtime._skill_dispatcher is not None
-    with resolve_packaged_codex_skill_path("help", skills_dir=runtime._skills_dir) as skill_md_path:
-        assert skill_md_path.is_file()
-
     captured_processes: list[_FakeProcess] = []
+    cli_path = _make_fake_codex_cli(tmp_path)
 
     async def fake_create_subprocess_exec(*command: str, **kwargs: object) -> _FakeProcess:
         assert kwargs["cwd"] == str(tmp_path)
@@ -113,6 +109,19 @@ async def test_unhandled_ooo_commands_pass_through_to_codex_unchanged(
             side_effect=fake_create_subprocess_exec,
         ) as mock_exec,
     ):
+        runtime = create_agent_runtime(
+            backend="codex",
+            cli_path=str(cli_path),
+            permission_mode="acceptEdits",
+            cwd=tmp_path,
+        )
+
+        assert isinstance(runtime, CodexCliRuntime)
+        assert runtime._skill_dispatcher is not None
+        with resolve_packaged_codex_skill_path(
+            "help", skills_dir=runtime._skills_dir
+        ) as skill_md_path:
+            assert skill_md_path.is_file()
         messages = [message async for message in runtime.execute_task(prompt)]
 
     assert captured_processes[0].stdin.written == prompt.encode("utf-8")
@@ -127,3 +136,50 @@ async def test_unhandled_ooo_commands_pass_through_to_codex_unchanged(
         mock_warning.assert_called_once()
         assert mock_warning.call_args[0][0] == expected_warning
         assert mock_warning.call_args.kwargs["error"] == expected_error
+
+
+@pytest.mark.asyncio
+async def test_packaged_ooo_auto_missing_mcp_tool_fails_closed_without_codex_fallback(
+    tmp_path: Path,
+) -> None:
+    """Packaged `ooo auto` must not fall through to Codex when the MCP tool is absent."""
+    cli_path = _make_fake_codex_cli(tmp_path)
+    fake_server = AsyncMock()
+    fake_server.call_tool = AsyncMock(
+        side_effect=LookupError("No local handler registered for tool: ouroboros_start_auto")
+    )
+
+    with (
+        patch("ouroboros.mcp.server.adapter.create_ouroboros_server", return_value=fake_server),
+        patch("ouroboros.orchestrator.codex_cli_runtime.log.warning") as mock_warning,
+        patch(
+            "ouroboros.orchestrator.codex_cli_runtime.asyncio.create_subprocess_exec"
+        ) as mock_exec,
+    ):
+        runtime = create_agent_runtime(
+            backend="codex",
+            cli_path=str(cli_path),
+            permission_mode="acceptEdits",
+            cwd=tmp_path,
+        )
+
+        assert isinstance(runtime, CodexCliRuntime)
+        assert runtime._skill_dispatcher is not None
+        with resolve_packaged_codex_skill_path(
+            "auto", skills_dir=runtime._skills_dir
+        ) as skill_md_path:
+            content = skill_md_path.read_text(encoding="utf-8")
+        assert "mcp_tool: ouroboros_start_auto" in content
+        messages = [message async for message in runtime.execute_task("ooo auto Build a CLI")]
+
+    fake_server.call_tool.assert_awaited_once()
+    assert fake_server.call_tool.await_args.args[0] == "ouroboros_start_auto"
+    mock_exec.assert_not_called()
+    mock_warning.assert_called_once()
+    assert mock_warning.call_args.kwargs["fallback"] == "terminal_error"
+    assert len(messages) == 1
+    assert messages[0].is_error is True
+    assert messages[0].content.startswith("Cannot run ooo auto")
+    assert "`ouroboros_start_auto` is unavailable" in messages[0].content
+    assert messages[0].data["error_type"] == "SkillDispatchUnavailable"
+    assert messages[0].data["tool_name"] == "ouroboros_start_auto"

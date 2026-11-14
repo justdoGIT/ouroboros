@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from types import ModuleType
 from typing import Any, get_args, get_origin, get_type_hints
 from unittest.mock import AsyncMock, patch
@@ -11,18 +12,50 @@ import pytest
 
 from ouroboros.orchestrator.adapter import (
     DEFAULT_TOOLS,
+    FULL_CAPABILITIES,
     AgentMessage,
     ClaudeAgentAdapter,
+    ParamSupport,
+    ResolvedWorkerCwd,
+    RuntimeCapabilities,
     RuntimeHandle,
     SkillDispatchHandler,
     TaskResult,
     _clone_runtime_handle_data,
+    resolve_worker_cwd,
 )
 from ouroboros.orchestrator.codex_cli_runtime import CodexCliRuntime
 from ouroboros.orchestrator.hermes_runtime import HermesCliRuntime
 from ouroboros.orchestrator.opencode_runtime import OpenCodeRuntime
 from ouroboros.orchestrator.rate_limit import RateLimitSnapshot, SharedRateLimitBucket
 from ouroboros.router import Resolved
+
+_EXPECTED_CANONICAL_PROJECT_CWD = str(Path("/tmp/project").resolve())
+
+
+class TestResolvedWorkerCwd:
+    def test_rejects_relative_value_at_construction(self) -> None:
+        with pytest.raises(ValueError, match="canonical absolute path"):
+            ResolvedWorkerCwd("workspace")
+
+    def test_rejects_noncanonical_absolute_value(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="canonical absolute path"):
+            ResolvedWorkerCwd(str(tmp_path / "nested" / ".."))
+
+    def test_rejects_symlink_alias(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        alias = tmp_path / "alias"
+        alias.symlink_to(workspace, target_is_directory=True)
+
+        with pytest.raises(ValueError, match="canonical absolute path"):
+            ResolvedWorkerCwd(str(alias))
+
+    def test_preserves_canonical_absolute_value(self, tmp_path: Path) -> None:
+        canonical = str(tmp_path.resolve())
+        resolved = ResolvedWorkerCwd(canonical)
+
+        assert resolve_worker_cwd(resolved) == canonical
 
 
 # Helper function to create mock SDK messages with correct class names
@@ -67,6 +100,52 @@ def _build_mock_claude_agent_sdk(
         "claude_agent_sdk": module,
         "claude_agent_sdk.types": types_module,
     }
+
+
+class TestRuntimeCapabilitiesParamSupport:
+    """The param-support fields are additive and default to NATIVE."""
+
+    def test_param_support_defaults_to_native(self) -> None:
+        caps = RuntimeCapabilities(
+            skill_dispatch=True,
+            targeted_resume=True,
+            structured_output=True,
+        )
+
+        assert caps.system_prompt_support is ParamSupport.NATIVE
+        assert caps.tool_restriction_support is ParamSupport.NATIVE
+        assert caps.empty_tool_restriction_support is ParamSupport.NATIVE
+        assert caps.permission_mode_support is ParamSupport.NATIVE
+
+    def test_full_capabilities_is_all_native(self) -> None:
+        assert FULL_CAPABILITIES.system_prompt_support is ParamSupport.NATIVE
+        assert FULL_CAPABILITIES.tool_restriction_support is ParamSupport.NATIVE
+        assert FULL_CAPABILITIES.empty_tool_restriction_support is ParamSupport.NATIVE
+        assert FULL_CAPABILITIES.permission_mode_support is ParamSupport.NATIVE
+
+    def test_claude_adapter_honors_system_prompt_natively(self) -> None:
+        adapter = ClaudeAgentAdapter(api_key="test-key")
+
+        assert adapter.capabilities.system_prompt_support is ParamSupport.NATIVE
+
+
+class TestCliRuntimesDeclareTranslatedSystemPrompt:
+    """CLI runtimes that fold the system prompt into the user message say so."""
+
+    def test_hermes_declares_translated_system_prompt(self) -> None:
+        runtime = HermesCliRuntime()
+
+        assert runtime.capabilities.system_prompt_support is ParamSupport.TRANSLATED
+
+    def test_codex_declares_translated_system_prompt(self) -> None:
+        runtime = CodexCliRuntime()
+
+        assert runtime.capabilities.system_prompt_support is ParamSupport.TRANSLATED
+
+    def test_opencode_declares_translated_system_prompt(self) -> None:
+        runtime = OpenCodeRuntime()
+
+        assert runtime.capabilities.system_prompt_support is ParamSupport.TRANSLATED
 
 
 class TestAgentMessage:
@@ -215,6 +294,12 @@ class TestRuntimeHandle:
             ("claude_code", "claude"),
             ("codex", "codex_cli"),
             ("opencode_cli", "opencode"),
+            ("gemini", "gemini_cli"),
+            ("gemini_cli", "gemini_cli"),
+            ("grok", "grok_cli"),
+            ("grok_cli", "grok_cli"),
+            ("antigravity", "antigravity_cli"),
+            ("antigravity_cli", "antigravity_cli"),
         ],
     )
     def test_init_normalizes_legacy_backend_aliases(
@@ -235,6 +320,50 @@ class TestRuntimeHandle:
             native_session_id="sess_123",
             cwd="/tmp/project",
         )
+
+    def test_runtime_only_backends_register_in_handle_contract(self) -> None:
+        """Regression for #1483 review (ouroboros-agent CHANGES_REQUESTED).
+
+        The gemini/grok/antigravity runtimes declare ``_runtime_handle_backend``
+        values that must be accepted by the shared RuntimeHandle contract. They
+        inherit Codex's ``_build_runtime_handle``, which constructs a
+        ``RuntimeHandle(backend=<cli>)`` on every execute/resume/control
+        iteration -- if the selector is unregistered, those generic paths crash
+        with ``ValueError`` before producing a typed runtime error.
+        """
+        from types import SimpleNamespace
+
+        from ouroboros.orchestrator.antigravity_cli_runtime import (
+            AntigravityCLIRuntime,
+        )
+        from ouroboros.orchestrator.gemini_cli_runtime import GeminiCLIRuntime
+        from ouroboros.orchestrator.grok_cli_runtime import GrokCliRuntime
+
+        for runtime_cls, expected in (
+            (GeminiCLIRuntime, "gemini_cli"),
+            (GrokCliRuntime, "grok_cli"),
+            (AntigravityCLIRuntime, "antigravity_cli"),
+        ):
+            handle = RuntimeHandle(
+                backend=runtime_cls._runtime_handle_backend,
+                native_session_id="sess_123",
+                cwd="/tmp/project",
+            )
+            assert handle.backend == expected
+
+        # Exercise Grok's inherited Codex handle builder against the real method.
+        from ouroboros.orchestrator.runtime_drift import RuntimeDriftLedger
+
+        stub = SimpleNamespace(
+            _runtime_handle_backend="grok_cli",
+            _cwd="/tmp/project",
+            _permission_mode=None,
+            _drift=RuntimeDriftLedger(runtime_backend="grok"),
+        )
+        built = GrokCliRuntime._build_runtime_handle(stub, "sess_123")
+        assert built is not None
+        assert built.backend == "grok_cli"
+        assert built.native_session_id == "sess_123"
 
     def test_non_dict_payload_returns_none(self) -> None:
         """Missing runtime payloads still deserialize to None."""
@@ -282,6 +411,47 @@ class TestRuntimeHandle:
                     native_session_id="oc-session-123",
                 ),
                 id="matching-backend-provider-aliases",
+            ),
+            pytest.param(
+                {
+                    "provider": "grok",
+                    "kind": "agent_runtime",
+                    "native_session_id": "grok-session-123",
+                    "cwd": "/tmp/project",
+                },
+                RuntimeHandle(
+                    backend="grok_cli",
+                    kind="agent_runtime",
+                    native_session_id="grok-session-123",
+                    cwd="/tmp/project",
+                ),
+                id="grok-provider-only-alias",
+            ),
+            pytest.param(
+                {
+                    "backend": "antigravity",
+                    "native_session_id": "agy-session-123",
+                    "cwd": "/tmp/project",
+                },
+                RuntimeHandle(
+                    backend="antigravity_cli",
+                    native_session_id="agy-session-123",
+                    cwd="/tmp/project",
+                ),
+                id="antigravity-backend-alias",
+            ),
+            pytest.param(
+                {
+                    "backend": "gemini",
+                    "native_session_id": "gemini-session-123",
+                    "cwd": "/tmp/project",
+                },
+                RuntimeHandle(
+                    backend="gemini_cli",
+                    native_session_id="gemini-session-123",
+                    cwd="/tmp/project",
+                ),
+                id="gemini-backend-alias",
             ),
         ],
     )
@@ -466,7 +636,11 @@ class TestRuntimeHandle:
             updated_at="2026-03-13T09:00:00+00:00",
             metadata={
                 "ac_id": "ac_2",
+                "ac_capsule_fingerprint": "sha256:" + "a" * 64,
+                "ac_dispatch_id": "b" * 32,
+                "ac_session_origin": "restored_same_attempt",
                 "server_session_id": "server-42",
+                "process_local_resume_nonce": "nonce-1",
                 "session_attempt_id": "ac_2_attempt_2",
                 "session_scope_id": "ac_2",
                 "session_state_path": "execution.acceptance_criteria.ac_2.implementation_session",
@@ -491,7 +665,11 @@ class TestRuntimeHandle:
             "approval_mode": "acceptEdits",
             "metadata": {
                 "ac_id": "ac_2",
+                "ac_capsule_fingerprint": "sha256:" + "a" * 64,
+                "ac_dispatch_id": "b" * 32,
+                "ac_session_origin": "restored_same_attempt",
                 "server_session_id": "server-42",
+                "process_local_resume_nonce": "nonce-1",
                 "session_attempt_id": "ac_2_attempt_2",
                 "session_scope_id": "ac_2",
                 "session_state_path": "execution.acceptance_criteria.ac_2.implementation_session",
@@ -597,7 +775,7 @@ class TestClaudeAgentAdapter:
     def test_init_with_custom_cwd_and_cli_path(self) -> None:
         """Test initialization stores backend-neutral runtime construction data."""
         adapter = ClaudeAgentAdapter(cwd="/tmp/project", cli_path="/tmp/claude")
-        assert adapter._cwd == "/tmp/project"
+        assert adapter._cwd == _EXPECTED_CANONICAL_PROJECT_CWD
         assert adapter._cli_path == "/tmp/claude"
 
     @patch.dict("os.environ", {"ANTHROPIC_API_KEY": "env_key"})
@@ -668,6 +846,60 @@ class TestClaudeAgentAdapter:
         assert result.tool_name == "Edit"
         assert "Edit" in result.content
 
+    def test_convert_tool_message_preserves_tool_call_id(self) -> None:
+        """Claude ToolUseBlock ids survive for mutation/result correlation."""
+        adapter = ClaudeAgentAdapter(api_key="test")
+        mock_block = _create_mock_sdk_message(
+            "ToolUseBlock",
+            name="Edit",
+            id="toolu_edit_1",
+            input={"file_path": "src/app.py"},
+        )
+        mock_message = _create_mock_sdk_message("AssistantMessage", content=[mock_block])
+
+        result = adapter._convert_message(mock_message)
+
+        assert result.data["tool_call_id"] == "toolu_edit_1"
+        assert result.data["tool_input"] == {"file_path": "src/app.py"}
+
+    @pytest.mark.parametrize("is_error", [False, True])
+    def test_convert_tool_result_preserves_call_id_and_error_bit(self, is_error: bool) -> None:
+        """Claude ToolResultBlock success/failure remains machine-readable."""
+        adapter = ClaudeAgentAdapter(api_key="test")
+        mock_block = _create_mock_sdk_message(
+            "ToolResultBlock",
+            tool_use_id="toolu_edit_1",
+            content="updated" if not is_error else "edit failed",
+            is_error=is_error,
+        )
+        mock_message = _create_mock_sdk_message("UserMessage", content=[mock_block])
+
+        result = adapter._convert_message(mock_message)
+
+        assert result.type == "tool_result"
+        assert result.data["subtype"] == "tool_result"
+        assert result.data["tool_call_id"] == "toolu_edit_1"
+        assert result.data["is_error"] is is_error
+        assert result.data["tool_result"]["is_error"] is is_error
+        assert result.data["tool_result"]["meta"]["tool_call_id"] == "toolu_edit_1"
+
+    def test_convert_tool_result_without_error_bit_does_not_invent_success(self) -> None:
+        """Missing SDK status stays unknown so mutation evidence fails closed."""
+        adapter = ClaudeAgentAdapter(api_key="test")
+        mock_block = _create_mock_sdk_message(
+            "ToolResultBlock",
+            tool_use_id="toolu_edit_1",
+            content="unknown outcome",
+        )
+        mock_message = _create_mock_sdk_message("UserMessage", content=[mock_block])
+
+        result = adapter._convert_message(mock_message)
+
+        assert result.type == "tool_result"
+        assert result.data["tool_call_id"] == "toolu_edit_1"
+        assert "is_error" not in result.data
+        assert "tool_result" not in result.data
+
     def test_convert_result_message(self) -> None:
         """Test converting SDK result message."""
         adapter = ClaudeAgentAdapter(api_key="test")
@@ -685,6 +917,112 @@ class TestClaudeAgentAdapter:
         assert result.content == "Task completed"
         assert result.data["subtype"] == "success"
 
+    def test_convert_result_message_surfaces_normalized_usage(self) -> None:
+        """ResultMessage usage + cost flow into data for per-AC token attribution."""
+        adapter = ClaudeAgentAdapter(api_key="test")
+
+        mock_message = _create_mock_sdk_message(
+            "ResultMessage",
+            result="done",
+            subtype="success",
+            usage={
+                "input_tokens": 120,
+                "output_tokens": 34,
+                "cache_read_input_tokens": 10,
+                "server_tool_use": {"web_search_requests": 0},  # non-scalar, dropped
+            },
+            total_cost_usd=0.0042,
+        )
+
+        result = adapter._convert_message(mock_message)
+
+        assert result.data["usage"] == {
+            "input_tokens": 120,
+            "output_tokens": 34,
+            "cache_read_input_tokens": 10,
+        }
+        assert result.data["total_cost_usd"] == 0.0042
+
+    def test_convert_result_message_omits_missing_usage(self) -> None:
+        """No usage/cost on the SDK message means no usage keys are emitted."""
+        adapter = ClaudeAgentAdapter(api_key="test")
+
+        mock_message = _create_mock_sdk_message(
+            "ResultMessage",
+            result="done",
+            subtype="success",
+        )
+
+        result = adapter._convert_message(mock_message)
+
+        assert "usage" not in result.data
+        assert "usage_invalid" not in result.data
+        assert "total_cost_usd" not in result.data
+
+    def test_convert_result_message_rejects_whole_malformed_usage(self) -> None:
+        """One malformed known counter invalidates the complete usage payload."""
+        adapter = ClaudeAgentAdapter(api_key="test")
+
+        mock_message = _create_mock_sdk_message(
+            "ResultMessage",
+            result="done",
+            subtype="success",
+            usage={
+                "input_tokens": "120",  # string → dropped
+                "output_tokens": float("nan"),  # non-finite → dropped
+                "total_tokens": True,  # bool → dropped
+                "cached_input_tokens": 7,
+            },
+            total_cost_usd=float("inf"),  # non-finite → dropped
+        )
+
+        result = adapter._convert_message(mock_message)
+
+        assert "usage" not in result.data
+        assert result.data["usage_invalid"] is True
+        assert "total_cost_usd" not in result.data
+
+    @pytest.mark.parametrize(
+        "invalid",
+        [-1, 10**10_000],
+        ids=["negative", "overflow"],
+    )
+    def test_convert_result_message_rejects_negative_or_overflowing_usage(
+        self,
+        invalid: int,
+    ) -> None:
+        adapter = ClaudeAgentAdapter(api_key="test")
+        mock_message = _create_mock_sdk_message(
+            "ResultMessage",
+            result="done",
+            subtype="success",
+            usage={"input_tokens": 10, "output_tokens": invalid},
+        )
+
+        result = adapter._convert_message(mock_message)
+
+        assert "usage" not in result.data
+        assert result.data["usage_invalid"] is True
+
+    def test_convert_result_message_usage_property_error_is_preserved_as_invalid(self) -> None:
+        class ExplodingUsage:
+            @property
+            def input_tokens(self):
+                raise RuntimeError("boom")
+
+        adapter = ClaudeAgentAdapter(api_key="test")
+        mock_message = _create_mock_sdk_message(
+            "ResultMessage",
+            result="done",
+            subtype="success",
+            usage=ExplodingUsage(),
+        )
+
+        result = adapter._convert_message(mock_message)
+
+        assert "usage" not in result.data
+        assert result.data["usage_invalid"] is True
+
     def test_convert_system_init_message(self) -> None:
         """Test converting SDK system init message."""
         adapter = ClaudeAgentAdapter(api_key="test")
@@ -701,6 +1039,79 @@ class TestClaudeAgentAdapter:
         assert result.type == "system"
         assert "sess_abc123" in result.content
         assert result.data["session_id"] == "sess_abc123"
+        assert "model_observation" not in result.data
+
+    @pytest.mark.parametrize(
+        ("requested", "mode"),
+        [("opus", "pinned"), (None, "automatic")],
+    )
+    def test_convert_system_init_message_records_the_reported_model(
+        self, requested: str | None, mode: str
+    ) -> None:
+        """The init event's concrete model is observed; the request is kept beside it."""
+        adapter = ClaudeAgentAdapter(api_key="test")
+        mock_message = _create_mock_sdk_message(
+            "SystemMessage",
+            subtype="init",
+            data={"session_id": "sess_abc123", "model": "claude-opus-5-5"},
+        )
+
+        result = adapter._convert_message(mock_message, requested)
+
+        assert result.data["session_id"] == "sess_abc123"
+        assert result.data["subtype"] == "init"
+        assert result.data["model_observation"] == {
+            "mode": mode,
+            "status": "observed",
+            "requested_model": requested,
+            "effective_model": "claude-opus-5-5",
+            "source": "runtime_stream:system.init:event.model",
+        }
+
+    @pytest.mark.parametrize("model", ["", "   ", 7, None, "claude opus", ["claude-opus-5-5"]])
+    def test_convert_system_init_message_ignores_malformed_model(self, model: object) -> None:
+        """An absent or malformed model is no observation, and never an error."""
+        adapter = ClaudeAgentAdapter(api_key="test")
+        mock_message = _create_mock_sdk_message(
+            "SystemMessage",
+            subtype="init",
+            data={"session_id": "sess_abc123", "model": model},
+        )
+
+        result = adapter._convert_message(mock_message, "opus")
+
+        assert result.data["session_id"] == "sess_abc123"
+        assert "model_observation" not in result.data
+
+    @pytest.mark.asyncio
+    async def test_execute_task_records_the_model_the_sdk_reports(self) -> None:
+        """The per-call model is the request; the init message's model is what ran."""
+        adapter = ClaudeAgentAdapter(api_key="test", cwd="/tmp/project", model="sonnet")
+
+        async def mock_query(*, prompt: str, options: Any):
+            yield _create_mock_sdk_message(
+                "SystemMessage",
+                subtype="init",
+                data={"session_id": "sess_789", "model": "claude-opus-5-5"},
+            )
+            yield _create_mock_sdk_message(
+                "ResultMessage",
+                result="done",
+                subtype="success",
+                is_error=False,
+                session_id="sess_789",
+                usage={"input_tokens": 4, "output_tokens": 2},
+            )
+
+        sdk_modules = _build_mock_claude_agent_sdk(query_impl=mock_query)
+
+        with patch.dict("sys.modules", sdk_modules):
+            messages = [message async for message in adapter.execute_task("hi", model="opus")]
+
+        observation = messages[0].data["model_observation"]
+        assert observation["requested_model"] == "opus"
+        assert observation["effective_model"] == "claude-opus-5-5"
+        assert "model_observation" not in messages[1].data
 
     @pytest.mark.asyncio
     async def test_execute_task_sdk_not_installed(self) -> None:
@@ -784,7 +1195,7 @@ class TestClaudeAgentAdapter:
         assert messages[0].resume_handle is not None
         assert messages[0].resume_handle.backend == "claude"
         assert messages[0].resume_handle.native_session_id == "sess_456"
-        assert messages[0].resume_handle.cwd == "/tmp/project"
+        assert messages[0].resume_handle.cwd == _EXPECTED_CANONICAL_PROJECT_CWD
         assert messages[0].resume_handle.approval_mode == "acceptEdits"
         assert messages[0].resume_handle.updated_at is not None
         assert messages[1].type == "result"
@@ -840,7 +1251,7 @@ class TestClaudeAgentAdapter:
         assert runtime_handle is not None
         assert runtime_handle.backend == "claude"
         assert runtime_handle.native_session_id == "sess_456"
-        assert runtime_handle.cwd == "/tmp/project"
+        assert runtime_handle.cwd == _EXPECTED_CANONICAL_PROJECT_CWD
         assert runtime_handle.approval_mode == "acceptEdits"
         assert runtime_handle.updated_at is not None
         assert [message.type for message in task_result.messages] == [
@@ -854,6 +1265,72 @@ class TestClaudeAgentAdapter:
             "Task completed",
         ]
         assert all(message.resume_handle == runtime_handle for message in task_result.messages)
+
+    @pytest.mark.asyncio
+    async def test_per_call_model_override_wins_over_constructor_pin(self) -> None:
+        """A per-call model routed by frugality tiering sets the SDK ``model``
+        option and overrides the constructor pin (RFC #1405 sibling)."""
+        adapter = ClaudeAgentAdapter(api_key="test", cwd="/tmp/project", model="pinned-sonnet")
+        options_sink: list[dict[str, Any]] = []
+
+        async def mock_query(*, prompt: str, options: Any):
+            yield _create_mock_sdk_message("ResultMessage", result="ok", subtype="success")
+
+        sdk_modules = _build_mock_claude_agent_sdk(query_impl=mock_query, options_sink=options_sink)
+        with patch.dict("sys.modules", sdk_modules):
+            _ = [message async for message in adapter.execute_task("hi", model="haiku-child")]
+
+        assert options_sink and options_sink[0]["model"] == "haiku-child"
+
+    @pytest.mark.asyncio
+    async def test_none_model_falls_back_to_constructor_pin(self) -> None:
+        """No per-call override → the constructor model is used, so existing call
+        sites (model=None default) are byte-identical."""
+        adapter = ClaudeAgentAdapter(api_key="test", cwd="/tmp/project", model="pinned-sonnet")
+        options_sink: list[dict[str, Any]] = []
+
+        async def mock_query(*, prompt: str, options: Any):
+            yield _create_mock_sdk_message("ResultMessage", result="ok", subtype="success")
+
+        sdk_modules = _build_mock_claude_agent_sdk(query_impl=mock_query, options_sink=options_sink)
+        with patch.dict("sys.modules", sdk_modules):
+            _ = [message async for message in adapter.execute_task("hi")]
+
+        assert options_sink and options_sink[0]["model"] == "pinned-sonnet"
+
+    @pytest.mark.asyncio
+    async def test_no_model_at_all_omits_model_option(self) -> None:
+        """Neither a constructor pin nor a per-call override → no ``model`` option
+        (SDK default), matching the pre-change ``if self._model:`` guard."""
+        adapter = ClaudeAgentAdapter(api_key="test", cwd="/tmp/project")
+        options_sink: list[dict[str, Any]] = []
+
+        async def mock_query(*, prompt: str, options: Any):
+            yield _create_mock_sdk_message("ResultMessage", result="ok", subtype="success")
+
+        sdk_modules = _build_mock_claude_agent_sdk(query_impl=mock_query, options_sink=options_sink)
+        with patch.dict("sys.modules", sdk_modules):
+            _ = [message async for message in adapter.execute_task("hi")]
+
+        assert options_sink and "model" not in options_sink[0]
+
+    @pytest.mark.asyncio
+    async def test_explicit_empty_tools_reaches_sdk_as_no_tools(self) -> None:
+        """An explicit empty list must not expand back to DEFAULT_TOOLS."""
+        adapter = ClaudeAgentAdapter(api_key="test", cwd="/tmp/project")
+        options_sink: list[dict[str, Any]] = []
+
+        async def mock_query(*, prompt: str, options: Any):
+            yield _create_mock_sdk_message("ResultMessage", result="ok", subtype="success")
+
+        sdk_modules = _build_mock_claude_agent_sdk(
+            query_impl=mock_query,
+            options_sink=options_sink,
+        )
+        with patch.dict("sys.modules", sdk_modules):
+            _ = [message async for message in adapter.execute_task("hi", tools=[])]
+
+        assert options_sink and options_sink[0]["allowed_tools"] == []
 
     @pytest.mark.asyncio
     async def test_execute_task_to_result_failure(self) -> None:
@@ -999,7 +1476,7 @@ class TestClaudeAgentAdapter:
         assert runtime_handle is not None
         assert runtime_handle.backend == "claude"
         assert runtime_handle.native_session_id == "sess_456"
-        assert runtime_handle.cwd == "/tmp/project"
+        assert runtime_handle.cwd == _EXPECTED_CANONICAL_PROJECT_CWD
         assert runtime_handle.approval_mode == "acceptEdits"
         assert runtime_handle.updated_at is not None
         assert runtime_handle.to_dict()["backend"] == "claude"
@@ -1089,7 +1566,7 @@ class TestBuildRuntimeHandleFreshPath:
         assert handle.backend == "claude"
         assert handle.kind == "agent_runtime"
         assert handle.native_session_id == "sess_789"
-        assert handle.cwd == "/tmp/project"
+        assert handle.cwd == _EXPECTED_CANONICAL_PROJECT_CWD
         assert handle.approval_mode == "acceptEdits"
         assert handle.metadata == {}
         assert handle.updated_at is not None

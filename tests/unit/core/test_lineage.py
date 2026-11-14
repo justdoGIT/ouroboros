@@ -1,10 +1,13 @@
 """Unit tests for ouroboros.core.lineage module."""
 
+from ouroboros.core.acceptance import AcceptanceState
 from ouroboros.core.lineage import (
+    ACAuthorityState,
     ACResult,
     EvaluationSummary,
     FeedbackMetadata,
     GenerationRecord,
+    TaskResult,
 )
 from ouroboros.core.seed import OntologySchema
 
@@ -49,6 +52,46 @@ class TestEvaluationSummary:
 
         assert payload["execution_completion_status"] == "completed"
         assert payload["approval_status"] == "rejected"
+
+    def test_summary_serializes_task_results_separately_from_ac_results(self) -> None:
+        """Worker task completion should not masquerade as formal AC verdicts."""
+        summary = EvaluationSummary(
+            final_approved=False,
+            highest_stage_passed=2,
+            task_results=(
+                TaskResult(
+                    task_index=0,
+                    task_content="Implement feature",
+                    status="completed",
+                    completed=True,
+                    source_ac_index=0,
+                    evidence="Worker finished the implementation task",
+                    execution_method="legacy_parallel_report",
+                ),
+            ),
+            ac_results=(),
+            execution_completion_status="completed",
+            approval_status="not_evaluated",
+        )
+
+        payload = summary.model_dump(mode="json")
+
+        assert payload["task_results"][0]["status"] == "completed"
+        assert payload["task_results"][0]["source_ac_index"] == 0
+        assert payload["ac_results"] == []
+        assert summary.run_verdict_passed is False
+
+    def test_run_verdict_fails_when_approval_not_evaluated(self) -> None:
+        """Completion without formal approval must not become a passing run verdict."""
+        summary = EvaluationSummary(
+            final_approved=False,
+            highest_stage_passed=2,
+            execution_completion_status="completed",
+            approval_status="not_evaluated",
+        )
+
+        assert summary.run_verdict_passed is False
+        assert summary.run_verdict == "FAIL"
 
     def test_feedback_metadata_serializes_as_structured_output(self) -> None:
         """Structured feedback metadata should survive round-trip serialization."""
@@ -135,8 +178,8 @@ class TestEvaluationSummary:
             "decomposition_depth_warning"
         ]
 
-    def test_run_verdict_prefers_ac_results_over_final_approved(self) -> None:
-        """Summary verdict should follow the detailed AC verdict source."""
+    def test_ac_results_cannot_override_final_rejection(self) -> None:
+        """Detailed AC PASSes are necessary but cannot mint final approval."""
         summary = EvaluationSummary(
             final_approved=False,
             highest_stage_passed=2,
@@ -152,10 +195,9 @@ class TestEvaluationSummary:
             ),
         )
 
-        assert summary.run_verdict_passed is True
-        assert summary.run_verdict == "PASS"
-        # approval_status must be reconciled to avoid contradictory serialization
-        assert summary.approval_status == "approved"
+        assert summary.run_verdict_passed is False
+        assert summary.run_verdict == "FAIL"
+        assert summary.approval_status == "rejected"
 
     def test_run_verdict_uses_canonical_final_verdict_over_legacy_passed_flag(self) -> None:
         """Summary verdict should aggregate from final_verdict even for legacy-shaped inputs."""
@@ -181,11 +223,12 @@ class TestEvaluationSummary:
         assert summary.run_verdict == "FAIL"
 
     def test_run_verdict_fails_when_execution_incomplete(self) -> None:
-        """Execution failure overrides AC results — run must be FAIL."""
+        """Execution failure overrides AC results and legacy approval fields."""
         summary = EvaluationSummary(
-            final_approved=False,
+            final_approved=True,
             highest_stage_passed=2,
             execution_completion_status="failed",
+            approval_status="approved",
             ac_results=(
                 ACResult(
                     ac_index=0,
@@ -200,6 +243,8 @@ class TestEvaluationSummary:
 
         assert summary.run_verdict_passed is False
         assert summary.run_verdict == "FAIL"
+        assert summary.final_approved is False
+        assert summary.approval_status == "rejected"
 
     def test_run_verdict_fails_when_approval_rejected_no_ac_results(self) -> None:
         """Rejected approval without AC results must be FAIL."""
@@ -213,8 +258,8 @@ class TestEvaluationSummary:
         assert summary.run_verdict_passed is False
         assert summary.run_verdict == "FAIL"
 
-    def test_run_verdict_reconciles_approval_when_acs_override(self) -> None:
-        """When AC results all pass, approval_status must be reconciled to 'approved'."""
+    def test_run_verdict_preserves_rejection_when_acs_pass(self) -> None:
+        """AC results may veto but cannot upgrade the independent final gate."""
         summary = EvaluationSummary(
             final_approved=False,
             highest_stage_passed=2,
@@ -232,9 +277,9 @@ class TestEvaluationSummary:
             ),
         )
 
-        assert summary.run_verdict_passed is True
-        assert summary.run_verdict == "PASS"
-        assert summary.approval_status == "approved"
+        assert summary.run_verdict_passed is False
+        assert summary.run_verdict == "FAIL"
+        assert summary.approval_status == "rejected"
 
     def test_run_verdict_reconciles_approval_when_acs_fail(self) -> None:
         """When AC results fail, approval_status must be reconciled to 'rejected'."""
@@ -260,8 +305,8 @@ class TestEvaluationSummary:
         assert summary.run_verdict == "FAIL"
         assert summary.approval_status == "rejected"
 
-    def test_approval_reconciled_at_construction_not_lazily(self) -> None:
-        """model_dump() must show reconciled approval_status without reading run_verdict first."""
+    def test_rejection_preserved_at_construction_not_lazily(self) -> None:
+        """model_dump() must preserve the final gate without lazy property access."""
         summary = EvaluationSummary(
             final_approved=False,
             highest_stage_passed=2,
@@ -279,8 +324,32 @@ class TestEvaluationSummary:
 
         # Deliberately do NOT access run_verdict_passed before serializing
         payload = summary.model_dump(mode="json")
-        assert payload["approval_status"] == "approved"
-        assert payload["final_approved"] is True
+        assert payload["approval_status"] == "rejected"
+        assert payload["final_approved"] is False
+
+    def test_serialized_approval_is_execution_aware_with_passing_acs(self) -> None:
+        """model_dump() must not expose approved legacy fields after execution failure."""
+        summary = EvaluationSummary(
+            final_approved=True,
+            highest_stage_passed=2,
+            execution_completion_status="failed",
+            approval_status="approved",
+            ac_results=(
+                ACResult(
+                    ac_index=0,
+                    ac_content="Feature works",
+                    passed=True,
+                    score=1.0,
+                    evidence="OK",
+                    verification_method="semantic",
+                ),
+            ),
+        )
+
+        payload = summary.model_dump(mode="json")
+        assert payload["approval_status"] == "rejected"
+        assert payload["final_approved"] is False
+        assert summary.run_verdict == "FAIL"
 
 
 class TestACResult:
@@ -303,6 +372,73 @@ class TestACResult:
         assert result.final_verdict == "fail"
         assert result.rendered_verdict == "FAIL"
 
+    def test_not_evaluated_pass_is_not_authoritative_approval(self) -> None:
+        """A contradictory PASS label cannot upgrade unknown evidence to approval."""
+        summary = EvaluationSummary(
+            final_approved=True,
+            highest_stage_passed=2,
+            ac_results=(
+                ACResult(
+                    ac_index=0,
+                    ac_content="Ship feature",
+                    passed=True,
+                    ac_verdict_state="not_evaluated",
+                    verification_method="unknown",
+                ),
+            ),
+        )
+
+        assert summary.ac_results[0].passed is True
+        assert not summary.ac_results[0].verdict_is_authoritative
+        assert not summary.ac_results[0].authoritative_pass
+        assert summary.ac_results[0].unresolved
+        assert summary.ac_results[0].authority_state == "unresolved"
+        assert not summary.final_approved
+        assert summary.approval_status == "rejected"
+        assert not summary.run_verdict_passed
+
+    def test_opaque_override_cannot_mint_approval(self) -> None:
+        """An override needs a concrete verifier source and reason."""
+        result = ACResult(
+            ac_index=0,
+            ac_content="Ship feature",
+            passed=True,
+            ac_verdict_state="overridden",
+            verification_method="unknown",
+            evidence="",
+        )
+        summary = EvaluationSummary(
+            final_approved=True,
+            highest_stage_passed=2,
+            ac_results=(result,),
+        )
+
+        assert not result.verdict_is_authoritative
+        assert not summary.final_approved
+        assert not summary.run_verdict_passed
+
+    def test_ac_passes_cannot_upgrade_explicit_final_rejection(self) -> None:
+        """Final approval and AC approval are conjunctive authorities."""
+        summary = EvaluationSummary(
+            final_approved=False,
+            approval_status="rejected",
+            highest_stage_passed=3,
+            failure_reason="Stage 3 consensus rejected the artifact",
+            ac_results=(
+                ACResult(
+                    ac_index=0,
+                    ac_content="Ship feature",
+                    passed=True,
+                    verification_method="semantic",
+                ),
+            ),
+        )
+
+        assert not summary.final_approved
+        assert summary.approval_status == "rejected"
+        assert summary.failure_reason == "Stage 3 consensus rejected the artifact"
+        assert not summary.run_verdict_passed
+
     def test_verdict_label_ignores_stale_rendered_verdict(self) -> None:
         """Rendered labels should keep following final_verdict once normalized."""
         result = ACResult(
@@ -316,3 +452,74 @@ class TestACResult:
         ).model_copy(update={"rendered_verdict": "PASS"})
 
         assert result.verdict_label == "FAIL"
+
+
+class TestEvaluationSummaryAcceptanceState:
+    """The persisted approval status is exposed as the one acceptance tri-state."""
+
+    def test_approved(self) -> None:
+        summary = EvaluationSummary(final_approved=True, highest_stage_passed=1)
+
+        assert summary.acceptance_state is AcceptanceState.APPROVED
+
+    def test_rejected(self) -> None:
+        summary = EvaluationSummary(final_approved=False, highest_stage_passed=1)
+
+        assert summary.acceptance_state is AcceptanceState.REJECTED
+
+    def test_not_evaluated_is_unverified_not_rejected(self) -> None:
+        summary = EvaluationSummary(
+            final_approved=False,
+            highest_stage_passed=1,
+            approval_status="not_evaluated",
+        )
+
+        assert summary.acceptance_state is AcceptanceState.UNVERIFIED
+
+    def test_not_evaluated_ac_rows_keep_generation_unverified(self) -> None:
+        summary = EvaluationSummary(
+            final_approved=False,
+            highest_stage_passed=1,
+            approval_status="not_evaluated",
+            ac_results=(
+                ACResult(
+                    ac_index=0,
+                    ac_content="Ship feature",
+                    passed=False,
+                    ac_verdict_state="not_evaluated",
+                    verification_method="formal_evaluation",
+                ),
+            ),
+        )
+
+        assert summary.acceptance_state is AcceptanceState.UNVERIFIED
+        assert summary.ac_results[0].authority_state is ACAuthorityState.UNRESOLVED
+
+    def test_approval_flag_without_approved_status_is_not_approved(self) -> None:
+        unverified = EvaluationSummary(
+            final_approved=True,
+            highest_stage_passed=1,
+            approval_status="not_evaluated",
+        )
+        rejected = EvaluationSummary(
+            final_approved=True,
+            highest_stage_passed=1,
+            approval_status="rejected",
+        )
+
+        assert unverified.acceptance_state is AcceptanceState.UNVERIFIED
+        assert rejected.acceptance_state is AcceptanceState.REJECTED
+
+    def test_unrecognized_status_reads_rejected(self) -> None:
+        summary = EvaluationSummary(
+            final_approved=False,
+            highest_stage_passed=1,
+            approval_status="pending",
+        )
+
+        assert summary.acceptance_state is AcceptanceState.REJECTED
+
+    def test_evaluation_package_reexports_the_same_enum(self) -> None:
+        from ouroboros.evaluation import AcceptanceState as EvaluationAcceptanceState
+
+        assert EvaluationAcceptanceState is AcceptanceState

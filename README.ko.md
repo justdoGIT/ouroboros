@@ -1,12 +1,12 @@
 <p align="right">
-  <a href="./README.md">English</a> | <strong>한국어</strong>
+  <a href="./README.md">English</a> | <strong>한국어</strong> | <a href="./README.zh-CN.md">简体中文</a>
 </p>
 
 <p align="center">
   <br/>
   ◯ ─────────── ◯
   <br/><br/>
-  <img src="./docs/images/ouroboros.png" width="520" alt="Ouroboros">
+  <img src="./docs/images/ouroboros.png" width="420" alt="Ouroboros">
   <br/><br/>
   <strong>O U R O B O R O S</strong>
   <br/><br/>
@@ -16,368 +16,180 @@
 
 
 <p align="center">
-  <strong>프롬프트를 멈추세요. 명세를 시작하세요.</strong>
+  <strong>스스로 똑똑해지는 에이전트, 그 경계는 우리가 정합니다.</strong>
   <br/>
-  <sub>AI가 코드를 쓰기 전에, 막연한 아이디어를 검증된 명세로 바꿔주는 명세 우선 워크플로우 엔진.</sub>
+  <sub>먼저 묻고, 그다음 만들고, 언제나 확인합니다. 지금 쓰는 에이전트를 위한 명세 우선 AI 코딩.</sub>
 </p>
 
 <p align="center">
+  <a href="https://github.com/Q00/ouroboros"><img src="https://img.shields.io/github/stars/Q00/ouroboros?color=yellow&logo=github&label=stars" alt="GitHub stars"></a>
   <a href="https://pypi.org/project/ouroboros-ai/"><img src="https://img.shields.io/pypi/v/ouroboros-ai?color=blue" alt="PyPI"></a>
   <a href="https://github.com/Q00/ouroboros/actions/workflows/test.yml"><img src="https://img.shields.io/github/actions/workflow/status/Q00/ouroboros/test.yml?branch=main" alt="Tests"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
+  <a href="https://github.com/sponsors/Q00"><img src="https://img.shields.io/github/sponsors/Q00?logo=githubsponsors&color=EA4AAA&label=sponsors" alt="GitHub Sponsors"></a>
 </p>
 
 <p align="center">
-  <a href="#빠른-시작">빠른 시작</a> ·
-  <a href="#wonder에서-온톨로지로">철학</a> ·
-  <a href="#순환-구조">원리</a> ·
-  <a href="#명령어">명령어</a> ·
-  <a href="#아홉-개의-사고">에이전트</a>
+  <a href="#설치">설치</a> ·
+  <a href="#처음-해-볼-것">처음 해 볼 것</a> ·
+  <a href="#지원-도구">지원 도구</a> ·
+  <a href="#더-알아보기">더 알아보기</a> ·
+  <a href="https://ouroboros.page/learn/">가이드</a>
 </p>
 
-> *AI는 무엇이든 만들 수 있다. 어려운 건 무엇을 만들어야 하는지 아는 것이다.*
+Ouroboros는 AI 코딩 에이전트가 맞는 것을 만들도록 돕습니다. 목표가 분명해질
+때까지 질문하고, 그 답을 확인 가능한 수용 기준이 담긴 스펙으로 정리한 뒤,
+지금 쓰고 있는 코딩 에이전트에게 넘겨 만들게 하고, 결과가 스펙대로인지
+검사합니다.
 
-Ouroboros는 **명세 우선 AI 개발 시스템**입니다. 이 시스템은 소크라테스식 질문법과 온톨로지 분석을 적용하여, 단 한 줄의 코드도 작성하기 전에 사용자의 숨겨진 가정을 드러냅니다.
+<p align="center">
+  <img src="./docs/images/console-tour-ko.gif" width="900" alt="브라우저에서 한국어 화면으로 연 Ouroboros 콘솔 화면 녹화. 에이전트 도구마다 연결 상태를 보여 주는 연결 화면에서 시작해 홈, 인터뷰·자동·질문 모드가 있는 채팅, 실행, 에이전트·모델, 프로바이더, 공유 MCP, 상태 점검 화면을 차례로 보여 줍니다.">
+</p>
 
-대부분의 AI 코딩은 **출력**이 아니라 **입력** 단계에서 실패합니다. 병목 현상의 원인은 AI의 능력이 아니라, 우리가 뭘 만들지 덜 정한 채 시작하기 때문입니다. Ouroboros는 기계가 아닌 인간을 바로잡습니다.
+<p align="center">
+  <sub>Ouroboros 콘솔: 에이전트 도구 연결부터 채팅, 실행 기록, 모델 설정, 상태 점검까지 한곳에서 다룹니다.</sub>
+</p>
 
----
-
-## Wonder에서 온톨로지로
-
-> *Wonder → "어떻게 살아야 하는가?" → "'삶'이란 무엇인가?" → 온톨로지*
-> — 소크라테스
-
-이게 바로 Ouroboros의 철학적 토대입니다. 좋은 질문은 더 깊은 질문으로 이어지며, 더 깊은 질문은 언제나 **온톨로지**입니다. 즉, *"이걸 어떻게 하지?"*보다 *"이게 정확히 뭐지?"*를 먼저 묻는 겁니다.
-
-```text
-   Wonder                         온톨로지
-     💡                               🔬
-"내가 원하는 게 뭐지?"      →    "내가 원하는 게 정확히 뭐지?"
-"Task CLI를 만들자"         →    "Task가 뭐지? Priority는 뭐지?"
-"인증 버그를 고치자"        →    "이게 근본 원인일까, 아니면 증상일까?"
-```
-
-이것은 단순히 추상화를 위한 것이 아닙니다. *"Task가 뭐지?"* 라는 질문에 답할 때 — 삭제 가능한 것인가, 보관 가능한 것인가? 혼자 하는 것인가, 팀으로 하는 것인가? — 재작업의 한 유형 전체를 없앨 수 있습니다. **온톨로지 질문이야말로 가장 실용적인 질문입니다.**
-
-Ouroboros는 이 철학을 **Double Diamond** 구조로 풀어냅니다:
-
-```text
-    ◇ Wonder         ◇ 설계
-   ╱  (넓히기)       ╱  (넓히기)
-  ╱    탐색         ╱    창조
- ╱                 ╱
-◆ ──────────── ◆ ──────────── ◆
- ╲                 ╲
-  ╲    정의         ╲    전달
-   ╲  (좁히기)      ╲  (좁히기)
-    ◇ 온톨로지       ◇ 평가
-```
-
-첫 번째 다이아몬드는 **소크라테스적**입니다. 질문을 넓히고, 온톨로지가 또렷해질 때까지 좁혀 갑니다. 두 번째 다이아몬드는 **실용적**입니다. 설계 옵션을 넓히고, 검증된 결과물로 좁혀 갑니다. 각 다이아몬드는 그 이전 단계가 없이는 성립할 수 없습니다. 이해하지 못한 것은 설계할 수 없기 때문입니다.
-
----
-
-## 빠른 시작
-
-**설치** — 한 줄이면 전부 자동:
+## 설치
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Q00/ouroboros/main/scripts/install.sh | bash
+# macOS / Linux / WSL 2
+curl -fsSL https://raw.githubusercontent.com/Q00/ouroboros/main/scripts/install.sh | OUROBOROS_INSTALL_REF=readme-ko bash
 ```
 
-**시작** — AI 코딩 에이전트를 열고 바로:
-
+```powershell
+# Windows (PowerShell) — Python 없어도 됩니다. Git과 uv를 대신 설치합니다
+irm https://raw.githubusercontent.com/Q00/ouroboros/main/scripts/install.ps1 | iex
 ```
-> ooo interview "I want to build a task management CLI"
-```
 
-> Claude Code와 Codex CLI 모두 지원합니다. 런타임 감지, MCP 서버 등록, 스킬 설치까지 자동으로 처리됩니다.
+설치가 끝나면 브라우저에 Ouroboros 콘솔이 열리고, 에이전트 도구를 연결하는
+과정을 차례로 안내합니다. 나중에 다시 열 때는 `ouroboros gui`를 실행하세요.
 
-<details>
-<summary><strong>다른 설치 방법</strong></summary>
+설치 스크립트는 이미 깔려 있는 에이전트 도구를 찾아 Ouroboros를 연결합니다.
+네이티브 Windows는 실험 단계이고 Codex CLI는 WSL 2가 필요합니다.
+[플랫폼 지원](./docs/platform-support.md)을 참고하세요.
 
-**Claude Code 플러그인만** (시스템 패키지 없이):
+**다른 설치 방법.** 아래 방법은 콘솔을 자동으로 열지 않습니다. `ouroboros`
+명령이 설치된 뒤 `ouroboros gui`를 실행하세요.
+
 ```bash
+# Claude Code 플러그인만 (설치 후 Claude Code 안에서 /ouroboros:setup 실행)
 claude plugin marketplace add Q00/ouroboros && claude plugin install ouroboros@ouroboros
-```
-Claude Code 세션 안에서 `ooo setup` 실행.
 
-**pip / uv / pipx**:
-```bash
-pip install ouroboros-ai                # 기본
-pip install ouroboros-ai[claude]        # + Claude Code 의존성
-pip install ouroboros-ai[litellm]       # + LiteLLM 멀티 프로바이더
-pip install ouroboros-ai[mcp]           # + MCP 서버/클라이언트 지원
-pip install ouroboros-ai[tui]           # + Textual 터미널 UI
-pip install ouroboros-ai[all]           # 전부
-ouroboros setup                         # 런타임 설정
+# pip / uv / pipx (Python 3.12+)
+pip install 'ouroboros-ai[mcp,tui]' && ouroboros setup --runtime claude-cli
+
+# Homebrew (macOS / Linux)
+brew tap q00/tap && brew install ouroboros-ai && ouroboros setup
 ```
 
-호환성 참고: extras 전환 기간 동안 `ouroboros-ai[dashboard]`도 no-op alias로 계속 허용됩니다.
+모든 설치 경로, 프로필, 호스트별 설정은 [시작 가이드](./docs/getting-started.md)(영어)에
+있습니다. `ouroboros uninstall`은 Ouroboros 설정, MCP 등록, 데이터 디렉터리
+(`~/.ouroboros/`)를 지웁니다. Python 패키지와 Claude Code 플러그인은 그대로 남으니,
+[UNINSTALL.md](./UNINSTALL.md)에 있는 나머지 단계로 마저 제거하세요.
 
-런타임별 가이드: [Claude Code](./docs/runtime-guides/claude-code.md) · [Codex CLI](./docs/runtime-guides/codex.md)
+## 처음 해 볼 것
 
-</details>
+원하는 것을 평소 말투로 적으면 됩니다. 이렇게 시작해 보세요:
 
-<details>
-<summary><strong>완전 삭제</strong></summary>
+- **콘솔 채팅**: 목표를 적고 **인터뷰**(목표가 분명해질 때까지 질문) 또는 **자동**(빈 부분을 스스로 채움)을 고른 뒤, 스펙을 에이전트에게 넘기고 실행을 지켜보세요.
+- 에이전트에서 **`ooo interview "마감일이 있는 할 일 CLI"`**: 목표가 분명해질 때까지 질문한 뒤 스펙(*Seed*)을 만듭니다.
+- **`ooo auto "마감일이 있는 할 일 CLI"`**: 빠진 것만 묻고, 스펙을 쓰고, 실행하고, 검사합니다.
+- **`ooo run`**: 이미 있는 Seed를 구현하고 모든 수용 기준을 검사합니다.
 
-```bash
-ouroboros uninstall
-```
+Claude Code에서는 `/ouroboros:setup`을 한 번 실행해 질문에 답한 뒤, 첫 `ooo`
+명령은 다음 메시지로 따로 보내세요. 에이전트 호스트 없이 터미널에서는
+`ouroboros init start "..."`와 `ouroboros auto "..."`로 같은 일을 할 수
+있습니다. 전체 명령어 목록은 [시작 가이드](./docs/getting-started.md#commands)에
+있습니다.
 
-모든 설정, MCP 등록, 데이터를 제거합니다. 자세한 내용은 [UNINSTALL.md](./UNINSTALL.md)를 참고하세요.
+> Ouroboros가 실행하는 코딩 에이전트는 프로젝트 파일을 바꾸고 명령을 실행할 수
+> 있습니다. 신뢰하지 않는 프로젝트에서 쓰기 전에
+> [권한 범위](./skills/help/TROUBLESHOOTING.md#permission-scope)를 읽어 보세요.
 
-</details>
+## 지원 도구
 
-<details>
-<summary><strong>무슨 일이 일어났나요?</strong></summary>
+[Claude Code](./docs/runtime-guides/claude-code.ko.md) ·
+[Codex CLI](./docs/runtime-guides/codex.ko.md) ·
+[GitHub Copilot CLI](./docs/runtime-guides/copilot.ko.md) ·
+[OpenCode](./docs/runtime-guides/opencode.ko.md) ·
+[Hermes](./docs/runtime-guides/hermes.ko.md) ·
+[Gemini CLI](./docs/runtime-guides/gemini.ko.md) ·
+[Kiro CLI](./docs/runtime-guides/kiro.ko.md) ·
+[Pi](./docs/runtime-guides/pi.ko.md) ·
+[OMP](./docs/runtime-guides/omp.ko.md) ·
+[Zcode](./docs/runtime-guides/zcode.ko.md) ·
+[Goose](./docs/runtime-guides/goose.ko.md) ·
+[GJC](./docs/runtime-guides/gjc.ko.md) ·
+[Antigravity CLI](./docs/runtime-guides/antigravity.ko.md) ·
+[Grok Build CLI](./docs/runtime-guides/grok.ko.md) ·
+[DeepSeek Harness](./docs/guides/deepseek-harness.md)
 
-```text
-ooo interview  →  소크라테스식 질문으로 숨겨진 가정 12개를 드러냄
-ooo seed       →  답변을 확정된 스펙으로 정리 (Ambiguity: 0.15)
-ooo run        →  Double Diamond로 실행
-ooo evaluate   →  3단계 검증: Mechanical → Semantic → Consensus
-```
+설치 스크립트는 이미 있는 도구를 연결하고, 나머지는 콘솔의 **연결** 화면에서
+설치하고 연결할 수 있습니다. 먼저 보고 싶다면
+[일곱 개 호스트에서 인터뷰가 돌아가는 모습](./docs/how-ouroboros-works.md#see-it-on-each-host)(영어 문서)을
+확인하세요.
 
-뱀이 한 바퀴를 돌고 나면 다음 바퀴는 다릅니다. 전보다 더 많이 알게 되니까요.
+## 더 알아보기
 
-</details>
+- [시작 가이드](./docs/getting-started.md)(영어): 모든 설치 경로, 호스트별 설정, 첫 워크플로, 전체 명령어.
+- [콘솔 가이드](./docs/guides/console.md)(영어): 콘솔 화면별 기능, 공유 MCP 서버, 로그인 시 콘솔 자동 시작.
+- [Ouroboros 작동 방식](./docs/how-ouroboros-works.md)(영어): 순환 구조, 에이전트, 모호성 게이트, Agent OS 스택, 내부 구조, 철학.
+- [TUI 사용 가이드](./docs/guides/tui-usage.ko.md): `ooo run`이나 `ooo evolve`를 실시간으로 지켜보는 터미널 대시보드.
+- [CLI 레퍼런스](./docs/cli-reference.md) · [설정 레퍼런스](./docs/config-reference.md) · [플랫폼 지원](./docs/platform-support.md) · [전체 문서](./docs/README.md)
+- [대화형 가이드](https://ouroboros.page/learn/)
 
----
-
-## 순환 구조
-
-우로보로스(자기 꼬리를 삼키는 뱀)는 그냥 상징이 아닙니다. 우로보로스는 아키텍처 그 자체입니다:
-
-```text
-    Interview → Seed → Execute → Evaluate
-        ↑                           ↓
-        └──── Evolutionary Loop ────┘
-```
-
-각 순환은 같은 걸 반복하는 게 아닙니다. 평가 결과가 다음 세대 입력으로 돌아가고, 시스템이 지금 뭘 만드는지 분명해질 때까지 계속 **진화**합니다.
-
-| 단계 | 수행 내용 |
-|:------|:-------------|
-| **Interview** | 소크라테스식 질문으로 숨겨진 가정 드러내기 |
-| **Seed** | 답변을 확정된 스펙으로 정리 |
-| **Execute** | Double Diamond: 발견 → 정의 → 설계 → 전달 |
-| **Evaluate** | 3단계 게이트: Mechanical ($0) → Semantic → Multi-Model Consensus |
-| **Evolve** | Wonder *("우리가 아직 모르는 게 뭐지?")* → 성찰 → 다음 세대 |
-
-> *"여기서 우로보로스가 자기 꼬리를 삼킵니다: 평가의 출력이*
-> *다음 세대 Seed 스펙의 입력이 됩니다."*
-> — `reflect.py`
-
-온톨로지 유사도 0.95를 넘기면 거기서 수렴합니다. 질문을 더 돌려도 크게 달라지지 않는다는 뜻입니다.
-
-### Ralph: 멈추지 않는 순환
-
-`ooo ralph`는 수렴에 도달할 때까지 세션 경계를 넘어 지속적으로 진화 루프를 돌립니다. 각 단계는 **무상태(stateless)**로 움직입니다. EventStore가 전체 계보를 다시 만들 수 있어서, 머신이 재시작돼도 뱀은 중단된 지점에서 이어집니다.
-
-```text
-Ralph Cycle 1: evolve_step(lineage, seed) → Gen 1 → action=CONTINUE
-Ralph Cycle 2: evolve_step(lineage)       → Gen 2 → action=CONTINUE
-Ralph Cycle 3: evolve_step(lineage)       → Gen 3 → action=CONVERGED ✓
-                                                └── Ralph 종료.
-                                                    온톨로지가 안정됨.
-```
-
-### 모호성 점수: Wonder와 코드 사이의 관문
-
-Interview는 느낌으로 끝내지 않습니다. **수학적 계산** 점수가 기준 밑으로 내려와야 끝납니다. Ouroboros는 모호성을 `1 - 가중 명확도`로 계산합니다:
-
-```text
-Ambiguity = 1 − Σ(clarityᵢ × weightᵢ)
-```
-
-각 차원은 LLM이 0.0~1.0 사이 점수를 매기고 (재현성을 위해 temperature 0.1), 여기에 가중치를 곱합니다:
-
-| 차원 | Greenfield | Brownfield |
-|:----------|:----------:|:----------:|
-| **목표 명확도** — *목표가 구체적인가?* | 40% | 35% |
-| **제약 명확도** — *제한 사항이 정의되었는가?* | 30% | 25% |
-| **성공 기준** — *결과가 측정 가능한가?* | 30% | 25% |
-| **컨텍스트 명확도** — *기존 코드베이스를 이해하고 있는가?* | — | 15% |
-
-**임계값: Ambiguity ≤ 0.2** — 이 아래로 내려와야 Seed를 만들 수 있습니다.
-
-```text
-예시 (Greenfield):
-
-  Goal: 0.9 × 0.4  = 0.36
-  Constraint: 0.8 × 0.3  = 0.24
-  Success: 0.7 × 0.3  = 0.21
-                        ──────
-  Clarity             = 0.81
-  Ambiguity = 1 − 0.81 = 0.19  ≤ 0.2 → ✓ Seed 생성 가능
-```
-
-왜 0.2일까요? 가중 명확도가 80%면 남은 불확실성이 작아서 코드 수준의 판단으로도 충분히 풀 수 있기 때문입니다. 그보다 모호하면 아직 아키텍처를 감으로 정하는 단계에 가깝습니다.
-
-### 온톨로지 수렴: 뱀이 멈추는 시점
-
-진화 루프는 끝없이 돌지 않습니다. 연속된 세대가 온톨로지적으로 같은 스키마를 만들면 거기서 멈춥니다. 유사도는 스키마 필드를 가중 비교해서 계산합니다:
-
-```text
-Similarity = 0.5 × name_overlap + 0.3 × type_match + 0.2 × exact_match
-```
-
-| 구성 요소 | 가중치 | 측정 대상 |
-|:----------|:------:|:-----------------|
-| **Name overlap** | 50% | 두 세대에 같은 필드명이 존재하는가? |
-| **Type match** | 30% | 공유 필드의 타입이 동일한가? |
-| **Exact match** | 20% | 이름, 타입, 설명이 모두 동일한가? |
-
-**임계값: Similarity ≥ 0.95** — 이 선을 넘으면 루프가 수렴하고 멈춥니다.
-
-하지만 유사도만 보는 건 아닙니다. 시스템은 병리적인 패턴도 함께 봅니다:
-
-| 신호 | 조건 | 의미 |
-|:-------|:----------|:--------------|
-| **정체(Stagnation)** | 3세대 연속 유사도 ≥ 0.95 | 온톨로지가 안정됨 |
-| **진동(Oscillation)** | Gen N ≈ Gen N-2 (주기 2 순환) | 두 설계 사이에서 왕복 중 |
-| **반복 피드백** | 3세대에 걸쳐 질문 중복률 ≥ 70% | Wonder가 같은 질문만 반복 중 |
-| **Hard cap** | 30세대 도달 | 안전장치 |
-
-```text
-Gen 1: {Task, Priority, Status}
-Gen 2: {Task, Priority, Status, DueDate}     → similarity 0.78 → CONTINUE
-Gen 3: {Task, Priority, Status, DueDate}     → similarity 1.00 → CONVERGED ✓
-```
-
-기준은 두 개입니다. **충분히 분명해질 때까지는 만들지 않고 (Ambiguity ≤ 0.2), 안정될 때까지는 진화를 계속합니다 (Similarity ≥ 0.95).**
-
----
-
-## 명령어
-
-> 모든 `ooo` 명령어는 AI 코딩 에이전트(Claude Code, Codex CLI 등) 세션 안에서 실행됩니다.
-> 설치 후 `ooo setup`을 실행하여 MCP 서버를 등록(1회)하고, 프로젝트 설정과 통합할 수 있습니다.
-
-| 명령어 | 기능 |
-|:--------|:-------------|
-| `ooo setup` | MCP 서버 등록 (1회) |
-| `ooo interview` | 소크라테스식 질문 → 숨겨진 가정 드러내기 |
-| `ooo seed` | 확정된 스펙으로 정리 |
-| `ooo run` | Double Diamond로 실행 |
-| `ooo evaluate` | 3단계 검증 게이트 |
-| `ooo evolve` | 온톨로지 수렴까지 진화 루프 |
-| `ooo unstuck` | 막혔을 때 활용 가능한 5가지 수평적 사고 페르소나 |
-| `ooo status` | 드리프트 감지 + 세션 추적 |
-| `ooo resume-session` | 실행 중인 세션 목록과 재연결 명령 확인 |
-| `ooo ralph` | 검증될 때까지 계속 도는 루프 |
-| `ooo tutorial` | 대화형 실습 |
-| `ooo help` | 전체 참조 |
-| `ooo pm` | PM 인터뷰 + PRD 생성 |
-| `ooo qa` | 범용 QA 판정 |
-| `ooo cancel` | 멈춘 실행 취소 |
-| `ooo update` | 최신 버전 확인 + 업그레이드 |
-| `ooo brownfield` | 기존 저장소 스캔 + 기본값 관리 |
-| `ooo publish` | Seed를 GitHub Epic/Task 이슈로 발행 |
-
-> `ooo publish`는 직접적인 `ouroboros publish` 셸 서브커맨드가 아니라, AI 런타임 세션에서 실행되는 skill/runtime surface이며 내부적으로 `gh` CLI를 사용합니다.
-
----
-
-## 아홉 개의 사고
-
-아홉 개의 에이전트가 있고, 각자 생각하는 방식이 다릅니다. 필요할 때만 로드하고, 처음부터 다 띄워두지는 않습니다:
-
-| 에이전트 | 역할 | 핵심 질문 |
-|:------|:-----|:--------------|
-| **Socratic Interviewer** | 질문만 한다. 절대 만들지 않는다. | *"지금 뭘 가정하고 있지?"* |
-| **Ontologist** | 증상이 아닌 본질을 찾는다 | *"이게 정확히 뭐지?"* |
-| **Seed Architect** | 대화를 통해 스펙을 구체화한다 | *"모호함이 사라졌나?"* |
-| **Evaluator** | 3단계로 검증 | *"우리가 맞는 걸 만든 건가?"* |
-| **Contrarian** | 모든 가정에 의문을 제기한다 | *"반대 상황이 사실이라면?"* |
-| **Hacker** | 색다른 경로를 찾는다 | *"진짜 제약이 뭐지?"* |
-| **Simplifier** | 복잡성을 제거한다 | *"돌아가는 것 중 제일 단순한 건?"* |
-| **Researcher** | 코딩을 멈추고 조사를 시작한다 | *"근거 있어?"* |
-| **Architect** | 구조적 원인을 파악한다 | *"처음부터 다시 짜면 정말 이렇게 갈까?"* |
-
----
-
-## 내부 구조
-
-<details>
-<summary><strong>18개 패키지 · 166개 모듈 · 95개 테스트 파일 · Python 3.14+</strong></summary>
-
-```text
-src/ouroboros/
-├── bigbang/        Interview, 모호성 점수 산정, brownfield 탐색
-├── routing/        PAL Router — 3단계 비용 최적화 (1x / 10x / 30x)
-├── execution/      Double Diamond, 계층적 AC 분해
-├── evaluation/     Mechanical → Semantic → Multi-Model Consensus
-├── evolution/      Wonder / Reflect 순환, 수렴 감지
-├── resilience/     4가지 정체 패턴 감지, 5가지 측면 페르소나
-├── observability/  3요소 드리프트 측정, 자동 회고
-├── persistence/    Event Sourcing (SQLAlchemy + aiosqlite), 체크포인트
-├── orchestrator/   런타임 추상화 레이어 (Claude Code, Codex CLI)
-├── core/           타입, 에러, Seed, 온톨로지, 보안
-├── providers/      LiteLLM 어댑터 (100+ 모델)
-├── mcp/            MCP 클라이언트/서버
-├── plugin/         플러그인 시스템 (스킬/에이전트 자동 탐색)
-├── tui/            터미널 UI 대시보드
-└── cli/            Typer 기반 CLI
-```
-
-**핵심 내부 구조:**
-- **PAL Router** — Frugal (1x) → Standard (10x) → Frontier (30x), 실패 시 자동 상향, 성공 시 자동 하향
-- **Drift** — Goal (50%) + Constraint (30%) + 온톨로지 (20%) 가중 측정, 임계값 ≤ 0.3
-- **Brownfield** — 12개 이상의 언어 생태계에서 15종의 설정 파일 스캔
-- **Evolution** — 최대 30세대, 온톨로지 유사도 ≥ 0.95에서 수렴
-- **Stagnation** — 스핀, 오실레이션, 드리프트 부재, 수익 감소 패턴 감지
-
-</details>
-
----
-
-## 실시간 모니터링 (TUI)
-
-Ouroboros에는 실시간 워크플로우를 볼 수 있는 **터미널 대시보드**가 있습니다. `ooo run`이나 `ooo evolve`를 돌릴 때 별도 터미널에서 같이 띄우면 됩니다:
-
-```bash
-# 설치 및 실행
-uvx --from 'ouroboros-ai[tui]' ouroboros tui monitor
-
-# 로컬 설치된 경우
-uv run ouroboros tui monitor
-```
-
-| 키 | 화면 | 표시 내용 |
-|:---:|:-------|:-------------|
-| `1` | **Dashboard** | 단계 진행률, 수용 기준 트리, 실시간 상태 |
-| `2` | **Execution** | 타임라인, 단계별 출력, 상세 이벤트 |
-| `3` | **Logs** | 레벨별 색상 구분, 필터링 가능한 로그 뷰어 |
-| `4` | **Debug** | 상태 인스펙터, 원시 이벤트, 설정 |
-
-> 자세한 내용은 [TUI 사용 가이드](./docs/guides/tui-usage.md)를 참고하세요.
-
----
+<p align="center">
+  <sub>대개는 리뷰 세 번째 파일쯤에서 자기가 명확하지 않았다는 걸 알게 됩니다.<br/>
+  익숙한 기분이라면, 같은 일을 겪을 다음 사람이 이 프로젝트를 찾도록 <a href="https://github.com/Q00/ouroboros"><strong>GitHub의 Q00/ouroboros</strong></a>에 Star를 남겨 주세요.</sub>
+</p>
 
 ## 기여하기
 
 ```bash
 git clone https://github.com/Q00/ouroboros
 cd ouroboros
-uv sync --all-groups && uv run pytest
+uv sync --python 3.13 --all-groups
+uv run --python 3.13 --no-sync pytest
 ```
 
-[이슈](https://github.com/Q00/ouroboros/issues) · [토론](https://github.com/Q00/ouroboros/discussions)
+[이슈](https://github.com/Q00/ouroboros/issues) · [토론](https://github.com/Q00/ouroboros/discussions) · [기여 가이드](./CONTRIBUTING.md)
 
----
+## 후원하기
 
-## Star 히스토리
+Ouroboros는 MIT 라이선스로 공개 개발되는 오픈소스입니다. 재작업을 줄여 줬다면
+후원을 고려해 주세요. 후원금은 유지보수, 새로운 런타임 통합, 후원자 전용 심층
+콘텐츠 제작에 쓰입니다.
 
-<a href="https://www.star-history.com/?repos=Q00/ouroboros&type=Date#gh-light-mode-only">
-  <img src="https://api.star-history.com/svg?repos=Q00/ouroboros&type=Date&theme=light" alt="Star History Chart" width="100%" />
-</a>
-<a href="https://www.star-history.com/?repos=Q00/ouroboros&type=Date#gh-dark-mode-only">
-  <img src="https://api.star-history.com/svg?repos=Q00/ouroboros&type=Date&theme=dark" alt="Star History Chart" width="100%" />
-</a>
+<p align="center">
+  <a href="https://github.com/sponsors/Q00"><img src="https://img.shields.io/badge/%E2%9D%A4%EF%B8%8E%20Sponsor%20on%20GitHub-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor Q00 on GitHub"></a>
+</p>
+
+## 활동
+
+여기 있는 숫자는 GitHub 데이터를 바탕으로 생성되어 자동으로 갱신되며, 캐시로 인해 업데이트가 지연될 수 있습니다.
+
+<p align="center">
+  <a href="https://github.com/Q00/ouroboros/graphs/contributors"><img src="https://img.shields.io/github/contributors/Q00/ouroboros?color=orange" alt="Contributors"></a>
+  <a href="https://github.com/Q00/ouroboros/commits/main"><img src="https://img.shields.io/github/commit-activity/m/Q00/ouroboros?color=orange" alt="Commit activity"></a>
+  <a href="https://github.com/Q00/ouroboros/pulls?q=is%3Apr+is%3Aclosed"><img src="https://img.shields.io/github/issues-pr-closed/Q00/ouroboros?color=orange" alt="Closed pull requests"></a>
+  <a href="https://github.com/Q00/ouroboros/commits/main"><img src="https://img.shields.io/github/last-commit/Q00/ouroboros?color=orange" alt="Last commit"></a>
+</p>
+
+## 고지
+
+> Ouroboros 프로젝트와 커뮤니티는 **어떤 암호화폐, 토큰, 밈코인, 트레이딩
+> 커뮤니티와도 무관합니다** — pump.fun을 비롯한 런치패드에 올라온 "ouroboros"
+> 티커도 여기 포함됩니다. 이것은 오픈소스 개발자 도구입니다. 우리는 어떤 코인도
+> 발행하거나, 보증하거나, 보유하지 않습니다. 이 프로젝트와 관련이 있다고
+> 주장하는 토큰은 전부 무단입니다.
+
+> **이름 관련 안내.** "Ouroboros"라는 이름을 쓰는 별개의, 무관한 오픈소스
+> 프로젝트가 하나 더 있습니다 — Anton Razzhigaev의 자가 수정형(self-modifying),
+> 지속 기억형 에이전트(`github.com/razzant/ouroboros`)입니다. 코드 공유도,
+> 관계도 없습니다. 이 프로젝트는 실행 전에 명세를 고정하며 스스로의 아키텍처를
+> 다시 쓰지 않습니다 — 자기 자신의 코드를 고쳐 쓰는 에이전트를 찾으신다면
+> 그쪽입니다.
 
 ---
 

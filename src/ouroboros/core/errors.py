@@ -116,6 +116,14 @@ class ProviderError(OuroborosError):
             "session_id",
             "claudecode_present",
             "claude_code_entrypoint",
+            "configured_cli_path",
+            "cwd",
+            "env_override_keys",
+            "failure_category",
+            "model_guidance",
+            "codex_app_version",
+            "codex_cli_version",
+            "codex_app_cli_versions_match",
             "stderr",
         ):
             value = self.details.get(key)

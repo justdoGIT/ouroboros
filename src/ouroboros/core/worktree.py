@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
@@ -11,11 +11,21 @@ import shutil
 import socket
 import subprocess
 from typing import Any
+import uuid
+
+import structlog
 
 from ouroboros.config.loader import load_config
 from ouroboros.config.models import OrchestratorConfig
 from ouroboros.core.errors import ConfigError, OuroborosError
 from ouroboros.core.file_lock import file_lock
+from ouroboros.core.project_identity import (
+    ProjectIdentityGitVersionError,
+    ProjectIdentityUnavailableError,
+    require_managed_identity_git,
+)
+
+log = structlog.get_logger()
 
 
 class WorktreeError(OuroborosError):
@@ -96,15 +106,21 @@ def _worktree_root() -> Path:
     return Path(root).expanduser()
 
 
-def _stale_after() -> timedelta:
-    config = _orchestrator_config()
-    minutes = getattr(config, "worktree_lock_stale_after_minutes", 60)
-    return timedelta(minutes=minutes)
-
-
 def _worktrees_enabled() -> bool:
     config = _orchestrator_config()
     return getattr(config, "use_worktrees", True)
+
+
+def _worktree_cleanup_policy() -> str:
+    # Cleanup is destructive, so configuration failures must not inherit the
+    # model default.  Other worktree settings can safely use
+    # ``_orchestrator_config``'s defaults, but cleanup requires a positively
+    # loaded and validated operator policy.
+    try:
+        config = load_config().orchestrator
+    except (ConfigError, OSError):
+        return "keep"
+    return config.worktree_cleanup
 
 
 def _run_git_process(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -114,6 +130,11 @@ def _run_git_process(args: list[str], cwd: Path) -> subprocess.CompletedProcess[
             cwd=cwd,
             capture_output=True,
             text=True,
+            # Git for Windows emits repository paths as UTF-8. Relying on the
+            # process ANSI code page (commonly cp949 on Korean Windows) can
+            # make subprocess' reader thread fail and leave stdout as None.
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             check=False,
         )
@@ -129,6 +150,29 @@ def _run_git(args: list[str], cwd: Path) -> str:
             details={"stdout": result.stdout.strip(), "stderr": result.stderr.strip()},
         )
     return result.stdout.strip()
+
+
+def _run_git_bytes(args: list[str], cwd: Path) -> bytes:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=False,
+            timeout=30,
+            check=False,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        raise WorktreeError(f"Git command failed: {' '.join(args)}", details={"error": str(exc)})
+    if result.returncode != 0:
+        raise WorktreeError(
+            f"Git command failed: {' '.join(args)}",
+            details={
+                "stdout": os.fsdecode(result.stdout).strip(),
+                "stderr": os.fsdecode(result.stderr).strip(),
+            },
+        )
+    return result.stdout
 
 
 def _resolve_repo_root(start_path: Path) -> Path:
@@ -184,8 +228,47 @@ def _ensure_clean_checkout(repo_root: Path) -> None:
         )
 
 
+def _ensure_only_untracked_evidence(repo_root: Path) -> None:
+    status = _run_git(["status", "--porcelain", "--untracked-files=no"], repo_root)
+    if status:
+        raise WorktreeError(
+            "Cannot start task worktree from a dirty checkout",
+            details={"repo_root": str(repo_root)},
+        )
+    untracked = _run_git_bytes(["ls-files", "--others", "--exclude-standard", "-z"], repo_root)
+    if any(
+        len(path.parts) < 2 or path.parts[0] != "evidence"
+        for value in untracked.split(b"\0")
+        if value
+        for path in (Path(os.fsdecode(value)),)
+    ):
+        raise WorktreeError(
+            "Cannot start task worktree from a dirty checkout",
+            details={"repo_root": str(repo_root)},
+        )
+
+
 def _checkout_is_dirty(repo_root: Path) -> bool:
     return bool(_run_git(["status", "--porcelain"], repo_root))
+
+
+def _branch_is_merged(repo_root: Path, branch: str) -> bool:
+    if not _branch_exists(repo_root, branch):
+        return True
+
+    result = _run_git_process(["merge-base", "--is-ancestor", branch, "HEAD"], repo_root)
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise WorktreeError(
+        "Git command failed: merge-base --is-ancestor",
+        details={
+            "branch": branch,
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+        },
+    )
 
 
 def _list_worktrees(repo_root: Path) -> dict[str, dict[str, str]]:
@@ -277,10 +360,41 @@ def _ensure_worktree(
 
     if _branch_exists(repo_root, branch):
         _run_git(["worktree", "add", str(worktree_path), branch], repo_root)
+        _record_task_provenance(worktree_path)
         return
 
-    base = base_ref or _run_git(["rev-parse", "HEAD"], repo_root)
+    if base_ref is not None:
+        base = base_ref
+    else:
+        head = _run_git_process(["rev-parse", "--verify", "HEAD"], repo_root)
+        if head.returncode != 0:
+            raise WorktreeError(
+                "Cannot create a task worktree from an empty Git repository. "
+                "Create an initial commit first (for example: "
+                'git commit --allow-empty -m "chore: initialize repository") and retry.',
+                details={
+                    "repo_root": str(repo_root),
+                    "stdout": head.stdout.strip(),
+                    "stderr": head.stderr.strip(),
+                },
+            )
+        base = head.stdout.strip()
     _run_git(["worktree", "add", "-b", branch, str(worktree_path), base], repo_root)
+    _record_task_provenance(worktree_path)
+
+
+_TASK_PROVENANCE_FILE = "ouroboros-task"
+"""Written in a task worktree's private git directory only when Ouroboros creates it."""
+
+
+def _task_git_dir(worktree_path: Path) -> Path:
+    return Path(_run_git(["rev-parse", "--path-format=absolute", "--git-dir"], worktree_path))
+
+
+def _record_task_provenance(worktree_path: Path) -> None:
+    """Record that Ouroboros created this task worktree (its durable id, untracked)."""
+    marker = _task_git_dir(worktree_path) / _TASK_PROVENANCE_FILE
+    marker.write_text(f"{worktree_path.name}\n", encoding="utf-8")
 
 
 def _lock_path(repo_name: str, durable_id: str) -> Path:
@@ -300,31 +414,22 @@ def _pid_is_alive(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    except PermissionError:
-        # Process exists but we lack permission to signal it — still alive.
+    except (PermissionError, OverflowError):
+        # An uncheckable process is not proof that the owner has exited.
         return True
     return True
 
 
 def _is_lock_stale(data: dict[str, Any]) -> bool:
-    host = str(data.get("host", ""))
+    host = data.get("host")
     pid = data.get("pid")
-    if host == socket.gethostname() and isinstance(pid, int):
+    if not isinstance(host, str) or not host or type(pid) is not int or pid <= 0:
+        return False
+    if host == socket.gethostname():
         return not _pid_is_alive(pid)
 
-    timestamp = data.get("updated_at") or data.get("created_at")
-    if not isinstance(timestamp, str):
-        return True
-
-    try:
-        seen = datetime.fromisoformat(timestamp)
-    except ValueError:
-        return True
-
-    if seen.tzinfo is None:
-        seen = seen.replace(tzinfo=UTC)
-
-    return datetime.now(UTC) - seen > _stale_after()
+    # An old heartbeat cannot establish that a remote process is dead.
+    return False
 
 
 def _acquire_lock(lock_path: Path, workspace: TaskWorkspace) -> dict[str, Any]:
@@ -332,12 +437,16 @@ def _acquire_lock(lock_path: Path, workspace: TaskWorkspace) -> dict[str, Any]:
         if lock_path.exists():
             try:
                 existing = json.loads(lock_path.read_text())
-            except (OSError, json.JSONDecodeError) as exc:
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
                 raise WorktreeError(
                     "Invalid task workspace lock file",
                     details={"lock_path": str(lock_path), "error": str(exc)},
                 ) from exc
-            if isinstance(existing, dict) and existing and not _is_lock_stale(existing):
+            if not isinstance(existing, dict) or not existing:
+                raise WorktreeError(
+                    "Invalid task workspace lock file", details={"lock_path": str(lock_path)}
+                )
+            if not _is_lock_stale(existing):
                 raise WorktreeError(
                     "Task already active",
                     details={
@@ -356,6 +465,7 @@ def _acquire_lock(lock_path: Path, workspace: TaskWorkspace) -> dict[str, Any]:
             "host": socket.gethostname(),
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
+            "lease_id": uuid.uuid4().hex,
         }
         lock_path.write_text(json.dumps(owner, indent=2, sort_keys=True))
         return owner
@@ -379,22 +489,243 @@ def heartbeat_lock(lock_path: str) -> None:
         path.write_text(json.dumps(payload, indent=2, sort_keys=True))
 
 
-def release_lock(lock_path: str) -> None:
-    """Release a task lock if this process owns it."""
+def release_lock(lock_path: str, owner: dict[str, Any] | None = None) -> None:
+    """Release only the exact task lease supplied by its owner."""
     path = Path(lock_path)
     if not path.exists():
         return
     with file_lock(path):
         try:
             payload = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            path.unlink(missing_ok=True)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            # Failure to read or decode is not proof that this process owns
+            # the lock. Preserve it for inspection instead of releasing it.
             return
         if not isinstance(payload, dict):
-            path.unlink(missing_ok=True)
             return
-        if payload.get("pid") == os.getpid() and payload.get("host") == socket.gethostname():
+        if _matches_lock_owner(payload, owner):
             path.unlink(missing_ok=True)
+
+
+def _matches_lock_owner(payload: object, owner: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict) or not owner:
+        return False
+    lease_id = owner.get("lease_id")
+    return (
+        isinstance(lease_id, str)
+        and bool(lease_id)
+        and payload.get("lease_id") == lease_id
+        and payload.get("pid") == owner.get("pid") == os.getpid()
+        and payload.get("host") == owner.get("host") == socket.gethostname()
+    )
+
+
+def cleanup_task_workspace(
+    workspace: TaskWorkspace,
+    *,
+    policy: str | None = None,
+    dry_run: bool = False,
+) -> bool:
+    """Remove a managed task worktree according to the configured cleanup policy.
+
+    With ``dry_run=True`` all safety checks run but nothing is mutated; the
+    return value still reports whether the workspace would be removed.
+    """
+    selected_policy = policy or _worktree_cleanup_policy()
+    if selected_policy == "keep":
+        return False
+    if selected_policy not in {"remove", "prune-merged"}:
+        raise WorktreeError(
+            "Invalid task worktree cleanup policy",
+            details={"policy": selected_policy},
+        )
+
+    repo_root = Path(workspace.repo_root)
+    worktree_path = Path(workspace.worktree_path)
+    require_merged = selected_policy == "prune-merged"
+
+    if not worktree_path.exists():
+        if not dry_run:
+            # Drop any stale registration left in .git/worktrees when the
+            # directory was deleted externally; also required before a safe
+            # branch delete (git refuses to delete a branch a registered
+            # worktree still claims).
+            _run_git_process(["worktree", "prune"], repo_root)
+        if _branch_exists(repo_root, workspace.branch) and _branch_is_merged(
+            repo_root, workspace.branch
+        ):
+            if not dry_run:
+                _run_git(["branch", "-d", workspace.branch], repo_root)
+        return True
+
+    if _checkout_is_dirty(worktree_path):
+        return False
+    if require_merged and not _branch_is_merged(repo_root, workspace.branch):
+        return False
+
+    if dry_run:
+        return True
+
+    _run_git(["worktree", "remove", str(worktree_path)], repo_root)
+
+    if _branch_exists(repo_root, workspace.branch) and _branch_is_merged(
+        repo_root, workspace.branch
+    ):
+        _run_git(["branch", "-d", workspace.branch], repo_root)
+    return True
+
+
+def release_task_workspace(
+    workspace: TaskWorkspace | None,
+    *,
+    cleanup: bool,
+) -> None:
+    """Release a task workspace lock and optionally apply configured cleanup.
+
+    Callers must positively establish that no delegated or resumable work is
+    still using the workspace before passing ``cleanup=True``.
+    """
+    if workspace is None:
+        return
+    path = Path(workspace.lock_path)
+    with file_lock(path):
+        try:
+            current = json.loads(path.read_text())
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return
+        # A prior owner in this process must not remove a newer lease.
+        if not _matches_lock_owner(current, workspace.lock_owner):
+            return
+        try:
+            if cleanup:
+                cleanup_task_workspace(workspace)
+        except WorktreeError as exc:
+            log.warning(
+                "worktree.cleanup_failed",
+                durable_id=workspace.durable_id,
+                worktree_path=workspace.worktree_path,
+                branch=workspace.branch,
+                error=str(exc),
+            )
+        finally:
+            path.unlink(missing_ok=True)
+
+
+def managed_worktree_root() -> Path:
+    """Return the configured root directory for managed task worktrees."""
+    return _worktree_root()
+
+
+def _is_managed_task_worktree(path: Path) -> bool:
+    """Whether ``path`` lies in a task worktree Ouroboros created, on its managed branch.
+
+    Created means Ouroboros recorded it when it ran ``git worktree add``
+    (``_record_task_provenance``); the path's shape and branch name alone are
+    not ownership.
+    """
+    try:
+        repo_root = _resolve_repo_root(path)
+        common_root = _resolve_common_repo_root(repo_root)
+    except WorktreeError:
+        return False
+    root = _worktree_root().expanduser().resolve()
+    if repo_root.parent.parent != root or common_root == repo_root:
+        return False
+    durable_id = repo_root.name
+    try:
+        expected = _managed_branch_name(common_root, durable_id)
+        marker = _task_git_dir(repo_root) / _TASK_PROVENANCE_FILE
+        recorded = marker.read_text(encoding="utf-8").strip()
+    except (WorktreeError, OSError):
+        return False
+    head = _run_git_process(["symbolic-ref", "--quiet", "--short", "HEAD"], repo_root)
+    return recorded == durable_id and head.returncode == 0 and head.stdout.strip() == expected
+
+
+def checkpoint_managed_worktree(path: str | Path, *, message: str) -> str | None:
+    """Commit every change in an Ouroboros-managed task worktree as a checkpoint.
+
+    Only a task worktree Ouroboros created is ever committed: a linked git
+    worktree at ``<managed root>/<repo>/<durable id>``, recorded by Ouroboros
+    when it created it, whose checked-out branch is that id's managed branch
+    (``ooo/<durable id>``). Any other checkout (the user's own, a standalone
+    repository or a worktree someone else created under the root, a worktree
+    on another branch) is left untouched and ``None`` is returned, as it is for
+    a clean worktree. Ignored files stay out (``git add -A`` honors
+    ``.gitignore``) and no git hook runs: this is the product's own record of a
+    generation's work on its task branch. Returns the checkpoint commit.
+    """
+    if not _is_managed_task_worktree(Path(path)):
+        return None
+    repo_root = _resolve_repo_root(Path(path))
+    if not _checkout_is_dirty(repo_root):
+        return None
+    _run_git(["add", "-A"], repo_root)
+    # Each identity field git needs is filled on its own when the
+    # configuration does not supply it; a configured field is kept.
+    identity: list[str] = []
+    for key, fallback in (("user.name", "Ouroboros"), ("user.email", "ouroboros@localhost")):
+        if not _run_git_process(["config", key], repo_root).stdout.strip():
+            identity += ["-c", f"{key}={fallback}"]
+    # No hook of any kind runs for the product's own checkpoint.
+    no_hooks = ["-c", f"core.hooksPath={os.devnull}"]
+    _run_git([*no_hooks, *identity, "commit", "-q", "--no-verify", "-m", message], repo_root)
+    return _run_git(["rev-parse", "HEAD"], repo_root)
+
+
+def lock_file_is_stale(lock_path: str | Path) -> bool:
+    """Return true only for absent or positively stale locks, preserving unknown owners."""
+    path = Path(lock_path)
+    try:
+        payload = json.loads(path.read_text())
+    except FileNotFoundError:
+        return True
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict) or not payload:
+        return False
+    return _is_lock_stale(payload)
+
+
+def discover_managed_workspaces(root: Path | None = None) -> list[TaskWorkspace]:
+    """Enumerate managed task worktrees left on disk under the worktree root.
+
+    Reconstructs a ``TaskWorkspace`` for every ``<repo>/<durable_id>``
+    directory that still resolves to a git repository. Directories whose
+    parent repository has been deleted are skipped.
+    """
+    base = root if root is not None else _worktree_root()
+    workspaces: list[TaskWorkspace] = []
+    if not base.is_dir():
+        return workspaces
+    for repo_dir in sorted(base.iterdir()):
+        if not repo_dir.is_dir() or repo_dir.name == ".locks":
+            continue
+        for worktree_path in sorted(repo_dir.iterdir()):
+            if not worktree_path.is_dir():
+                continue
+            durable_id = worktree_path.name
+            try:
+                repo_root = _resolve_common_repo_root(worktree_path)
+                branch = _managed_branch_name(repo_root, durable_id)
+            except WorktreeError:
+                continue
+            if repo_root == worktree_path.resolve():
+                # Not a linked worktree (e.g. a stray standalone repo).
+                continue
+            workspaces.append(
+                TaskWorkspace(
+                    durable_id=durable_id,
+                    repo_root=str(repo_root),
+                    repo_name=repo_dir.name,
+                    original_cwd=str(repo_root),
+                    effective_cwd=str(worktree_path),
+                    worktree_path=str(worktree_path),
+                    branch=branch,
+                    lock_path=str(base / ".locks" / repo_dir.name / f"{durable_id}.json"),
+                )
+            )
+    return workspaces
 
 
 def prepare_task_workspace(
@@ -402,19 +733,18 @@ def prepare_task_workspace(
     durable_id: str,
     *,
     allow_dirty: bool = False,
+    allow_untracked_evidence: bool = False,
 ) -> TaskWorkspace:
-    """Create or reuse a task worktree and acquire its active lock."""
+    """Create or reuse a clean task worktree without touching caller changes."""
     source_path = Path(source_cwd).expanduser().resolve()
     repo_root = _resolve_repo_root(source_path)
-    if not allow_dirty:
-        _ensure_clean_checkout(repo_root)
+    if allow_untracked_evidence and not allow_dirty:
+        _ensure_only_untracked_evidence(repo_root)
 
     repo_name = repo_root.name
     branch = _managed_branch_name(repo_root, durable_id)
     worktree_path = _worktree_root() / repo_name / durable_id
     effective_cwd = worktree_path / _relative_subdir(repo_root, source_path)
-    _ensure_worktree(repo_root, worktree_path, branch)
-
     workspace = TaskWorkspace(
         durable_id=durable_id,
         repo_root=str(repo_root),
@@ -426,6 +756,13 @@ def prepare_task_workspace(
         lock_path=str(_lock_path(repo_name, durable_id)),
     )
     owner = _acquire_lock(Path(workspace.lock_path), workspace)
+    try:
+        _ensure_worktree(repo_root, worktree_path, branch)
+        if not allow_dirty:
+            _ensure_clean_checkout(worktree_path)
+    except BaseException:
+        release_lock(workspace.lock_path, owner)
+        raise
     return TaskWorkspace(
         durable_id=workspace.durable_id,
         repo_root=workspace.repo_root,
@@ -445,14 +782,19 @@ def restore_task_workspace(
     *,
     fallback_source_cwd: str | Path | None = None,
     allow_dirty: bool = False,
+    allow_untracked_evidence: bool = False,
 ) -> TaskWorkspace:
     """Restore an existing task worktree or bootstrap it from fallback cwd."""
     if persisted is not None:
         worktree_path = Path(persisted.worktree_path)
-        if not worktree_path.exists():
-            repo_root = Path(persisted.repo_root)
-            _ensure_worktree(repo_root, worktree_path, persisted.branch)
         owner = _acquire_lock(Path(persisted.lock_path), persisted)
+        try:
+            if not worktree_path.exists():
+                repo_root = Path(persisted.repo_root)
+                _ensure_worktree(repo_root, worktree_path, persisted.branch)
+        except BaseException:
+            release_lock(persisted.lock_path, owner)
+            raise
         return TaskWorkspace(
             durable_id=persisted.durable_id,
             repo_root=persisted.repo_root,
@@ -474,6 +816,11 @@ def restore_task_workspace(
     source_dir = Path(fallback_source_cwd).expanduser().resolve()
     root = _worktree_root()
     caller_repo_root = _resolve_repo_root(source_dir)
+    # A managed worktree belongs to the repository its git data lives in. The
+    # source may itself be a linked worktree of that repository (the task
+    # worktree a chained evaluation ran in), so both sides are compared by
+    # their common repository root, never by the source's own top level.
+    caller_common_root = _resolve_common_repo_root(source_dir)
 
     repo_matches: list[tuple[Path, Path]] = []
     for match in root.glob(f"*/{durable_id}"):
@@ -482,7 +829,7 @@ def restore_task_workspace(
             match_repo_root = _resolve_common_repo_root(worktree_path)
         except WorktreeError:
             continue
-        if match_repo_root == caller_repo_root:
+        if match_repo_root == caller_common_root:
             repo_matches.append((worktree_path, match_repo_root))
 
     if len(repo_matches) > 1:
@@ -512,6 +859,12 @@ def restore_task_workspace(
             lock_path=str(lock),
         )
         owner = _acquire_lock(lock, workspace)
+        if not worktree_path.exists():
+            release_lock(str(lock), owner)
+            raise WorktreeError(
+                "Managed task worktree disappeared during restore",
+                details={"worktree_path": str(worktree_path)},
+            )
         return TaskWorkspace(
             durable_id=workspace.durable_id,
             repo_root=workspace.repo_root,
@@ -524,7 +877,37 @@ def restore_task_workspace(
             lock_owner=owner,
         )
 
+    if allow_untracked_evidence:
+        return prepare_task_workspace(
+            fallback_source_cwd,
+            durable_id,
+            allow_dirty=allow_dirty,
+            allow_untracked_evidence=True,
+        )
     return prepare_task_workspace(fallback_source_cwd, durable_id, allow_dirty=allow_dirty)
+
+
+def _require_managed_identity_git() -> None:
+    """Refuse a run's task worktree before creating it when Git cannot prove ownership.
+
+    A run in a task worktree resolves its project identity by proving, from
+    Git's worktree population, that the worktree belongs to its source
+    checkout; that query needs Git 2.36.0 or newer. Checking here, before any
+    worktree, branch or lock exists, turns a failure at session start into an
+    immediate refusal the caller can act on.
+    """
+    try:
+        require_managed_identity_git()
+    except ProjectIdentityGitVersionError as exc:
+        raise WorktreeError(
+            f"{exc}. A run in a managed task worktree needs it to prove the worktree "
+            "belongs to its source checkout. Upgrade Git to 2.36.0 or newer, or set "
+            "orchestrator.use_worktrees: false in the Ouroboros config to run in the "
+            "checkout itself.",
+            details={"cause": str(exc)},
+        ) from exc
+    except ProjectIdentityUnavailableError as exc:
+        raise WorktreeError(str(exc), details={"cause": str(exc)}) from exc
 
 
 def maybe_prepare_task_workspace(
@@ -532,21 +915,29 @@ def maybe_prepare_task_workspace(
     durable_id: str,
     *,
     allow_dirty: bool = False,
+    allow_untracked_evidence: bool = False,
+    resolves_managed_identity: bool = True,
 ) -> TaskWorkspace | None:
-    """Provision a task workspace only when worktrees are enabled."""
+    """Provision a task workspace only when worktrees are enabled.
+
+    ``resolves_managed_identity`` says the workspace goes to a run that proves
+    it belongs to its source checkout; see :func:`_require_managed_identity_git`.
+    """
     if not _worktrees_enabled():
         return None
     repo_root = _try_resolve_repo_root(source_cwd)
     if repo_root is None:
         return None
-    if allow_dirty and _checkout_is_dirty(repo_root):
-        return None
-    try:
-        return prepare_task_workspace(source_cwd, durable_id, allow_dirty=allow_dirty)
-    except WorktreeError as exc:
-        if exc.message == "Cannot start task worktree from a dirty checkout":
-            return None
-        raise
+    if resolves_managed_identity:
+        _require_managed_identity_git()
+    if allow_untracked_evidence:
+        return prepare_task_workspace(
+            source_cwd,
+            durable_id,
+            allow_dirty=allow_dirty,
+            allow_untracked_evidence=True,
+        )
+    return prepare_task_workspace(source_cwd, durable_id, allow_dirty=allow_dirty)
 
 
 def maybe_restore_task_workspace(
@@ -555,8 +946,13 @@ def maybe_restore_task_workspace(
     *,
     fallback_source_cwd: str | Path | None = None,
     allow_dirty: bool = False,
+    allow_untracked_evidence: bool = False,
+    resolves_managed_identity: bool = True,
 ) -> TaskWorkspace | None:
-    """Restore or bootstrap a task workspace when worktrees are enabled."""
+    """Restore or bootstrap a task workspace when worktrees are enabled.
+
+    ``resolves_managed_identity`` is as for :func:`maybe_prepare_task_workspace`.
+    """
     if persisted is None and not _worktrees_enabled():
         return None
     if persisted is None:
@@ -564,14 +960,19 @@ def maybe_restore_task_workspace(
             return None
         if _try_resolve_repo_root(fallback_source_cwd) is None:
             return None
-    try:
+    if resolves_managed_identity:
+        _require_managed_identity_git()
+    if allow_untracked_evidence:
         return restore_task_workspace(
             durable_id,
             persisted,
             fallback_source_cwd=fallback_source_cwd,
             allow_dirty=allow_dirty,
+            allow_untracked_evidence=True,
         )
-    except WorktreeError as exc:
-        if exc.message == "Cannot start task worktree from a dirty checkout":
-            return None
-        raise
+    return restore_task_workspace(
+        durable_id,
+        persisted,
+        fallback_source_cwd=fallback_source_cwd,
+        allow_dirty=allow_dirty,
+    )

@@ -7,12 +7,16 @@ This module contains handlers for querying session state and events:
 """
 
 from dataclasses import dataclass, field
+import math
 from typing import Any
 
 import structlog
 
+from ouroboros.auto.intent_guard import diagnose_auto_pipeline_state
+from ouroboros.auto.state import AutoPhase, AutoStore
 from ouroboros.core.types import Result
 from ouroboros.mcp.errors import MCPServerError, MCPToolError
+from ouroboros.mcp.job_manager import JobManager, JobStatus
 from ouroboros.mcp.tools.ac_tree_hud_handler import (
     format_subtask_progress_summary,
     summarize_subtask_events,
@@ -27,6 +31,7 @@ from ouroboros.mcp.types import (
 )
 from ouroboros.orchestrator.session import SessionRepository, SessionStatus
 from ouroboros.persistence.event_store import EventStore
+from ouroboros.persistence.qa_session_store import QA_EVALUATED, read_qa_evaluation
 
 log = structlog.get_logger(__name__)
 
@@ -39,12 +44,17 @@ class SessionStatusHandler:
     """
 
     event_store: EventStore | None = field(default=None, repr=False)
+    auto_store: AutoStore | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Initialize the session repository after dataclass creation."""
         self._owns_event_store = self.event_store is None
         self._event_store = self.event_store or EventStore()
         self._session_repo = SessionRepository(self._event_store)
+        # Auto sessions are read from a separate JSON-file store; the
+        # repository is created lazily so callers that never query an
+        # ``auto_<id>`` session do not pay the file-system cost.
+        self._auto_store = self.auto_store or AutoStore()
         self._initialized = False
 
     async def _ensure_initialized(self) -> None:
@@ -78,6 +88,185 @@ class SessionStatusHandler:
             ),
         )
 
+    def _build_ralph_block(self, state: Any) -> dict[str, Any] | None:
+        """Build the ``ralph`` sub-block for an auto session, if applicable.
+
+        Returns ``None`` when no ralph context exists yet (no lineage, no
+        job, no plugin delegation). When a ``ralph_dispatch_mode`` is
+        ``"plugin"`` the block intentionally omits ``job_id`` per the issue
+        contract — the OpenCode Task widget owns the lifecycle and the
+        block instead exposes the operator-facing guidance string.
+
+        For job-mode dispatch the block carries the four mirror fields
+        populated by ``ouroboros.auto.listeners`` plus the ``lineage_id``
+        already pinned at handoff time. ``last_event_at`` is forwarded
+        as-is even though it is a monotonic-clock reading; the unified
+        status surface only uses it for ordering, never for absolute time
+        rendering.
+        """
+        if state.ralph_dispatch_mode == "plugin":
+            return {
+                "dispatch_mode": "plugin",
+                "guidance": ("ralph delegated to OpenCode Task widget; follow that lifecycle"),
+            }
+        if state.phase is AutoPhase.RALPH_HANDOFF and state.ralph_dispatch_mode == "plugin_pending":
+            return {
+                "dispatch_mode": "plugin_pending",
+                "lineage_id": state.ralph_lineage_id,
+                "status": "interrupted_plugin_dispatch",
+                "guidance": "plugin dispatch unconfirmed; resume will retry or block",
+            }
+        if state.ralph_job_id is not None:
+            return {
+                "job_id": state.ralph_job_id,
+                "lineage_id": state.ralph_lineage_id,
+                "status": state.ralph_job_status,
+                "last_event_at": state.ralph_last_event_at,
+                "current_generation": state.ralph_current_generation,
+                "stop_reason": state.ralph_stop_reason,
+                "dispatch_mode": state.ralph_dispatch_mode or "job",
+            }
+        return None
+
+    async def _reconcile_auto_state_from_execution_job(self, state: Any) -> None:
+        """Project a completed run job onto non-complete-product status displays."""
+        if not state.job_id:
+            return
+        if (
+            state.phase is AutoPhase.RALPH_HANDOFF
+            or state.ralph_job_id is not None
+            or state.ralph_lineage_id is not None
+        ):
+            return
+        try:
+            snapshot = await JobManager().get_snapshot(state.job_id)
+        except Exception:
+            return
+        if snapshot.status is JobStatus.COMPLETED:
+            state.phase = AutoPhase.COMPLETE
+            state.last_error = None
+            state.last_error_code = None
+            state.last_progress_message = "execution job completed"
+            state.ralph_job_status = "completed"
+            state.ralph_stop_reason = None
+
+    async def _handle_auto_session(
+        self,
+        session_id: str,
+    ) -> Result[MCPToolResult, MCPServerError]:
+        """Build the unified status response for an ``auto_<id>`` session.
+
+        Synchronous because ``AutoStore`` is a JSON-file store, not async.
+        The handler intentionally returns a ``MCPToolError`` with the same
+        ``tool_name`` as the orchestrator branch so client error handling
+        does not need to special-case the auto path.
+        """
+        try:
+            state = self._auto_store.load(session_id)
+        except ValueError as exc:
+            return Result.err(
+                MCPToolError(
+                    f"Auto session not found: {exc}",
+                    tool_name="ouroboros_session_status",
+                )
+            )
+        await self._reconcile_auto_state_from_execution_job(state)
+
+        # Gap window per the issue contract: between RUN's run_handoff_status
+        # transitioning to "started" and the RALPH_HANDOFF entry persisting a
+        # job_id, the session phase is reported as ``ralph_handoff`` with a
+        # ``pending`` marker so the operator never sees a missing-status hole.
+        is_gap_window = (
+            state.phase is AutoPhase.RALPH_HANDOFF
+            and state.ralph_lineage_id is not None
+            and state.ralph_job_id is None
+            and state.ralph_dispatch_mode not in {"plugin", "plugin_pending"}
+        )
+        phase_value = "ralph_handoff" if is_gap_window else state.phase.value
+        is_terminal = state.phase in {
+            AutoPhase.COMPLETE,
+            AutoPhase.BLOCKED,
+            AutoPhase.FAILED,
+        }
+        ralph_block = self._build_ralph_block(state)
+        intent_guard = diagnose_auto_pipeline_state(state)
+
+        # Render a short text block; the structured detail lives in ``meta``
+        # so machine consumers do not have to parse strings. Keep the layout
+        # stable so the CLI snapshot test in ``tests/integration/auto`` can
+        # pin it.
+        lines = [
+            f"Auto session: {state.auto_session_id}",
+            f"Phase: {phase_value}",
+            f"Terminal: {is_terminal}",
+            f"Last progress: {state.last_progress_message}",
+        ]
+        if state.pending_question:
+            lines.append("Pending question:")
+            for line in str(state.pending_question).strip().splitlines() or [""]:
+                lines.append(f"  {line}")
+        recent_auto_answers = state.auto_answer_log[-3:]
+        if recent_auto_answers:
+            lines.append(f"Recent auto answers (last {len(recent_auto_answers)}):")
+            for entry in recent_auto_answers:
+                round_value = entry.get("round", "?")
+                source = entry.get("source", "?")
+                question = str(entry.get("question", "")).strip()
+                answer = str(entry.get("answer", "")).strip()
+                lines.append(f"  round {round_value} [{source}] Q: {question}")
+                lines.append(f"    A: {answer}")
+        if state.last_grade:
+            lines.append(f"Seed grade: {state.last_grade}")
+        if is_gap_window:
+            lines.append("Pending: starting ralph")
+        if ralph_block is not None:
+            lines.append("Ralph:")
+            for key in (
+                "dispatch_mode",
+                "job_id",
+                "lineage_id",
+                "status",
+                "current_generation",
+                "stop_reason",
+                "guidance",
+            ):
+                if key in ralph_block:
+                    lines.append(f"  {key}: {ralph_block[key]}")
+        if state.last_error:
+            lines.append(f"Blocker: {state.last_error}")
+        lines.extend(intent_guard.render_lines())
+        status_text = "\n".join(lines) + "\n"
+
+        meta: dict[str, Any] = {
+            "session_id": state.auto_session_id,
+            "auto_session_id": state.auto_session_id,
+            "phase": phase_value,
+            "is_terminal": is_terminal,
+            "ralph_job_id": state.ralph_job_id,
+            "ralph_lineage_id": state.ralph_lineage_id,
+            "last_progress_message": state.last_progress_message,
+            "last_progress_at": state.last_progress_at,
+            "intent_guard": intent_guard.to_dict(),
+        }
+        if state.pending_question:
+            meta["pending_question"] = state.pending_question
+        if recent_auto_answers:
+            meta["auto_answer_log"] = recent_auto_answers
+        if state.last_error:
+            meta["blocker"] = state.last_error
+        if is_gap_window:
+            meta["pending"] = "starting ralph"
+        if ralph_block is not None:
+            meta["ralph"] = ralph_block
+
+        return Result.ok(
+            MCPToolResult(
+                content=(MCPContentItem(type=ContentType.TEXT, text=status_text),),
+                is_error=False,
+                meta=meta,
+            )
+        )
+
     async def handle(
         self,
         arguments: dict[str, Any],
@@ -101,9 +290,115 @@ class SessionStatusHandler:
 
         log.info("mcp.tool.session_status", session_id=session_id)
 
+        # Q00/ouroboros#782: ``ouroboros_session_status`` is the unified
+        # surface for both orchestrator sessions (``exec_*`` / arbitrary IDs
+        # tracked by ``SessionRepository``) and ``ooo auto`` sessions
+        # (``auto_<hex>`` tracked by ``AutoStore``). The auto branch returns a
+        # superset shape with a ``ralph`` sub-block when a ralph job has been
+        # linked or is being prepared.
+        if isinstance(session_id, str) and session_id.startswith("auto_"):
+            try:
+                return await self._handle_auto_session(session_id)
+            except Exception as e:  # pragma: no cover - defensive
+                log.error("mcp.tool.session_status.auto_error", error=str(e))
+                return Result.err(
+                    MCPToolError(
+                        f"Failed to get auto session status: {e}",
+                        tool_name="ouroboros_session_status",
+                    )
+                )
+
         try:
             # Ensure event store is initialized
             await self._ensure_initialized()
+
+            # QA evaluations share the session ID namespace but have their
+            # own event kind. Read in append order, in one snapshot, and never
+            # silently choose between conflicting owners of the same ID.
+            has_qa = await self._event_store.query_events(
+                aggregate_id=session_id,
+                aggregate_type="session",
+                event_type=QA_EVALUATED,
+                limit=1,
+            )
+            data = await read_qa_evaluation(self._event_store, session_id) if has_qa else None
+            if data is not None:
+                if not isinstance(data, dict):
+                    return Result.err(
+                        MCPToolError(
+                            "QA session record is invalid",
+                            tool_name="ouroboros_session_status",
+                        )
+                    )
+                iteration, score = data.get("iteration"), data.get("score")
+                threshold, passed, verdict = (
+                    data.get("pass_threshold"),
+                    data.get("passed"),
+                    data.get("verdict"),
+                )
+                if (
+                    type(iteration) is not int
+                    or iteration < 1
+                    or isinstance(score, bool)
+                    or not isinstance(score, (int, float))
+                    or not math.isfinite(score)
+                    or not 0 <= score <= 1
+                    or isinstance(threshold, bool)
+                    or not isinstance(threshold, (int, float))
+                    or not math.isfinite(threshold)
+                    or not 0 <= threshold <= 1
+                    or type(passed) is not bool
+                    or passed != (score >= threshold)
+                    or not isinstance(verdict, str)
+                    or verdict not in {"pass", "revise", "fail"}
+                ):
+                    return Result.err(
+                        MCPToolError(
+                            "QA session record is invalid",
+                            tool_name="ouroboros_session_status",
+                        )
+                    )
+                from ouroboros.mcp.tools.qa import FAIL_THRESHOLD
+
+                expected_verdict = (
+                    "pass" if passed else "revise" if score >= FAIL_THRESHOLD else "fail"
+                )
+                if verdict != expected_verdict:
+                    return Result.err(
+                        MCPToolError(
+                            "QA session record is invalid",
+                            tool_name="ouroboros_session_status",
+                        )
+                    )
+                return Result.ok(
+                    MCPToolResult(
+                        content=(
+                            MCPContentItem(
+                                type=ContentType.TEXT,
+                                text=(
+                                    f"Session: {session_id}\n"
+                                    "Type: QA\nStatus: completed\nTerminal: True\n"
+                                    f"Last completed evaluation: {iteration}\n"
+                                    f"Score: {score}\nVerdict: {verdict}\n"
+                                ),
+                            ),
+                        ),
+                        is_error=False,
+                        meta={
+                            "session_id": session_id,
+                            "session_kind": "qa",
+                            "status": "completed",
+                            "is_active": False,
+                            "is_completed": True,
+                            "is_failed": False,
+                            "iteration": iteration,
+                            "score": score,
+                            "verdict": verdict,
+                            "passed": passed,
+                            "pass_threshold": threshold,
+                        },
+                    )
+                )
 
             # Query session state from repository
             result = await self._session_repo.reconstruct_session(session_id)

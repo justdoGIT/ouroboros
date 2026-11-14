@@ -99,48 +99,33 @@ class TestPMInterviewWithDBBrownfield:
     """Test PM interview start_interview using DB default repo as brownfield context."""
 
     @pytest.mark.asyncio
-    async def test_start_with_db_default_repo_includes_brownfield_context(
+    async def test_start_with_db_default_repo_marks_brownfield_without_a_summary(
         self, tmp_path: Path
     ) -> None:
-        """When brownfield_repos from DB are passed, codebase context is explored and included."""
+        """The roster decides brownfield; no summary is embedded in the context.
+
+        The embedded ``Existing Codebase Context`` section is gone with the
+        engine-side scan (RFC Q00/ouroboros#1937). What survives is the fact the
+        registration always carried — this is brownfield, and here are the paths.
+        """
         adapter = _make_adapter()
         engine = _make_engine(adapter, tmp_path)
 
-        codebase_summary = (
-            "### [PRIMARY] /home/user/my-project\n"
-            "Tech: Python\n"
-            "A FastAPI web application with PostgreSQL."
+        result = await engine.start_interview(
+            initial_context="Add user notifications",
+            brownfield_repos=[
+                {"path": "/home/user/my-project", "name": "my-project", "role": "primary"}
+            ],
         )
-
-        with patch("ouroboros.bigbang.pm_interview.CodebaseExplorer") as MockExplorer:
-            mock_explorer = MagicMock()
-            mock_explorer.explore = AsyncMock(return_value=[])
-            MockExplorer.return_value = mock_explorer
-
-            with patch(
-                "ouroboros.bigbang.pm_interview.format_explore_results",
-                return_value=codebase_summary,
-            ):
-                result = await engine.start_interview(
-                    initial_context="Add user notifications",
-                    brownfield_repos=[
-                        {
-                            "path": "/home/user/my-project",
-                            "name": "my-project",
-                            "role": "primary",
-                        }
-                    ],
-                )
 
         assert result.is_ok
         state = result.value
         ctx = state.initial_context
 
-        # Brownfield codebase context should be embedded
-        assert "Existing Codebase Context (BROWNFIELD)" in ctx
-        assert "FastAPI web application" in ctx
-        # User context is also present
+        assert "Existing Codebase Context" not in ctx
         assert "Add user notifications" in ctx
+        assert state.is_brownfield is True
+        assert state.codebase_paths == [{"path": "/home/user/my-project", "role": "primary"}]
 
     @pytest.mark.asyncio
     async def test_start_without_brownfield_repos_is_greenfield(self, tmp_path: Path) -> None:
@@ -173,35 +158,67 @@ class TestPMInterviewWithDBBrownfield:
         assert "Existing Codebase Context" not in ctx
 
     @pytest.mark.asyncio
-    async def test_opening_and_start_with_db_brownfield_repos(self, tmp_path: Path) -> None:
-        """ask_opening_and_start forwards brownfield_repos and explores them."""
+    async def test_start_redirects_repos_to_snapshot_worktrees(self, tmp_path: Path) -> None:
+        """Snapshot redirection survives the engine no longer reading code.
+
+        The engine still decides *where* the repositories are read from — the
+        snapshot machinery is engine-side, and the roster handed to the lanes is
+        built from these records — so a stale local checkout still cannot reach
+        the PRD. What changed is only who does the reading.
+        """
         adapter = _make_adapter()
         engine = _make_engine(adapter, tmp_path)
 
-        with patch.object(
-            engine, "explore_codebases", new_callable=AsyncMock, return_value=""
-        ) as mock_explore:
+        def _fake_refresh(repos: list[dict[str, str]]) -> list[dict[str, str]]:
+            return [{**r, "path": f"/snap{r['path']}", "source_path": r["path"]} for r in repos]
+
+        with patch(
+            "ouroboros.bigbang.pm_interview.refresh_pm_snapshot_worktrees",
+            side_effect=_fake_refresh,
+        ) as mock_refresh:
+            result = await engine.ask_opening_and_start(
+                user_response="Enhance existing project",
+                brownfield_repos=[{"path": "/home/user/project", "name": "project"}],
+            )
+
+        assert result.is_ok
+        mock_refresh.assert_called_once()
+        selected = engine._selected_brownfield_repos
+        assert selected[0]["path"] == "/snap/home/user/project"
+        assert selected[0]["source_path"] == "/home/user/project"
+        # State persists the durable checkout, not the snapshot.
+        assert result.value.codebase_paths == [{"path": "/home/user/project", "role": "primary"}]
+
+    @pytest.mark.asyncio
+    async def test_opening_and_start_with_db_brownfield_repos(self, tmp_path: Path) -> None:
+        """ask_opening_and_start forwards brownfield_repos without reading them."""
+        adapter = _make_adapter()
+        engine = _make_engine(adapter, tmp_path)
+
+        with patch("ouroboros.bigbang.explore.CodebaseExplorer") as MockExplorer:
             result = await engine.ask_opening_and_start(
                 user_response="Enhance existing project",
                 brownfield_repos=[
-                    {
-                        "path": "/home/user/project",
-                        "name": "project",
-                        "desc": "Main backend",
-                    }
+                    {"path": "/home/user/project", "name": "project", "desc": "Main backend"}
                 ],
             )
 
-            assert result.is_ok
-            mock_explore.assert_called_once()
+        assert result.is_ok
+        MockExplorer.assert_not_called()
+        assert result.value.is_brownfield is True
 
 
-class TestExploreCodebasesWithDBRepos:
-    """Test explore_codebases using DB-loaded brownfield repos."""
+class TestEngineDoesNotExploreDBRepos:
+    """The engine reads no repository, whatever the roster says.
+
+    RFC Q00/ouroboros#1937 moved repository reading to the advisory lanes in the
+    host session. ``explore_codebases`` survives as a no-op for out-of-engine
+    callers, and the empty string it returns is now the correct answer rather
+    than a failure signal.
+    """
 
     @pytest.mark.asyncio
-    async def test_explore_uses_db_repos_when_none_passed(self, tmp_path: Path) -> None:
-        """When repos=None, explore_codebases loads from DB via load_brownfield_repos."""
+    async def test_explore_is_a_no_op_and_reads_nothing(self, tmp_path: Path) -> None:
         adapter = _make_adapter()
         engine = _make_engine(adapter, tmp_path)
 
@@ -211,55 +228,22 @@ class TestExploreCodebasesWithDBRepos:
         ]
 
         with patch.object(PMInterviewEngine, "load_brownfield_repos", return_value=db_repos):
-            with patch("ouroboros.bigbang.pm_interview.CodebaseExplorer") as MockExplorer:
-                mock_explorer = MagicMock()
-                mock_explorer.explore = AsyncMock(return_value=[])
-                MockExplorer.return_value = mock_explorer
+            with patch("ouroboros.bigbang.explore.CodebaseExplorer") as MockExplorer:
+                assert await engine.explore_codebases() == ""
+                assert await engine.explore_codebases(db_repos) == ""
 
-                await engine.explore_codebases()  # No repos arg
-
-                # Should have called explore with paths from DB repos
-                mock_explorer.explore.assert_called_once()
-                call_args = mock_explorer.explore.call_args[0][0]
-                assert len(call_args) == 2
-                assert call_args[0]["path"] == "/home/user/repo-a"
-                assert call_args[1]["path"] == "/home/user/repo-b"
+        MockExplorer.assert_not_called()
+        assert engine.codebase_context == ""
+        assert engine.classifier.codebase_context == ""
 
     @pytest.mark.asyncio
     async def test_explore_returns_empty_when_db_has_no_repos(self, tmp_path: Path) -> None:
-        """When DB has no repos, explore_codebases returns empty string."""
         adapter = _make_adapter()
         engine = _make_engine(adapter, tmp_path)
 
         with patch.object(PMInterviewEngine, "load_brownfield_repos", return_value=[]):
-            result = await engine.explore_codebases()  # No repos arg
-
-            assert result == ""
+            assert await engine.explore_codebases() == ""
             assert engine._explored is True
-
-    @pytest.mark.asyncio
-    async def test_explore_caches_after_first_call(self, tmp_path: Path) -> None:
-        """explore_codebases only scans once — second call returns cached result."""
-        adapter = _make_adapter()
-        engine = _make_engine(adapter, tmp_path)
-
-        with patch("ouroboros.bigbang.pm_interview.CodebaseExplorer") as MockExplorer:
-            mock_explorer = MagicMock()
-            mock_explorer.explore = AsyncMock(return_value=[])
-            MockExplorer.return_value = mock_explorer
-
-            with patch(
-                "ouroboros.bigbang.pm_interview.format_explore_results",
-                return_value="Cached context",
-            ):
-                repos = [{"path": "/code/proj", "name": "proj"}]
-                result1 = await engine.explore_codebases(repos)
-                result2 = await engine.explore_codebases(repos)
-
-                assert result1 == "Cached context"
-                assert result2 == "Cached context"
-                # Only explored once
-                assert mock_explorer.explore.call_count == 1
 
 
 class TestPMSeedIncludesDBBrownfieldRepos:
@@ -315,40 +299,74 @@ class TestPMSeedIncludesDBBrownfieldRepos:
         assert seed.brownfield_repos[0]["path"] == "/home/user/existing-app"
         assert seed.brownfield_repos[0]["name"] == "existing-app"
 
+    @pytest.mark.asyncio
+    async def test_pm_seed_records_source_path_over_snapshot_path(self, tmp_path: Path) -> None:
+        """Seed must persist the durable source checkout, not the snapshot worktree."""
+        adapter = _make_adapter()
+        engine = _make_engine(adapter, tmp_path)
+
+        extraction_response = """{
+            "product_name": "TaskFlow",
+            "goal": "Manage tasks efficiently",
+            "user_stories": [{"persona": "User", "action": "create tasks", "benefit": "stay organized"}],
+            "constraints": [],
+            "success_criteria": ["tasks can be created"],
+            "deferred_items": [],
+            "decide_later_items": [],
+            "assumptions": []
+        }"""
+        adapter.complete = AsyncMock(return_value=Result.ok(_mock_completion(extraction_response)))
+
+        from ouroboros.bigbang.interview import InterviewRound, InterviewState
+
+        state = InterviewState(
+            interview_id="test-seed-snapshot",
+            initial_context="Build on top of existing-app",
+            status=InterviewStatus.COMPLETED,
+            rounds=[
+                InterviewRound(
+                    round_number=1,
+                    question="What problem does this solve?",
+                    user_response="We need better task management",
+                ),
+            ],
+        )
+
+        engine._selected_brownfield_repos = [
+            {
+                "path": "/home/user/.ouroboros/pm-snapshots/existing-app-abc12345",
+                "source_path": "/home/user/existing-app",
+                "name": "existing-app",
+            },
+        ]
+        result = await engine.generate_pm_seed(state)
+
+        assert result.is_ok
+        seed = result.value
+        assert len(seed.brownfield_repos) == 1
+        assert seed.brownfield_repos[0]["path"] == "/home/user/existing-app"
+        assert "source_path" not in seed.brownfield_repos[0]
+
 
 class TestBrownfieldContextInInterviewFlow:
     """Test the full interview flow with DB-backed brownfield context."""
 
     @pytest.mark.asyncio
-    async def test_brownfield_context_shared_with_classifier(self, tmp_path: Path) -> None:
-        """Exploring DB brownfield repos shares context with the question classifier."""
+    async def test_the_classifier_is_never_primed_with_a_repo_summary(self, tmp_path: Path) -> None:
+        """The truncated whole-repo blob is gone.
+
+        The ``code_context`` lane answers the same need per question, with
+        evidence the PM can see rather than a summary only the classifier read.
+        """
         adapter = _make_adapter()
         engine = _make_engine(adapter, tmp_path)
 
-        codebase_summary = "Python FastAPI project with user auth"
+        await engine.explore_codebases(
+            [{"path": "/home/user/my-app", "name": "my-app", "desc": "Web app"}]
+        )
 
-        with patch("ouroboros.bigbang.pm_interview.CodebaseExplorer") as MockExplorer:
-            mock_explorer = MagicMock()
-            mock_explorer.explore = AsyncMock(return_value=[])
-            MockExplorer.return_value = mock_explorer
-
-            with patch(
-                "ouroboros.bigbang.pm_interview.format_explore_results",
-                return_value=codebase_summary,
-            ):
-                await engine.explore_codebases(
-                    [
-                        {
-                            "path": "/home/user/my-app",
-                            "name": "my-app",
-                            "desc": "Web app",
-                        }
-                    ]
-                )
-
-        # Both engine and classifier should have the context
-        assert engine.codebase_context == codebase_summary
-        assert engine.classifier.codebase_context == codebase_summary
+        assert engine.codebase_context == ""
+        assert engine.classifier.codebase_context == ""
 
     @pytest.mark.asyncio
     async def test_brownfield_context_included_in_extraction_prompt(self, tmp_path: Path) -> None:

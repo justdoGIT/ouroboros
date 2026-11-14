@@ -141,19 +141,70 @@ class AnalysisStrategy:
         }
 
 
+class ArtifactStrategy:
+    """Strategy for document, presentation, and other file-artifact tasks."""
+
+    def get_tools(self) -> list[str]:
+        return ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+
+    def get_system_prompt_fragment(self) -> str:
+        return (
+            "You are an artifact execution agent. Work directly on the requested "
+            "document, presentation, spreadsheet, markdown, or other file artifacts. "
+            "Treat the Seed acceptance criteria and declared verify_command entries "
+            "as the execution contract. Preserve the existing artifact structure "
+            "unless the Seed explicitly asks for a rewrite. Do not substitute code "
+            "unit-test evidence for artifact verification; use file inspection, "
+            "render/build commands, and the Seed's artifact-shaped checks."
+        )
+
+    def get_task_prompt_suffix(self) -> str:
+        return (
+            "Please update the requested artifacts against each criterion. "
+            "Run the declared artifact verification commands when present, "
+            "record any rebuild/render outcome explicitly, and report which "
+            "artifact paths changed or remain unverified."
+        )
+
+    def get_activity_map(self) -> dict[str, ActivityType]:
+        return {
+            "Read": ActivityType.EXPLORING,
+            "Glob": ActivityType.EXPLORING,
+            "Grep": ActivityType.EXPLORING,
+            "Edit": ActivityType.BUILDING,
+            "Write": ActivityType.BUILDING,
+            "Bash": ActivityType.TESTING,
+        }
+
+
 # Strategy registry
 _STRATEGY_REGISTRY: dict[str, ExecutionStrategy] = {
+    "artifact": ArtifactStrategy(),
     "code": CodeStrategy(),
+    "document": ArtifactStrategy(),
+    "documentation": ArtifactStrategy(),
+    "presentation": ArtifactStrategy(),
     "research": ResearchStrategy(),
     "analysis": AnalysisStrategy(),
 }
+
+
+def _canonicalize_task_type(task_type: str) -> str:
+    """Canonicalize a task type identifier: strip surrounding whitespace, then lower-case.
+
+    This is the single authoritative normalization used at registration, lookup,
+    and validation boundaries so that ``register_strategy("  Foo  ", s)`` and
+    ``get_strategy("foo")`` always agree.
+    """
+    return task_type.strip().lower()
 
 
 def get_strategy(task_type: str = "code") -> ExecutionStrategy:
     """Get execution strategy for a task type.
 
     Args:
-        task_type: Type of task ("code", "research", "analysis").
+        task_type: Type of task ("code", "research", "analysis",
+            "artifact", "document", "documentation", or "presentation").
 
     Returns:
         ExecutionStrategy instance.
@@ -161,7 +212,7 @@ def get_strategy(task_type: str = "code") -> ExecutionStrategy:
     Raises:
         ValueError: If task_type is not recognized.
     """
-    strategy = _STRATEGY_REGISTRY.get(task_type.lower())
+    strategy = _STRATEGY_REGISTRY.get(_canonicalize_task_type(task_type))
     if strategy is None:
         valid = ", ".join(sorted(_STRATEGY_REGISTRY.keys()))
         msg = f"Unknown task_type: {task_type!r}. Valid types: {valid}"
@@ -176,14 +227,26 @@ def register_strategy(task_type: str, strategy: ExecutionStrategy) -> None:
         task_type: Type identifier for the strategy.
         strategy: ExecutionStrategy instance.
     """
-    _STRATEGY_REGISTRY[task_type.lower()] = strategy
+    _STRATEGY_REGISTRY[_canonicalize_task_type(task_type)] = strategy
+
+
+def is_registered_task_type(task_type: str) -> bool:
+    """Return whether *task_type* is known to the strategy registry.
+
+    This is the shared validation contract used by :class:`~ouroboros.core.seed.Seed`
+    to accept both built-in and dynamically registered custom strategy identifiers.
+    """
+    return _canonicalize_task_type(task_type) in _STRATEGY_REGISTRY
 
 
 __all__ = [
     "AnalysisStrategy",
+    "ArtifactStrategy",
     "CodeStrategy",
     "ExecutionStrategy",
     "ResearchStrategy",
+    "_canonicalize_task_type",
     "get_strategy",
+    "is_registered_task_type",
     "register_strategy",
 ]

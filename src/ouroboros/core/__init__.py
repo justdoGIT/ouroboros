@@ -16,8 +16,60 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "EventPayload": ("ouroboros.core.types", "EventPayload"),
     "CostUnits": ("ouroboros.core.types", "CostUnits"),
     "DriftScore": ("ouroboros.core.types", "DriftScore"),
-    # Control-plane directive vocabulary
+    # Control-plane directive vocabulary and contract
+    "ControlContract": ("ouroboros.core.control_contract", "ControlContract"),
     "Directive": ("ouroboros.core.directive", "Directive"),
+    # Active Conductor decision and successor contracts
+    "ConductorActorMode": ("ouroboros.core.conductor", "ConductorActorMode"),
+    "ConductorDecisionPhase": (
+        "ouroboros.core.conductor",
+        "ConductorDecisionPhase",
+    ),
+    "ConductorDirective": ("ouroboros.core.conductor", "ConductorDirective"),
+    "ConductorEffect": ("ouroboros.core.conductor", "ConductorEffect"),
+    "EngineOwnershipState": (
+        "ouroboros.core.conductor",
+        "EngineOwnershipState",
+    ),
+    # Execution preferences
+    "EfficiencyMode": ("ouroboros.core.execution_preferences", "EfficiencyMode"),
+    "FrugalityAssurance": (
+        "ouroboros.core.execution_preferences",
+        "FrugalityAssurance",
+    ),
+    "ResolvedExecutionPreferences": (
+        "ouroboros.core.execution_preferences",
+        "ResolvedExecutionPreferences",
+    ),
+    "resolve_execution_preferences": (
+        "ouroboros.core.execution_preferences",
+        "resolve_execution_preferences",
+    ),
+    # Ouroboros Synapse
+    "SessionSignal": ("ouroboros.core.session_signal", "SessionSignal"),
+    "SessionSignalCapabilities": (
+        "ouroboros.core.session_signal",
+        "SessionSignalCapabilities",
+    ),
+    "SessionSignalCapabilityError": (
+        "ouroboros.core.session_signal",
+        "SessionSignalCapabilityError",
+    ),
+    "SessionSignalContractEffect": (
+        "ouroboros.core.session_signal",
+        "SessionSignalContractEffect",
+    ),
+    "SessionSignalMode": ("ouroboros.core.session_signal", "SessionSignalMode"),
+    "SessionSignalSource": ("ouroboros.core.session_signal", "SessionSignalSource"),
+    "SessionSignalState": ("ouroboros.core.session_signal", "SessionSignalState"),
+    "resolve_session_signal_mode": (
+        "ouroboros.core.session_signal",
+        "resolve_session_signal_mode",
+    ),
+    "derive_session_signal_id": (
+        "ouroboros.core.session_signal",
+        "derive_session_signal_id",
+    ),
     # Errors
     "OuroborosError": ("ouroboros.core.errors", "OuroborosError"),
     "ProviderError": ("ouroboros.core.errors", "ProviderError"),
@@ -27,13 +79,43 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     # Seed
     "Seed": ("ouroboros.core.seed", "Seed"),
     "SeedMetadata": ("ouroboros.core.seed", "SeedMetadata"),
+    "InvestmentSpec": ("ouroboros.core.seed", "InvestmentSpec"),
     "OntologySchema": ("ouroboros.core.seed", "OntologySchema"),
     "OntologyField": ("ouroboros.core.seed", "OntologyField"),
     "EvaluationPrinciple": ("ouroboros.core.seed", "EvaluationPrinciple"),
     "ExitCondition": ("ouroboros.core.seed", "ExitCondition"),
+    "derive_semantic_ac_key": ("ouroboros.core.seed", "derive_semantic_ac_key"),
     "OntologyConcept": ("ouroboros.core.seed_contract", "OntologyConcept"),
     "OntologyLens": ("ouroboros.core.seed_contract", "OntologyLens"),
     "SeedContract": ("ouroboros.core.seed_contract", "SeedContract"),
+    # Pre-Seed requirement candidate projection
+    "CandidateContentSource": (
+        "ouroboros.core.requirement_candidate",
+        "CandidateContentSource",
+    ),
+    "CandidateResolution": ("ouroboros.core.requirement_candidate", "CandidateResolution"),
+    "ConfirmationAuthority": (
+        "ouroboros.core.requirement_candidate",
+        "ConfirmationAuthority",
+    ),
+    "RequirementCandidate": (
+        "ouroboros.core.requirement_candidate",
+        "RequirementCandidate",
+    ),
+    "RequirementDistillation": (
+        "ouroboros.core.requirement_candidate",
+        "RequirementDistillation",
+    ),
+    "RequirementEvidence": (
+        "ouroboros.core.requirement_candidate",
+        "RequirementEvidence",
+    ),
+    "RequirementEvidenceKind": (
+        "ouroboros.core.requirement_candidate",
+        "RequirementEvidenceKind",
+    ),
+    "RequirementSection": ("ouroboros.core.requirement_candidate", "RequirementSection"),
+    "evaluate_promotion": ("ouroboros.core.requirement_candidate", "evaluate_promotion"),
     # Context management
     "WorkflowContext": ("ouroboros.core.context", "WorkflowContext"),
     "ContextMetrics": ("ouroboros.core.context", "ContextMetrics"),

@@ -6,6 +6,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from ouroboros.harness.deliver_gate import (
+    RUNTIME_FAILURE_BOOLEAN_FIELDS,
+    RUNTIME_SUCCESS_BOOLEAN_FIELDS,
+    RUNTIME_TOOL_EXIT_STATUS_FIELDS,
+)
 from ouroboros.mcp.types import MCPToolResult
 from ouroboros.orchestrator.adapter import (
     AgentMessage,
@@ -44,6 +49,23 @@ _RUNTIME_FAILED_EVENT_TYPES = frozenset(
         "task.failed",
         "turn.failed",
     }
+)
+
+# Closed command-verdict vocabulary shared with the journal verifier.  These
+# are metadata only: filesystem authority still comes exclusively from the
+# LeafDispatcher's held dirfd lease.
+_RUNTIME_STATUS_VERDICT_FIELDS = (
+    "subtype",
+    "status",
+    "runtime_status",
+    "runtime_signal",
+    "runtime_event_type",
+)
+_RUNTIME_VERDICT_FIELDS = (
+    *RUNTIME_SUCCESS_BOOLEAN_FIELDS,
+    *RUNTIME_FAILURE_BOOLEAN_FIELDS,
+    *RUNTIME_TOOL_EXIT_STATUS_FIELDS,
+    *_RUNTIME_STATUS_VERDICT_FIELDS,
 )
 
 
@@ -163,6 +185,8 @@ def _normalized_message_type_from_signal(
 ) -> str:
     """Derive normalized message type from pre-computed runtime signal."""
     subtype = message.data.get("subtype")
+    if subtype == "tool_progress":
+        return "system"
     if subtype == "tool_result":
         return "tool_result"
     if runtime_signal is not None and runtime_status in {"completed", "failed"}:
@@ -172,6 +196,27 @@ def _normalized_message_type_from_signal(
     if message.is_final:
         return "result"
     return message.type
+
+
+def should_emit_runtime_progress(
+    message: AgentMessage,
+    messages_processed: int,
+    *,
+    projected: ProjectedRuntimeMessage | None = None,
+    interval: int = 10,
+) -> bool:
+    """Never sample away text deltas; retain the existing lifecycle/tool policy."""
+    projected = projected or project_runtime_message(message)
+    return (
+        message.is_final
+        or messages_processed % interval == 0
+        or projected.is_tool_call
+        or projected.thinking is not None
+        or message.type == "system"
+        or (message.resume_handle is not None and message.resume_handle.backend == "opencode")
+        or projected.is_tool_result
+        or isinstance(message.data.get("content_delta"), str)
+    )
 
 
 def message_tool_name(message: AgentMessage) -> str | None:
@@ -209,7 +254,43 @@ def serialize_runtime_message_metadata(
     """Serialize shared runtime metadata for persisted progress/audit events."""
     from ouroboros.orchestrator.workflow_state import resolve_ac_marker_update
 
-    metadata: dict[str, Any] = {}
+    metadata = _project_runtime_verdict_fields(message.data, exclude={"is_error"})
+    for key in (
+        "content_delta",
+        "tool_output",
+        "agent_id",
+        "parent_tool_call_id",
+        "parent_event_id",
+        "source_event_id",
+        "source_timestamp",
+        "mcp_server_name",
+        "mcp_tool_name",
+        "tool_kind",
+        "runtime_transport",
+        "acp_session_id",
+        "acp_update_type",
+        "stop_reason",
+        "fallback_from",
+        "fallback_reason",
+    ):
+        value = message.data.get(key)
+        if isinstance(value, str):
+            # Preserve whitespace in deltas: content_preview is display-only.
+            metadata[key] = value[:65536]
+    if "meta" in message.data:
+        raw_meta = message.data["meta"]
+        if isinstance(raw_meta, Mapping):
+            projected_meta = _project_runtime_verdict_fields(raw_meta)
+            if projected_meta:
+                metadata["meta"] = projected_meta
+        else:
+            # Preserve a JSON-safe poison value.  Dropping a malformed-present
+            # verdict container would let a simultaneous zero exit launder it.
+            metadata["meta"] = True
+
+    message_runtime_event_type = runtime_event_type(message)
+    if message_runtime_event_type is not None and "runtime_event_type" not in metadata:
+        metadata["runtime_event_type"] = message_runtime_event_type
     if runtime_signal is None or runtime_status is None:
         runtime_signal, runtime_status = derive_runtime_signal(
             message_type=normalized_message_type(message),
@@ -224,7 +305,11 @@ def serialize_runtime_message_metadata(
         metadata["runtime"] = runtime_handle.to_session_state_dict()
         metadata["runtime_backend"] = runtime_handle.backend
         handle_runtime_event_type = runtime_handle.metadata.get("runtime_event_type")
-        if isinstance(handle_runtime_event_type, str) and handle_runtime_event_type:
+        if (
+            "runtime_event_type" not in metadata
+            and isinstance(handle_runtime_event_type, str)
+            and handle_runtime_event_type
+        ):
             metadata["runtime_event_type"] = handle_runtime_event_type
         tool_catalog = runtime_handle_tool_catalog(runtime_handle)
         if tool_catalog is not None:
@@ -246,7 +331,7 @@ def serialize_runtime_message_metadata(
             metadata["recovery_discontinuity"] = dict(recovery_discontinuity)
 
     subtype = message_subtype(message)
-    if subtype:
+    if subtype and "subtype" not in metadata:
         metadata["subtype"] = subtype
 
     session_id = message.data.get("session_id")
@@ -270,6 +355,13 @@ def serialize_runtime_message_metadata(
     error_type = message.data.get("error_type")
     if isinstance(error_type, str) and error_type.strip():
         metadata["error_type"] = error_type.strip()
+
+    if "is_error" in message.data:
+        raw_is_error = message.data.get("is_error")
+        if isinstance(raw_is_error, bool):
+            metadata["is_error"] = raw_is_error
+        else:
+            metadata["is_error_invalid"] = True
 
     permission_request_id = message.data.get("permission_request_id")
     if isinstance(permission_request_id, str) and permission_request_id.strip():
@@ -300,10 +392,10 @@ def serialize_runtime_message_metadata(
     if thinking:
         metadata["thinking"] = thinking
 
-    if runtime_signal:
+    if runtime_signal and "runtime_signal" not in metadata:
         metadata["runtime_signal"] = runtime_signal
 
-    if runtime_status:
+    if runtime_status and "runtime_status" not in metadata:
         metadata["runtime_status"] = runtime_status
 
     tool_definition = message.data.get("tool_definition")
@@ -312,6 +404,18 @@ def serialize_runtime_message_metadata(
 
     if tool_result is not None:
         metadata["tool_result"] = tool_result
+    elif "tool_result" in message.data:
+        # A malformed-present result container must remain visible to the
+        # verifier rather than disappearing during normalization.
+        metadata["tool_result"] = True
+
+    # This field is reserved for LeafDispatcher's locally measured dirfd lease
+    # effects.  The dispatcher strips adapter-supplied values before projection;
+    # preserve the measured completion payload so the journal verifier can reuse
+    # that existing authority instead of reconstructing provenance from prose.
+    filesystem_effects = message.data.get("filesystem_effects")
+    if isinstance(filesystem_effects, (list, tuple)):
+        metadata["filesystem_effects"] = _clone_metadata_value(filesystem_effects)
 
     tool_call_id = message.data.get("tool_call_id")
     if isinstance(tool_call_id, str) and tool_call_id.strip():
@@ -362,6 +466,9 @@ def derive_runtime_signal(
 
     if normalized_subtype == "permission_resolved":
         return ("permission_resolved", "running")
+
+    if normalized_subtype == "tool_progress":
+        return ("tool_progress", "running")
 
     if normalized_event_type in _RUNTIME_SESSION_RESUMED_EVENT_TYPES:
         return ("session_resumed", "running")
@@ -444,6 +551,20 @@ def _clone_metadata_value(value: Any) -> Any:
     return value
 
 
+def _project_runtime_verdict_fields(
+    value: Mapping[str, Any],
+    *,
+    exclude: set[str] | None = None,
+) -> dict[str, Any]:
+    """Copy only closed command-verdict fields without normalizing failures away."""
+    excluded = exclude or set()
+    return {
+        key: _clone_metadata_value(value[key])
+        for key in _RUNTIME_VERDICT_FIELDS
+        if key in value and key not in excluded
+    }
+
+
 def _normalize_tool_result_payload(tool_result: object) -> dict[str, Any] | None:
     """Normalize an MCP tool result object or mapping into projection-safe data."""
     if isinstance(tool_result, MCPToolResult):
@@ -455,9 +576,9 @@ def _normalize_tool_result_payload(tool_result: object) -> dict[str, Any] | None
     normalized: dict[str, Any] = {
         "content": [],
         "text_content": "",
-        "is_error": False,
         "meta": {},
     }
+    normalized.update(_project_runtime_verdict_fields(tool_result, exclude={"is_error"}))
 
     raw_content = tool_result.get("content")
     if isinstance(raw_content, list | tuple):
@@ -486,13 +607,22 @@ def _normalize_tool_result_payload(tool_result: object) -> dict[str, Any] | None
     if isinstance(text_content, str) and text_content.strip():
         normalized["text_content"] = text_content.strip()
 
-    is_error = tool_result.get("is_error")
-    if isinstance(is_error, bool):
-        normalized["is_error"] = is_error
+    if "is_error" in tool_result:
+        is_error = tool_result.get("is_error")
+        if isinstance(is_error, bool):
+            normalized["is_error"] = is_error
+        else:
+            # Preserve invalidity explicitly. Dropping a malformed-present
+            # status would let a surrounding ``tool.completed`` lifecycle
+            # signal launder an unknown/failing result into success.
+            normalized["is_error_invalid"] = True
 
-    meta = tool_result.get("meta")
-    if isinstance(meta, Mapping):
-        normalized["meta"] = dict(meta)
+    if "meta" in tool_result:
+        meta = tool_result["meta"]
+        if isinstance(meta, Mapping):
+            normalized["meta"] = _clone_metadata_value(meta)
+        else:
+            normalized["meta"] = True
 
     return normalized
 
@@ -519,4 +649,5 @@ __all__ = [
     "project_runtime_message",
     "runtime_event_type",
     "serialize_runtime_message_metadata",
+    "should_emit_runtime_progress",
 ]

@@ -9,8 +9,10 @@ import json
 import re
 from typing import TYPE_CHECKING, Any
 
-from ouroboros.config import get_dependency_analysis_model
+from ouroboros.config import get_llm_backend_for_role, get_llm_model_for_role
+from ouroboros.core.seed import AcceptanceCriterionInput, ac_text
 from ouroboros.core.types import Result
+from ouroboros.evolution.provider_usage import tracked_complete
 from ouroboros.observability.logging import get_logger
 
 if TYPE_CHECKING:
@@ -229,6 +231,10 @@ class ExecutionPlanningError(Exception):
     """Raised when dependency analysis cannot produce safe execution stages."""
 
 
+class DependencyCycleError(DependencyAnalysisError, ExecutionPlanningError):
+    """A cyclic graph cannot be scheduled or replaced by an independent fallback."""
+
+
 DEPENDENCY_ANALYSIS_PROMPT = """Analyze the following acceptance criteria and determine their dependencies.
 
 Acceptance Criteria:
@@ -273,68 +279,97 @@ class HybridExecutionPlanner:
             msg = "Dependency graph contains duplicate AC node indices"
             raise ExecutionPlanningError(msg)
 
-        execution_levels = dependency_graph.execution_levels
-        if not execution_levels and dependency_graph.nodes:
-            execution_levels = _apply_serial_only_constraints(
+        if dependency_graph.execution_levels:
+            normalized_levels = tuple(
+                tuple(sorted(level)) for level in dependency_graph.execution_levels if level
+            )
+            try:
+                return _create_staged_execution_plan(
+                    nodes=dependency_graph.nodes,
+                    node_map=node_map,
+                    normalized_levels=normalized_levels,
+                )
+            except ExecutionPlanningError as exc:
+                log.warning(
+                    "dependency_analyzer.invalid_execution_levels_recomputed",
+                    error=str(exc),
+                    execution_levels=normalized_levels,
+                )
+
+        recomputed_levels: tuple[tuple[int, ...], ...] = ()
+        if dependency_graph.nodes:
+            recomputed_levels = _apply_serial_only_constraints(
                 _compute_execution_levels(dependency_graph.nodes),
                 dependency_graph.nodes,
             )
+        return _create_staged_execution_plan(
+            nodes=dependency_graph.nodes,
+            node_map=node_map,
+            normalized_levels=recomputed_levels,
+        )
 
-        normalized_levels = tuple(tuple(sorted(level)) for level in execution_levels if level)
-        ac_to_stage: dict[int, int] = {}
-        for stage_index, level in enumerate(normalized_levels):
-            for ac_index in level:
-                if ac_index in ac_to_stage:
-                    msg = f"AC {ac_index} appears in multiple execution stages"
-                    raise ExecutionPlanningError(msg)
-                ac_to_stage[ac_index] = stage_index
 
-        if node_map:
-            expected = set(node_map)
-            planned = set(ac_to_stage)
-            if expected != planned:
-                missing = sorted(expected - planned)
-                extra = sorted(planned - expected)
-                details: list[str] = []
-                if missing:
-                    details.append(f"missing={missing}")
-                if extra:
-                    details.append(f"extra={extra}")
-                msg = "Execution stages do not match dependency graph nodes: " + ", ".join(details)
+def _create_staged_execution_plan(
+    *,
+    nodes: tuple[ACNode, ...],
+    node_map: dict[int, ACNode],
+    normalized_levels: tuple[tuple[int, ...], ...],
+) -> StagedExecutionPlan:
+    """Build a staged plan from pre-normalized levels after validation."""
+    ac_to_stage: dict[int, int] = {}
+    for stage_index, level in enumerate(normalized_levels):
+        for ac_index in level:
+            if ac_index in ac_to_stage:
+                msg = f"AC {ac_index} appears in multiple execution stages"
                 raise ExecutionPlanningError(msg)
+            ac_to_stage[ac_index] = stage_index
 
-        stages: list[ExecutionStage] = []
-        for stage_index, level in enumerate(normalized_levels):
-            depends_on_stages: set[int] = set()
-            for ac_index in level:
-                node = node_map.get(ac_index)
-                if node is None:
-                    continue
-                if node.requires_serial_stage and len(level) > 1:
-                    msg = f"Serialized AC {ac_index} cannot share stage {stage_index + 1}"
+    if node_map:
+        expected = set(node_map)
+        planned = set(ac_to_stage)
+        if expected != planned:
+            missing = sorted(expected - planned)
+            extra = sorted(planned - expected)
+            details: list[str] = []
+            if missing:
+                details.append(f"missing={missing}")
+            if extra:
+                details.append(f"extra={extra}")
+            msg = "Execution stages do not match dependency graph nodes: " + ", ".join(details)
+            raise ExecutionPlanningError(msg)
+
+    stages: list[ExecutionStage] = []
+    for stage_index, level in enumerate(normalized_levels):
+        depends_on_stages: set[int] = set()
+        for ac_index in level:
+            node = node_map.get(ac_index)
+            if node is None:
+                continue
+            if node.requires_serial_stage and len(level) > 1:
+                msg = f"Serialized AC {ac_index} cannot share stage {stage_index + 1}"
+                raise ExecutionPlanningError(msg)
+            for dependency in node.depends_on:
+                dependency_stage = ac_to_stage.get(dependency)
+                if dependency_stage is None:
+                    msg = f"AC {ac_index} depends on missing AC {dependency}"
                     raise ExecutionPlanningError(msg)
-                for dependency in node.depends_on:
-                    dependency_stage = ac_to_stage.get(dependency)
-                    if dependency_stage is None:
-                        msg = f"AC {ac_index} depends on missing AC {dependency}"
-                        raise ExecutionPlanningError(msg)
-                    if dependency_stage >= stage_index:
-                        msg = (
-                            f"AC {ac_index} depends on AC {dependency}, but both are assigned "
-                            f"to stage {stage_index + 1}"
-                        )
-                        raise ExecutionPlanningError(msg)
-                    depends_on_stages.add(dependency_stage)
+                if dependency_stage >= stage_index:
+                    msg = (
+                        f"AC {ac_index} depends on AC {dependency}, but both are assigned "
+                        f"to stage {stage_index + 1}"
+                    )
+                    raise ExecutionPlanningError(msg)
+                depends_on_stages.add(dependency_stage)
 
-            stages.append(
-                ExecutionStage(
-                    index=stage_index,
-                    ac_indices=level,
-                    depends_on_stages=tuple(sorted(depends_on_stages)),
-                )
+        stages.append(
+            ExecutionStage(
+                index=stage_index,
+                ac_indices=level,
+                depends_on_stages=tuple(sorted(depends_on_stages)),
             )
+        )
 
-        return StagedExecutionPlan(nodes=dependency_graph.nodes, stages=tuple(stages))
+    return StagedExecutionPlan(nodes=nodes, stages=tuple(stages))
 
 
 class DependencyAnalyzer:
@@ -346,29 +381,33 @@ class DependencyAnalyzer:
         model: str | None = None,
     ) -> None:
         self._llm = llm_adapter
-        self._model = model or get_dependency_analysis_model()
+        self._model_is_explicit = model is not None
+        backend = get_llm_backend_for_role("dependency_analysis")
+        self._model = get_llm_model_for_role(
+            "dependency_analysis",
+            backend=backend,
+            explicit_model=model,
+        )
 
     async def analyze(
         self,
-        acceptance_criteria: Sequence[str] | Sequence[ACDependencySpec],
+        acceptance_criteria: Sequence[AcceptanceCriterionInput] | Sequence[ACDependencySpec],
     ) -> Result[DependencyGraph, DependencyAnalysisError]:
-        """Analyze AC dependencies and return a graph with execution levels."""
+        """Return execution levels, or a cycle error without discarding dependency edges."""
         specs = self._normalize_specs(acceptance_criteria)
         count = len(specs)
 
         log.info("dependency_analyzer.analysis.started", ac_count=count)
 
-        if count <= 1:
-            nodes = tuple(ACNode(index=spec.index, content=spec.content) for spec in specs)
-            levels = ((specs[0].index,),) if specs else ()
-            return Result.ok(DependencyGraph(nodes=nodes, execution_levels=levels))
+        if count == 0:
+            return Result.ok(DependencyGraph(nodes=(), execution_levels=()))
 
         structured_dependencies, serialization_reasons = self._analyze_structured_dependencies(
             specs
         )
 
         dependencies = {index: set(values) for index, values in structured_dependencies.items()}
-        if self._llm is not None:
+        if self._llm is not None and count > 1:
             try:
                 llm_dependencies = await self._analyze_with_llm(
                     tuple(spec.content for spec in specs)
@@ -387,7 +426,10 @@ class DependencyAnalyzer:
             method = "structured_only"
 
         nodes = self._build_nodes(specs, dependencies, serialization_reasons)
-        levels = _apply_serial_only_constraints(_compute_execution_levels(nodes), nodes)
+        try:
+            levels = _apply_serial_only_constraints(_compute_execution_levels(nodes), nodes)
+        except DependencyCycleError as exc:
+            return Result.err(exc)
         graph = DependencyGraph(nodes=nodes, execution_levels=levels)
 
         log.info(
@@ -402,7 +444,7 @@ class DependencyAnalyzer:
 
     def _normalize_specs(
         self,
-        acceptance_criteria: Sequence[str] | Sequence[ACDependencySpec],
+        acceptance_criteria: Sequence[AcceptanceCriterionInput] | Sequence[ACDependencySpec],
     ) -> tuple[ACDependencySpec, ...]:
         specs: list[ACDependencySpec] = []
         for index, item in enumerate(acceptance_criteria):
@@ -418,7 +460,7 @@ class DependencyAnalyzer:
                     )
                 )
             else:
-                specs.append(ACDependencySpec(index=index, content=str(item)))
+                specs.append(ACDependencySpec(index=index, content=ac_text(item)))
         return tuple(specs)
 
     def _analyze_structured_dependencies(
@@ -432,7 +474,7 @@ class DependencyAnalyzer:
         for spec in specs:
             for raw_reference in spec.prerequisites:
                 resolved = self._resolve_reference(raw_reference, key_to_index, len(specs))
-                if resolved is None or resolved == spec.index:
+                if resolved is None:
                     continue
                 dependencies[spec.index].add(resolved)
                 reasons[spec.index].append(f"prerequisite AC {resolved + 1}")
@@ -441,7 +483,7 @@ class DependencyAnalyzer:
                 raw_value = spec.metadata.get(metadata_key)
                 for raw_reference in _coerce_reference_list(raw_value):
                     resolved = self._resolve_reference(raw_reference, key_to_index, len(specs))
-                    if resolved is None or resolved == spec.index:
+                    if resolved is None:
                         continue
                     dependencies[spec.index].add(resolved)
                     reasons[spec.index].append(f"metadata dependency on AC {resolved + 1}")
@@ -449,14 +491,14 @@ class DependencyAnalyzer:
             for context_name, context in _iter_dependency_contexts(spec):
                 for raw_reference in _collect_context_dependency_references(context):
                     resolved = self._resolve_reference(raw_reference, key_to_index, len(specs))
-                    if resolved is None or resolved == spec.index:
+                    if resolved is None:
                         continue
                     dependencies[spec.index].add(resolved)
                     reasons[spec.index].append(f"{context_name} dependency on AC {resolved + 1}")
 
                 for raw_reference in _collect_context_shared_prerequisites(context):
                     resolved = self._resolve_reference(raw_reference, key_to_index, len(specs))
-                    if resolved is None or resolved == spec.index:
+                    if resolved is None:
                         continue
                     dependencies[spec.index].add(resolved)
                     reasons[spec.index].append(
@@ -511,10 +553,13 @@ class DependencyAnalyzer:
         ac_list = "\n".join(f"AC {index}: {content}" for index, content in enumerate(criteria))
         prompt = DEPENDENCY_ANALYSIS_PROMPT.format(ac_list=ac_list)
 
-        response = await self._llm.complete(
+        response = await tracked_complete(
+            self._llm,
             messages=[Message(role=MessageRole.USER, content=prompt)],
             config=CompletionConfig(
                 model=self._model,
+                role="dependency_analysis",
+                model_is_explicit=self._model_is_explicit,
                 temperature=0.0,
                 max_tokens=1000,
             ),
@@ -544,9 +589,7 @@ class DependencyAnalyzer:
             ac_index = item.get("ac_index", 0)
             raw_dependencies = item.get("depends_on", [])
             valid_dependencies = [
-                dep
-                for dep in raw_dependencies
-                if isinstance(dep, int) and 0 <= dep < len(criteria) and dep != ac_index
+                dep for dep in raw_dependencies if isinstance(dep, int) and 0 <= dep < len(criteria)
             ]
             dependencies[ac_index] = valid_dependencies
 
@@ -635,7 +678,9 @@ def _compute_execution_levels(
                 "dependency_analyzer.circular_dependency_detected",
                 remaining=sorted(remaining),
             )
-            ready = tuple(sorted(remaining))
+            raise DependencyCycleError(
+                f"Circular AC dependencies detected; blocked AC indices: {sorted(remaining)}"
+            )
 
         levels.append(ready)
         for node_index in ready:
@@ -854,6 +899,7 @@ __all__ = [
     "ACSharedRuntimeResource",
     "DependencyAnalysisError",
     "DependencyAnalyzer",
+    "DependencyCycleError",
     "DependencyGraph",
     "ExecutionPlanningError",
     "ExecutionStage",

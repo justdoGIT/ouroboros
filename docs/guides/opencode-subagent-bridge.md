@@ -30,6 +30,14 @@ Tools that dispatch via the plugin when `runtime_backend=opencode` and
 | `ouroboros_start_evolve_step` | `_subagent` | evolution (background job) |
 | `ouroboros_evaluate` | `_subagent` | evaluator |
 
+`ouroboros_evolve_step` and `ouroboros_start_evolve_step` require in-process
+evolution for non-default checkpoint and recovery options: `commit_policy`,
+`auto_session_id`, `execution_id`, `checkpoint_commits`,
+`checkpoint_attempted_ac_ids`, and `recover_expired_claim`. Plugin mode returns
+a tool error naming the unsupported options before accepting work. Leave these
+options unset to delegate an ordinary generation, or use an in-process runtime
+to apply checkpoint metadata and recover an expired claim.
+
 For each payload the bridge **fire-and-forget** dispatches:
 
 1. Parses the envelope in the `tool.execute.after` hook.
@@ -172,7 +180,15 @@ does **not** abort the rest of a fan-out batch.
 | Variable                         | Default   | Purpose |
 |----------------------------------|-----------|---------|
 | `OUROBOROS_CHILD_TIMEOUT_MS`     | 1 200 000 | Per-child overall timeout (ms) |
-| `OUROBOROS_SUB_RETRIES`          | 2         | Extra retries after first child attempt |
+
+`OUROBOROS_CHILD_TIMEOUT_MS` is the only variable the bridge reads
+(`process.env` appears once, at `opencode/plugin/ouroboros-bridge.ts:38`).
+
+Retries are **not** configurable. The bridge holds two compile-time constants
+at `:40-41`: `PATCH_RETRIES = 3`, applied when a PATCH hits a network or server
+blip (`:598`), and `RESOLVE_RETRIES = 5`, applied when resolving the assistant
+message that hosts a `callID` (`:613`, fails closed and returns `null` if no
+exact match is found). Neither responds to an environment variable.
 
 ## Installation
 

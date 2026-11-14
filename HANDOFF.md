@@ -1,111 +1,198 @@
-# Handoff Document
+# Handoff — MCP 활성 사용자 → Ouroboros 제품 사용 전환
 
-> Last Updated: 2026-02-03
-> Session: Ontological Framework Implementation - Phase 6 Complete
+> Last reconciled: 2026-11-04
+> Status: 소스 구현은 [PR #2295](https://github.com/Q00/ouroboros/pull/2295)로 병합됨. 아래 구현 계획과 기준 수치는 2026-08-27 당시의 기록이며 현재 작업 지시가 아니다.
 
----
+## 현재 상태와 남은 확인
+
+[#2296의 병합 후 정리](https://github.com/Q00/ouroboros/issues/2296#issuecomment-5462638004)는 라우팅, 검증 실패 원인 분석, 사용 이벤트의 소스 구현이 병합됐다고 기록한다. 이후 릴리스에 포함됐지만, 이 문서는 대시보드 검증이나 활성화 효과를 증명하지 않는다. 남은 확인은 이슈를 기준으로 한다.
+
+- 대시보드 1985514의 service → product command 및 first product command 인사이트와 명령 집합을 검증한다.
+- `app_version`별 릴리스 전후 각 7일 코호트를 비교한다. 비교 근거 없이 전환율 상승을 주장하지 않는다.
+- `artifacts_missing_found_elsewhere`는 같은 bounded scan에서 중첩 파일과 디렉터리를 모두 진단한다. 무시 대상 디렉터리와 symlink는 건너뛰며, 이 분류는 검증 통과 여부를 바꾸지 않는다.
+
+아래는 원래 계획의 보존 기록이다. 파일 경로와 예시, 테스트 명령, 목표 수치는 당시 기준이며 현재 코드나 검증 완료를 나타내지 않는다.
 
 ## Goal
 
-Ouroboros v0.4.0에 **Ontological Framework** 추가:
-1. **AOP 기반 분석 프레임워크** - 횡단 관심사를 모듈화하여 재사용 가능한 분석 전략 구현
-2. **Deliberative Consensus** - Advocate/Devil/Judge 역할 기반 2라운드 토론 시스템
-3. **Devil's Advocate Strategy** - 온톨로지 질문으로 "근본 해결책인가?" 검증
+MCP가 연결된 사용자에게 `ooo` 문법을 먼저 학습시키는 것이 아니라, 사용자의
+자연어 요청이 요구사항 명확화·명세화·검증 실행에 적합할 때 호스트 모델이
+Ouroboros 진입 툴을 선제적으로 선택하도록 만든다.
 
----
+## Evidence
 
-## Current Progress
+2026-08-27 기준 최근 30일 PostHog 실측:
 
-### ✅ Phase 6: Quality Review - COMPLETE
+- MCP service 사용자: 2,086
+- 이후 `command_run` 도달 사용자: 807
+- service → any command 전환율: 38.7%
+- 첫 명령 상위: interview 303, brownfield 75, setup 64, qa 52,
+  config 50, update 47, auto 43, run 39, pm 38
 
-**Code Review 이슈 수정 완료:**
+운영 명령도 섞여 있으므로 실제 product activation은 38.7%보다 낮다.
+툴 설명만 개선하는 것으로는 부족하다. 툴 설명은 모델이 이미 툴을 발견한 뒤에만
+작동한다. 가장 넓은 공통 개입 지점은 모든 MCP 호스트가 받는 server
+`instructions`다.
 
-| 이슈 | 위치 | 해결 |
-|------|------|------|
-| Exception Handling (ProviderError 중복 래핑) | `consensus.py:731-737` | try/except 제거 - Strategy가 내부에서 에러 처리 |
-| Unused import | `consensus.py:26` | `build_devil_advocate_prompt` 제거 |
-| Import ordering | 3개 파일 | `ruff --fix`로 자동 정렬 |
-| Missing `__all__` | `ontology_aspect.py` | 이미 존재 (line 443-454) |
+## Decision
 
-**테스트 결과:** 73개 테스트 통과 (consensus + ontology 관련)
+세 층을 함께 수정한다.
 
-### ✅ 완료된 구현
+1. **Server instructions**: `render_mcp_server_instructions()` 첫 문단에
+   `WHEN TO USE OUROBOROS` 라우팅 규칙을 추가한다.
+2. **Entry-tool descriptions**: interview, start_auto, start_execute_seed를
+   `Use when / Result / Do not use when` 구조로 고친다.
+3. **Host natural-language routing**: 명시적 `ooo` 문자열 없이도 모호한 요청,
+   다단계 기능, 마이그레이션, 고위험·검증 요청을 적절한 진입 툴에 연결한다.
 
-| 파일 | 설명 | 테스트 |
-|------|------|--------|
-| `src/ouroboros/core/ontology_questions.py` | 온톨로지 질문 정의 | ✅ |
-| `src/ouroboros/core/ontology_aspect.py` | AOP 분석 프레임워크 | ✅ |
-| `src/ouroboros/evaluation/models.py` | VoterRole, FinalVerdict, DeliberationResult | ✅ |
-| `src/ouroboros/evaluation/consensus.py` | DeliberativeConsensus 클래스 | ✅ |
-| `src/ouroboros/strategies/devil_advocate.py` | DevilAdvocateStrategy | ✅ |
-| `tests/unit/evaluation/test_consensus.py` | Deliberative 테스트 | ✅ |
-| `tests/unit/core/test_ontology_aspect.py` | AOP 테스트 | ✅ |
-| `tests/unit/core/test_ontology_questions.py` | 온톨로지 질문 테스트 | ✅ |
+기본 라우팅:
 
----
+```text
+요구사항이 모호하거나 AC가 없음      → ouroboros_interview
+큰 작업을 명확화부터 실행까지 요청    → ouroboros_start_auto
+이미 Seed가 있음                     → ouroboros_start_execute_seed
+```
 
-## Next Steps
+## Historical Implementation Plan (2026-08-27)
 
-### Phase 7: Summary
+### 1. MCP 공통 instructions를 outcome-first로 재배치
 
-1. **전체 테스트 실행**
-   ```bash
-   uv run pytest tests/unit/evaluation/ tests/unit/core/ -v
-   ```
+대상: `src/ouroboros/backends/capabilities.py::render_mcp_server_instructions`
 
-2. **변경 사항 커밋** (선택적)
-   ```bash
-   git add -p  # 변경 검토
-   git commit -m "feat(evaluation): add deliberative consensus with AOP-based devil's advocate"
-   ```
+추가할 핵심 의미:
 
-### 대기 중 (낮은 우선순위)
+```text
+WHEN TO USE OUROBOROS
 
-| 파일 | 설명 |
-|------|------|
-| `src/ouroboros/bigbang/ontology.py` | Interview Phase 통합 |
-| `src/ouroboros/bigbang/ambiguity.py` | Ontology Score 가중치 추가 |
+Use proactively before implementation when a request is ambiguous, lacks
+acceptance criteria, spans multiple implementation steps, is a migration, or
+requires high-confidence execution and verification.
 
----
+Default entry points:
+- unclear request → ouroboros_interview
+- substantial end-to-end task → ouroboros_start_auto
+- existing Seed → ouroboros_start_execute_seed
+
+Do not wait for the literal word "ooo" when the natural-language request
+clearly matches these cases.
+```
+
+제약:
+
+- 전체 UTF-8 크기 2,048 bytes 미만 유지
+- `WHEN TO USE`를 tool discovery와 fan-out보다 앞에 둔다.
+- 런타임별 구체 툴명(`ToolSearch`, `Task/Agent`)은 넣지 않는다.
+- 범용 단일 파일 수정·단순 질문에는 Ouroboros를 강제하지 않는다.
+
+### 2. 진입 툴 설명 세 개 개선
+
+대상:
+
+- `src/ouroboros/mcp/tools/authoring_handlers.py`
+  - `ouroboros_interview`
+- `src/ouroboros/mcp/tools/auto_handler.py`
+  - `ouroboros_start_auto`
+- `src/ouroboros/mcp/tools/execution_handlers.py`
+  - `ouroboros_start_execute_seed`
+
+설명 계약:
+
+- interview: 구현 전, 모호함·범위·AC 부족 시 사용. 닫힌 요구사항 상태를 만든다.
+- start_auto: 다단계·마이그레이션·고위험 end-to-end 작업의 기본 진입점.
+  interview → A-grade Seed → execution handoff를 수행한다.
+- start_execute_seed: 기존 Seed가 있을 때만 사용. raw/모호 요청에는 사용하지 않는다.
+
+내부 아키텍처, polling 방법, 장황한 파라미터 설명은 진입 설명에서 제외하고 기존
+파라미터 schema와 응답 계약에 남긴다.
+
+### 3. Host routing 문구 정렬
+
+대상:
+
+- `src/ouroboros/codex/ouroboros.md`
+- 필요 시 런타임별 생성 가이드/패키지 산출물
+
+현재 자연어 매핑은 "clarify requirements", "generate seed", "run seed"처럼
+Ouroboros 용어를 이미 아는 사용자 표현에 치우쳐 있다. 다음 일반 표현을 추가한다.
+
+- "이 기능 만들어줘", "끝까지 검증해서 구현해줘" → start_auto 후보
+- "요구사항이 애매해", "범위부터 잡자" → interview
+- "이 Seed 실행해" → start_execute_seed
+
+호스트는 사용자의 의도와 현재 artifact 유무를 확인해 라우팅하며, 자연어 요청을
+무조건 auto로 보내지 않는다.
+
+### 4. Activation analytics 추가
+
+PostHog 대시보드 `1985514`에 다음 Insight를 추가한다.
+
+- Service → product command conversion
+- First product command distribution
+- Interview → Seed conversion
+- Auto/Run → workflow_outcome conversion
+- app_version별 product activation
+- runtime_backend별 product activation
+
+Product command 집합:
+
+```text
+interview, auto, run, pm, qa, seed, evaluate
+```
+
+`setup`, `config`, `update`, `status`, `brownfield`는 사용량에는 포함할 수 있지만
+product activation 성공으로 계산하지 않는다.
+
+## Acceptance Criteria
+
+1. `render_mcp_server_instructions()` 결과가 2,048 bytes 미만이다.
+2. instructions 첫 섹션이 `WHEN TO USE OUROBOROS`이며 interview/auto/run의
+   구분과 literal `ooo`를 기다리지 말라는 규칙을 포함한다.
+3. instructions는 provider-neutral하며 `ToolSearch`, `Task/Agent`를 포함하지 않는다.
+4. 세 진입 툴 설명이 각각 Use when, Result, Do not use when 의미를 포함한다.
+5. 모호한 자연어 요청은 interview, 큰 end-to-end 요청은 start_auto,
+   Seed 제공 요청은 start_execute_seed로 매핑되는 계약 테스트가 있다.
+6. 단순 질문·작은 명확한 수정은 자동으로 Ouroboros에 라우팅하지 않는다.
+7. PostHog에 service → product command 및 첫 product command Insight가 생성되고
+   쿼리가 정상 실행된다.
+8. 릴리즈 전 7일과 릴리즈 후 7일의 전환율을 app_version 기준으로 비교할 수 있다.
+
+## Verification
+
+```bash
+uv run pytest tests/unit/backends/test_capabilities.py -q
+uv run pytest \
+  tests/unit/mcp/tools/test_interview.py \
+  tests/unit/mcp/tools/test_auto_handler.py \
+  tests/unit/mcp/tools/test_execution_handlers.py -q
+uv run ruff format --check src/ tests/
+uv run ruff check src/ tests/
+```
+
+실제 테스트 경로가 다르면 기존 handler별 테스트 파일을 사용한다. 새 테스트 전용
+파일을 만들기 전에 현재 description/definition 테스트 위치를 먼저 찾는다.
 
 ## Important Files
 
-### 핵심 구현
-```
-src/ouroboros/core/ontology_questions.py    # 온톨로지 질문 정의
-src/ouroboros/core/ontology_aspect.py       # AOP 프레임워크 (BaseAnalyzer, AnalysisResult)
-src/ouroboros/evaluation/consensus.py       # DeliberativeConsensus (lines 500-830)
-src/ouroboros/strategies/devil_advocate.py  # Strategy 패턴 구현
-```
-
-### 테스트
-```
-tests/unit/evaluation/test_consensus.py     # 32개 테스트
-tests/unit/core/test_ontology_aspect.py     # 18개 테스트
-tests/unit/core/test_ontology_questions.py  # 23개 테스트
+```text
+src/ouroboros/backends/capabilities.py
+tests/unit/backends/test_capabilities.py
+src/ouroboros/mcp/tools/authoring_handlers.py
+src/ouroboros/mcp/tools/auto_handler.py
+src/ouroboros/mcp/tools/execution_handlers.py
+src/ouroboros/codex/ouroboros.md
+src/ouroboros/mcp/server/adapter.py
 ```
 
----
+## Risks / Non-goals
 
-## Notes
+- MCP 연결만으로 매 세션 팝업·홍보 문구를 띄우지 않는다.
+- 모든 사용자 요청을 auto로 보내지 않는다.
+- 툴 설명을 길게 만들어 context budget을 소비하지 않는다.
+- activation 개선을 증명하기 전에 전환율 상승을 주장하지 않는다.
+- 텔레메트리 볼륨 계약은 넓히지 않는다: 이벤트를 되살리더라도 사용자/일당
+  1행(daily dedupe)으로 수집한다. `install_started`는 설치 시도별 이벤트로
+  별도 처리한다. 세부 계약은 [TELEMETRY.md](TELEMETRY.md)를 따른다.
 
-### 아키텍처 결정
+## 다음 확인
 
-1. **Devil's Advocate는 Strategy 객체**: LLM 호출 대신 `DevilAdvocateStrategy.analyze()` 사용
-2. **Strategy가 에러 처리**: `analyze()` 메서드가 LLM 에러를 내부에서 처리하여 `AnalysisResult.invalid()` 반환
-3. **AnalysisResult.is_valid**: `True` = 근본 해결책, `False` = 증상 치료
-
-### 검증 명령어
-
-```bash
-# 테스트
-uv run pytest tests/unit/evaluation/test_consensus.py -v
-uv run pytest tests/unit/core/ -v
-
-# 린트
-uv run ruff check src/ouroboros/evaluation/ src/ouroboros/core/ src/ouroboros/strategies/
-```
-
----
-
-*Phase 6 완료. Phase 7 (Summary)로 진행 가능.*
+새 소스 구현을 반복하지 않는다. [#2296](https://github.com/Q00/ouroboros/issues/2296)의 남은 증거와 중첩 디렉터리 판정을 확인하고, 관측 결과가 한정된 결함을 보여줄 때만 후속 수정을 검토한다.

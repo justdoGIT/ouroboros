@@ -331,6 +331,9 @@ class TestCheckShutdownSerialization:
         assert ps["reflect_output"]["refined_goal"] == "g"
         assert ps["execution_output"] == "exec output"
         assert ps["evaluation_summary"]["score"] == 0.6
+        assert ps["wonder_output_complete"] is True
+        assert ps["reflect_output_complete"] is True
+        assert ps["evaluation_summary_complete"] is True
 
 
 # -- Resume restore tests --
@@ -354,13 +357,16 @@ class TestResumeRestore:
         from ouroboros.core.lineage import OntologyLineage
 
         gen = MagicMock()
+        gen.generation_number = 2
         gen.phase = GenerationPhase.INTERRUPTED
+        gen.last_completed_phase = last_completed_phase
         gen.partial_state = partial_state
         gen.evaluation_summary = None
         gen.execution_output = None
         gen.seed_json = None
 
         prev_gen = MagicMock()
+        prev_gen.generation_number = 1
         prev_gen.phase = GenerationPhase.COMPLETED
         prev_gen.evaluation_summary = EvaluationSummary(
             final_approved=False, highest_stage_passed=1, score=0.5
@@ -438,6 +444,7 @@ class TestResumeRestore:
             final_approved=True,
             highest_stage_passed=3,
             score=0.92,
+            goal_alignment=0.92,
         ).model_dump(mode="json")
 
         partial_state = {
@@ -490,6 +497,14 @@ class TestResumeRestore:
         assert gen_result.evaluation_summary is not None
         assert gen_result.evaluation_summary.score == 0.92
         assert gen_result.evaluation_summary.final_approved is True
+        assert gen_result.evaluation_summary.goal_alignment == 0.92
+
+        drift_event = next(
+            call.args[0]
+            for call in loop.event_store.append.call_args_list
+            if call.args[0].type == "observability.drift.measured"
+        )
+        assert drift_event.data["goal_drift"] == pytest.approx(0.08)
 
         # evaluator should NOT have been called
         assert len(evaluator_called) == 0

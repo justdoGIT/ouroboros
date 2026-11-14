@@ -31,9 +31,12 @@ from collections.abc import Mapping
 import contextlib
 from typing import TYPE_CHECKING, Any
 
+from rich.cells import cell_len
+from rich.text import Text
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal
+from textual.containers import Container, Horizontal, VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.reactive import reactive
@@ -41,12 +44,15 @@ from textual.screen import Screen
 from textual.widgets import Footer, Label, Static, Tree
 from textual.widgets.tree import TreeNode
 
+from ouroboros.tui.cell_width import fit_text
 from ouroboros.tui.events import (
     ACUpdated,
     AgentThinkingUpdated,
     CostUpdated,
     DriftUpdated,
     ExecutionUpdated,
+    FrugalityProofEvaluated,
+    FrugalityRetrospectiveReported,
     ParallelBatchCompleted,
     ParallelBatchStarted,
     PauseRequested,
@@ -56,6 +62,8 @@ from ouroboros.tui.events import (
     ToolCallCompleted,
     ToolCallStarted,
     WorkflowProgressUpdated,
+    format_frugality_retrospective_summary,
+    format_frugality_summary,
 )
 
 if TYPE_CHECKING:
@@ -83,6 +91,27 @@ _TOOL_ACTIVITY_FALLBACK_LABELS = {
     "missing": "working",
     "unavailable": "working",
 }
+
+_MODEL_SHORT_PREFIXES = ("claude-", "us.anthropic.", "anthropic.")
+_FALLBACK_TREE_CONTENT_WIDTH = 40
+
+
+def _compact_tokens(value: float) -> str:
+    """Render a token count compactly, e.g. 1200 -> ``1.2k``."""
+    if value >= 1000:
+        return f"{value / 1000:.1f}k"
+    return str(int(value))
+
+
+def _short_model(model: str) -> str:
+    """Compact a model id to its family token, e.g. ``claude-haiku-4-5`` -> ``haiku``."""
+    slug = model.rsplit("/", 1)[-1]
+    for prefix in _MODEL_SHORT_PREFIXES:
+        if slug.startswith(prefix):
+            slug = slug[len(prefix) :]
+            break
+    family = slug.split("-", 1)[0]
+    return family or slug
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -156,7 +185,7 @@ class DoubleDiamondBar(Static):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-class NodeDetailPanel(Static):
+class NodeDetailPanel(VerticalScroll):
     """Panel showing detailed information about the selected AC node."""
 
     DEFAULT_CSS = """
@@ -220,6 +249,7 @@ class NodeDetailPanel(Static):
 
     NodeDetailPanel > .thinking-section {
         width: 100%;
+        height: auto;
         max-height: 6;
         margin-top: 1;
         padding-top: 1;
@@ -238,7 +268,8 @@ class NodeDetailPanel(Static):
 
     NodeDetailPanel > .tool-history-section {
         width: 100%;
-        max-height: 10;
+        height: auto;
+        max-height: 11;
         margin-top: 1;
         padding-top: 1;
         border-top: dashed $primary-darken-2;
@@ -256,7 +287,7 @@ class NodeDetailPanel(Static):
     }
     """
 
-    selected_node: reactive[dict[str, Any] | None] = reactive(None)
+    selected_node: reactive[dict[str, Any] | None] = reactive(None, always_update=True)
     thinking_text: reactive[str] = reactive("")
     tool_history: reactive[list[dict[str, Any]]] = reactive([], always_update=True)
 
@@ -282,9 +313,46 @@ class NodeDetailPanel(Static):
                 yield Label("Status:", classes="label")
                 yield Static(status_display, classes="value")
 
+            runtime = node.get("runtime")
+            if isinstance(runtime, dict):
+                yield Static(
+                    Text(
+                        "\n".join(
+                            f"{key}: {value if value is not None else 'unknown'}"
+                            for key, value in runtime.items()
+                            if key != "generation"
+                        )
+                    ),
+                    classes="content-section",
+                )
+
             with Horizontal(classes="detail-row"):
                 yield Label("Depth:", classes="label")
                 yield Static(str(node.get("depth", 0)), classes="value")
+
+            provider = node.get("provider")
+            if isinstance(provider, str) and provider:
+                with Horizontal(classes="detail-row"):
+                    yield Label("Provider:", classes="label")
+                    yield Static(f"[cyan]{provider}[/]", classes="value")
+
+            model = node.get("model")
+            tier = node.get("model_tier")
+            if (isinstance(model, str) and model) or (isinstance(tier, str) and tier):
+                parts = []
+                if isinstance(model, str) and model:
+                    parts.append(f"[cyan]{_short_model(model)}[/]")
+                if isinstance(tier, str) and tier:
+                    parts.append(f"[dim]{tier}[/]")
+                with Horizontal(classes="detail-row"):
+                    yield Label("Model:", classes="label")
+                    yield Static(" ".join(parts), classes="value")
+
+            tokens = node.get("tokens")
+            if isinstance(tokens, (int, float)) and not isinstance(tokens, bool) and tokens > 0:
+                with Horizontal(classes="detail-row"):
+                    yield Label("Tokens:", classes="label")
+                    yield Static(f"[cyan]{_compact_tokens(float(tokens))}[/]", classes="value")
 
             with Horizontal(classes="detail-row"):
                 yield Label("Atomic:", classes="label")
@@ -409,6 +477,7 @@ class SelectableACTree(Static):
         if tree_data:
             self.tree_data = tree_data
         self._node_map: dict[str, dict[str, Any]] = {}
+        self._tree_node_map: dict[str, TreeNode[dict[str, Any]]] = {}
         self._active_tools: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
@@ -419,6 +488,93 @@ class SelectableACTree(Static):
 
     def on_mount(self) -> None:
         self._rebuild_tree()
+        self.call_after_refresh(self._resync_labels_for_current_width)
+
+    @staticmethod
+    def _display_depth(node: TreeNode[dict[str, Any]]) -> int:
+        """Return a node's rendered depth below the visible Seed root."""
+        depth = 0
+        parent = node.parent
+        while isinstance(parent, TreeNode):
+            depth += 1
+            parent = parent.parent
+        return depth
+
+    @staticmethod
+    def _badge_suffix(node_data: Mapping[str, Any], activity: str = "") -> Text:
+        """Build provider, model, token, and activity suffixes as styled text."""
+        suffix = Text()
+
+        provider = node_data.get("provider")
+        if isinstance(provider, str) and provider:
+            suffix.append(f" [{provider}]", style="dim cyan")
+
+        model = node_data.get("model")
+        tier = node_data.get("model_tier")
+        if isinstance(model, str) and model:
+            suffix.append(f" ⚡{_short_model(model)}", style="dim")
+        elif isinstance(tier, str) and tier:
+            suffix.append(f" ⚡{tier}", style="dim")
+
+        tokens = node_data.get("tokens")
+        if isinstance(tokens, (int, float)) and not isinstance(tokens, bool) and tokens > 0:
+            suffix.append(f" {_compact_tokens(float(tokens))}", style="dim")
+
+        if activity:
+            suffix.append(f" · {activity}", style="dim italic")
+        return suffix
+
+    def _tree_label_width(
+        self,
+        tree: Tree[dict[str, Any]],
+        *,
+        display_depth: int,
+        allow_expand: bool,
+        fixed_label_width: int,
+    ) -> int:
+        """Return label width after guides and the expand/collapse glyph."""
+        tree_width = getattr(tree.scrollable_content_region, "width", 0)
+        if not isinstance(tree_width, int) or tree_width <= 0:
+            tree_width = getattr(tree.size, "width", 0)
+        if isinstance(tree_width, int) and tree_width > 0:
+            guide_levels = display_depth if tree.show_root else max(0, display_depth - 1)
+            guide_width = guide_levels * tree.guide_depth
+            toggle_width = cell_len(tree.ICON_NODE_EXPANDED) if allow_expand else 0
+            return max(0, tree_width - guide_width - toggle_width)
+        return fixed_label_width + _FALLBACK_TREE_CONTENT_WIDTH
+
+    def _format_node_label(
+        self,
+        tree: Tree[dict[str, Any]],
+        node_data: Mapping[str, Any],
+        *,
+        display_depth: int,
+        allow_expand: bool,
+    ) -> Text:
+        """Format one complete tree label within its rendered row budget."""
+        status = str(node_data.get("status", "pending"))
+        prefix = Text.from_markup(STATUS_ICONS.get(status, "○"))
+        prefix.append(" ")
+
+        activity = self._active_tools.get(str(node_data.get("id", "")))
+        if not activity:
+            activity = self._activity_from_node(node_data)
+        if status not in {"executing", "running"}:
+            activity = ""
+
+        suffix = self._badge_suffix(node_data, activity)
+        label_width = self._tree_label_width(
+            tree,
+            display_depth=display_depth,
+            allow_expand=allow_expand,
+            fixed_label_width=prefix.cell_len + suffix.cell_len,
+        )
+        return fit_text(
+            str(node_data.get("content", "")),
+            label_width,
+            prefix=prefix,
+            suffix=suffix,
+        )
 
     def _rebuild_tree(self) -> None:
         try:
@@ -426,13 +582,20 @@ class SelectableACTree(Static):
         except NoMatches:
             return
 
+        # Rows move when branches expand or the tree gains nodes. Preserve the
+        # semantic cursor and the user's branch choices, rather than a row index.
+        cursor_id = next(
+            (key for key, node in self._tree_node_map.items() if node is tree.cursor_node),
+            None,
+        )
+        expanded = {
+            key: node.is_expanded for key, node in self._tree_node_map.items() if node.allow_expand
+        }
         tree.clear()
-        tree.root.label = "[bold]Seed[/]"
+        tree.root.label = Text("Seed", style="bold")
         tree.root.data = {"id": "seed", "content": "Seed", "status": "executing", "depth": 0}
         self._node_map = {"seed": tree.root.data}
-
-        if not self.tree_data:
-            return
+        self._tree_node_map = {"seed": tree.root}
 
         root_id = self.tree_data.get("root_id", "root")
         nodes = self.tree_data.get("nodes", {})
@@ -442,6 +605,18 @@ class SelectableACTree(Static):
             self._add_children(tree.root, root_node, nodes)
 
         tree.root.expand()
+        for node_id, is_expanded in expanded.items():
+            node = self._tree_node_map.get(node_id)
+            if node is not None and node.allow_expand:
+                if is_expanded:
+                    node.expand()
+                else:
+                    node.collapse()
+        # New TreeNodes have no row until layout traverses the rebuilt tree.
+        # Build before moving, otherwise move_cursor sees row -1 and resets.
+        tree._build()
+        cursor_node = self._tree_node_map.get(cursor_id) if cursor_id is not None else None
+        tree.move_cursor(cursor_node or tree.root)
 
     def _add_children(
         self,
@@ -456,26 +631,56 @@ class SelectableACTree(Static):
                 continue
 
             child_data = nodes[child_id]
-            status = child_data.get("status", "pending")
-            content = child_data.get("content", "")[:40]
-            icon = STATUS_ICONS.get(status, "○")
-
-            label = f"{icon} {content}"
-            if len(child_data.get("content", "")) > 40:
-                label += "..."
-
-            # P2: Show inline tool activity for executing nodes
-            activity = self._active_tools.get(child_id) or self._activity_from_node(child_data)
-            if activity and status in ("executing", "running"):
-                label += f"\n     [dim italic]{activity}[/]"
-
-            child_node = parent.add(label, data=child_data)
+            child_ids = child_data.get("children_ids", [])
+            display_depth = self._display_depth(parent) + 1
+            allow_expand = bool(child_ids)
+            label = self._format_node_label(
+                parent.tree,
+                child_data,
+                display_depth=display_depth,
+                allow_expand=allow_expand,
+            )
+            if allow_expand:
+                child_node = parent.add(label, data=child_data)
+            else:
+                child_node = parent.add_leaf(label, data=child_data)
             self._node_map[child_id] = child_data
+            self._tree_node_map[child_id] = child_node
 
             # Recursively add grandchildren
-            if child_data.get("children_ids"):
+            if child_ids:
                 self._add_children(child_node, child_data, nodes)
                 child_node.expand()
+
+    def _resync_labels_for_current_width(self) -> None:
+        """Reformat rendered nodes after layout or terminal width changes."""
+        try:
+            tree = self.query_one("#ac-tree", Tree)
+        except NoMatches:
+            return
+
+        for node_id, tree_node in self._tree_node_map.items():
+            if node_id == "seed":
+                tree_node.set_label(Text("Seed", style="bold"))
+                continue
+            node_data = self._node_map.get(node_id)
+            if node_data is None:
+                continue
+            tree_node.set_label(
+                self._format_node_label(
+                    tree,
+                    node_data,
+                    display_depth=self._display_depth(tree_node),
+                    allow_expand=tree_node.allow_expand,
+                )
+            )
+        # TreeNode.set_label refreshes a row but does not recompute virtual width.
+        tree._invalidate()
+
+    def on_resize(self, event: events.Resize) -> None:
+        """Recalculate labels after Textual measures a new tree width."""
+        del event
+        self.call_after_refresh(self._resync_labels_for_current_width)
 
     def update_tree(self, tree_data: dict[str, Any]) -> None:
         self.tree_data = tree_data
@@ -730,6 +935,11 @@ class DashboardScreenV3(Screen[None]):
         """Handle node selection from tree."""
         if self._detail_panel:
             self._detail_panel.selected_node = message.node_data
+            node_id = message.node_data.get("id")
+            thinking = self._state.thinking.get(node_id, "") if self._state else ""
+            history = self._state.tool_history.get(node_id, []) if self._state else []
+            self._detail_panel.update_thinking(thinking)
+            self._detail_panel.update_tool_history(list(history))
 
     def on_execution_updated(self, message: ExecutionUpdated) -> None:
         pass  # Status display removed
@@ -774,7 +984,55 @@ class DashboardScreenV3(Screen[None]):
                     parts.append(f"[dim]{elapsed}[/]")
                 if cost:
                     parts.append(f"[dim]{cost}[/]")
-                self._phase_bar.progress_text = "  ".join(parts)
+                run_total = self._state.run_total_tokens if self._state else 0.0
+                if run_total > 0:
+                    parts.append(f"[dim]Σ {_compact_tokens(run_total)} tok[/]")
+                # Preserve a run-end frugality verdict already appended to the bar.
+                verdict = self._frugality_verdict_suffix()
+                self._phase_bar.progress_text = "  ".join(parts) + verdict
+
+    def _frugality_verdict_suffix(self) -> str:
+        """Return the run-end proof and retrospective summaries as one suffix."""
+        if self._state is None:
+            return ""
+        summaries = [
+            self._state.frugality_summary,
+            self._state.frugality_retrospective_summary,
+        ]
+        rendered = [summary for summary in summaries if summary]
+        return f"  {'  '.join(rendered)}" if rendered else ""
+
+    @staticmethod
+    def _strip_frugality_suffix(value: str) -> str:
+        markers = [
+            position for marker in ("⚖", "Evidence:") if (position := value.find(marker)) >= 0
+        ]
+        return value[: min(markers)].rstrip() if markers else value.rstrip()
+
+    def on_frugality_proof_evaluated(self, message: FrugalityProofEvaluated) -> None:
+        """Append the one-line run-end frugality verdict to the phase bar."""
+        if self._phase_bar is None:
+            return
+        line = format_frugality_summary(message.status, message.token_reduction_pct)
+        base = self._strip_frugality_suffix(self._phase_bar.progress_text)
+        retrospective = (
+            self._state.frugality_retrospective_summary if self._state is not None else None
+        )
+        suffix = "  ".join(item for item in (line, retrospective) if item)
+        self._phase_bar.progress_text = f"{base}  {suffix}" if base else suffix
+
+    def on_frugality_retrospective_reported(
+        self,
+        message: FrugalityRetrospectiveReported,
+    ) -> None:
+        """Append the neutral execution-finalized evidence line to the phase bar."""
+        if self._phase_bar is None:
+            return
+        line = format_frugality_retrospective_summary(message.summary)
+        base = self._strip_frugality_suffix(self._phase_bar.progress_text)
+        proof = self._state.frugality_summary if self._state is not None else None
+        suffix = "  ".join(item for item in (proof, line) if item)
+        self._phase_bar.progress_text = f"{base}  {suffix}" if base else suffix
 
     def on_subtask_updated(self, message: SubtaskUpdated) -> None:
         """Handle sub-task updates.
@@ -821,6 +1079,15 @@ class DashboardScreenV3(Screen[None]):
         """Handle tool call completed - clear inline activity."""
         if self._tree:
             self._tree.clear_node_activity(message.ac_id)
+        if (
+            self._state is not None
+            and self._detail_panel is not None
+            and self._detail_panel.selected_node is not None
+            and self._detail_panel.selected_node.get("id") == message.ac_id
+        ):
+            self._detail_panel.update_tool_history(
+                list(self._state.tool_history.get(message.ac_id, []))
+            )
         if self._activity_bar:
             tools = dict(self._activity_bar.active_tools)
             tools.pop(message.ac_id, None)
@@ -875,6 +1142,16 @@ class DashboardScreenV3(Screen[None]):
     # ─────────────────────────────────────────────────────────────────────────
     # Actions
     # ─────────────────────────────────────────────────────────────────────────
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Defer `p`/`r` availability to the app that owns the execution.
+
+        Screen bindings shadow app bindings, so the dashboard must apply the
+        same gate; otherwise `ouroboros tui monitor`, which owns no execution,
+        would keep advertising controls it cannot exercise. Delegating keeps one
+        source of truth instead of a second copy of the rule.
+        """
+        return self.app.check_action(action, parameters)
 
     def action_pause(self) -> None:
         if self._state and self._state.execution_id:

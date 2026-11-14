@@ -11,8 +11,14 @@ Tests for:
 
 from __future__ import annotations
 
-import pytest
+from datetime import UTC, datetime
 
+import pytest
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal
+from textual.widgets import Label, Static
+
+from ouroboros.core.acceptance import AcceptanceState
 from ouroboros.core.lineage import (
     EvaluationSummary,
     GenerationPhase,
@@ -22,10 +28,16 @@ from ouroboros.core.lineage import (
     OntologyLineage,
 )
 from ouroboros.core.seed import OntologyField, OntologySchema
+from ouroboros.core.types import Result
 from ouroboros.events.base import BaseEvent
+from ouroboros.evolution.rewind import CommittedRewindResult
 from ouroboros.persistence.event_store import EventStore
 from ouroboros.tui.events import GenerationSelected, LineageSelected
-from ouroboros.tui.screens.lineage_detail import GenerationDetailPanel, LineageDetailScreen
+from ouroboros.tui.screens.lineage_detail import (
+    _ACCEPTANCE_BADGES,
+    GenerationDetailPanel,
+    LineageDetailScreen,
+)
 from ouroboros.tui.screens.lineage_selector import LineageSelectorScreen
 from ouroboros.tui.widgets.lineage_tree import (
     GenerationNodeSelected,
@@ -254,6 +266,71 @@ class TestGenerationDetailPanel:
         assert panel.previous_generation == gen
 
 
+class _DetailPanelApp(App[None]):
+    def compose(self) -> ComposeResult:
+        yield GenerationDetailPanel()
+
+
+async def _evaluation_rows(summary: EvaluationSummary) -> dict[str, str]:
+    """Mount the panel on a generation and return its detail rows as label -> text."""
+    app = _DetailPanelApp()
+    async with app.run_test(size=(120, 60)) as pilot:
+        panel = app.query_one(GenerationDetailPanel)
+        panel.selected_generation = make_generation(1, eval_summary=summary)
+        await pilot.pause()
+        rows: dict[str, str] = {}
+        for row in panel.query(".detail-row").results(Horizontal):
+            label = str(row.query_one(".label", Label).render()).strip()
+            rows[label] = str(row.query_one(".value", Static).render())
+        return rows
+
+
+class TestGenerationDetailAcceptance:
+    """The Result row keeps approved, rejected, and unverified distinct."""
+
+    def test_every_acceptance_state_has_a_distinct_badge(self) -> None:
+        assert set(_ACCEPTANCE_BADGES) == set(AcceptanceState)
+        assert len(set(_ACCEPTANCE_BADGES.values())) == len(AcceptanceState)
+        assert "red" not in _ACCEPTANCE_BADGES[AcceptanceState.UNVERIFIED]
+
+    @pytest.mark.asyncio
+    async def test_approved(self) -> None:
+        rows = await _evaluation_rows(
+            EvaluationSummary(final_approved=True, highest_stage_passed=1, score=0.9)
+        )
+
+        assert rows["Result:"] == "APPROVED"
+        assert "Failure:" not in rows
+
+    @pytest.mark.asyncio
+    async def test_rejected(self) -> None:
+        rows = await _evaluation_rows(
+            EvaluationSummary(
+                final_approved=False,
+                highest_stage_passed=1,
+                failure_reason="Stage 1 failed: test",
+            )
+        )
+
+        assert rows["Result:"] == "REJECTED"
+        assert rows["Failure:"] == "Stage 1 failed: test"
+
+    @pytest.mark.asyncio
+    async def test_unverified_is_not_rejected(self) -> None:
+        rows = await _evaluation_rows(
+            EvaluationSummary(
+                final_approved=False,
+                highest_stage_passed=2,
+                approval_status="not_evaluated",
+                failure_reason="Not approved: unverified.",
+            )
+        )
+
+        assert rows["Result:"] == "NOT APPROVED (unverified)"
+        assert rows["Reason:"] == "Not approved: unverified."
+        assert "Failure:" not in rows
+
+
 # =============================================================================
 # LineageSelectorScreen Tests
 # =============================================================================
@@ -421,3 +498,93 @@ class TestLineageDetailScreenRewind:
         mock_store = object()
         screen = LineageDetailScreen(lineage, event_store=mock_store)
         assert screen._event_store is mock_store
+
+    @pytest.mark.asyncio
+    async def test_perform_rewind_delegates_before_checkout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        lineage = make_lineage()
+        calls: list[tuple[OntologyLineage, int]] = []
+
+        class _Committer:
+            async def rewind_to(self, current: OntologyLineage, target: int):
+                calls.append((current, target))
+                return Result.ok(
+                    CommittedRewindResult(
+                        lineage=current.rewind_to(target),
+                        lineage_id=current.lineage_id,
+                        from_generation=current.current_generation,
+                        to_generation=target,
+                        rewind_event_id="rewind-tui-1",
+                        rewind_occurred_at=datetime(2026, 7, 13, tzinfo=UTC),
+                    )
+                )
+
+        class _Process:
+            returncode = 0
+
+            async def communicate(self):
+                return b"dirty\n", b""
+
+        class _App:
+            def __init__(self) -> None:
+                self.popped = False
+
+            def pop_screen(self) -> None:
+                self.popped = True
+
+        app = _App()
+        notifications: list[str] = []
+
+        async def _create_subprocess(*_args, **_kwargs):
+            return _Process()
+
+        def _get_app(_screen):
+            return app
+
+        def _notify(message, **_kwargs):
+            notifications.append(message)
+
+        monkeypatch.setattr(
+            "ouroboros.tui.screens.lineage_detail.asyncio.create_subprocess_exec",
+            _create_subprocess,
+        )
+        monkeypatch.setattr(LineageDetailScreen, "app", property(_get_app))
+        screen = LineageDetailScreen(lineage, rewind_committer=_Committer())
+        monkeypatch.setattr(screen, "notify", _notify)
+
+        await screen._perform_rewind(1)
+
+        assert calls == [(lineage, 1)]
+        assert screen._lineage.current_generation == 1
+        assert app.popped is True
+        assert any("working tree is dirty" in message for message in notifications)
+
+    @pytest.mark.asyncio
+    async def test_commit_failure_starts_no_checkout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from ouroboros.core.errors import OuroborosError
+
+        lineage = make_lineage()
+
+        class _Committer:
+            async def rewind_to(self, current, target):  # noqa: ARG002
+                return Result.err(OuroborosError("commit failed"))
+
+        async def _unexpected_subprocess(*args, **kwargs):
+            raise AssertionError("checkout must not start when commit fails")
+
+        notifications: list[str] = []
+
+        def _notify(message, **_kwargs):
+            notifications.append(message)
+
+        monkeypatch.setattr(
+            "ouroboros.tui.screens.lineage_detail.asyncio.create_subprocess_exec",
+            _unexpected_subprocess,
+        )
+        screen = LineageDetailScreen(lineage, rewind_committer=_Committer())
+        monkeypatch.setattr(screen, "notify", _notify)
+
+        await screen._perform_rewind(1)
+
+        assert notifications == ["Failed to commit rewind: commit failed"]

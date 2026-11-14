@@ -5,6 +5,31 @@ doc_metadata:
 
 # Running Ouroboros with OpenCode
 
+OpenCode 1.x LLM completions report token usage from native `step_finish`
+events, counting the latest report for each step part once. The native output
+count already uses raw output tokens, so reasoning is not added again; additive
+cache groups and any remaining reported total are preserved as `unallocated_tokens`.
+
+OpenCode 2.x plugin mode is not yet supported. Setup rejects a detected 2.x
+CLI before installing the V1 bridge or writing configuration. Use
+`ouroboros setup --runtime opencode --opencode-mode subprocess` for the existing
+subprocess path. This does not enable in-host child Task dispatch.
+If setup cannot determine the CLI version, it warns that plugin compatibility
+is unverified and continues with the V1 bridge. Confirm the version before use;
+an unrecognized 2.x host cannot load that bridge.
+
+If you manually registered the bridge directory in V2's `plugins` list,
+`ouroboros uninstall` removes the entry for the current OpenCode config
+directory. It leaves entries for other directories alone. If a V2 config
+contains JSONC comments, trailing commas, or duplicate keys, uninstall leaves
+the OpenCode config and bridge directory intact and asks you to remove the
+Ouroboros entries manually, so those settings are not silently discarded.
+
+V2 uses directory plugin entries and a different setup, tool-hook, session
+permission, completion, and interruption API. Renaming the entry or adding a
+`setup` export alone does not establish compatibility; the remaining port is
+tracked in [#2529](https://github.com/Q00/ouroboros/issues/2529).
+
 > For installation and first-run onboarding, see [Getting Started](../getting-started.md).
 
 Ouroboros integrates with **OpenCode** ([opencode.ai](https://opencode.ai)) — an open-source multi-provider AI coding agent — via two complementary paths:
@@ -88,7 +113,7 @@ What each mode installs:
 - Bridge plugin at `<opencode_config_dir>/plugins/ouroboros-bridge/ouroboros-bridge.ts` (atomic write, content-hashed — no-op if unchanged)
 - Plugin entry in `~/.config/opencode/opencode.jsonc` or `opencode.json` (dedupes stale entries)
 - Ouroboros MCP server in the same file
-- Claude Code MCP sidecar entry (if `~/.claude/` exists) — MCP is runtime-independent
+- No Claude SDK MCP sidecar mutation; its MCP 1.x profile remains isolated
 
 **subprocess**
 - `orchestrator.runtime_backend: opencode` in `~/.ouroboros/config.yaml`
@@ -131,7 +156,11 @@ ouroboros_lateral_think persona="all"
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `OUROBOROS_CHILD_TIMEOUT_MS` | `1200000` (20 min) | Per-child wall clock |
-| `OUROBOROS_SUB_RETRIES` | `2` | Retry count on spawn failure |
+
+> `OUROBOROS_CHILD_TIMEOUT_MS` is the only environment knob the bridge reads
+> (`opencode/plugin/ouroboros-bridge.ts:38`). Retry counts are compile-time
+> constants there — `PATCH_RETRIES = 3` and `RESOLVE_RETRIES = 5` (`:40-41`) —
+> and neither is overridable.
 
 See the full plugin guide: **[OpenCode Subagent Bridge](../guides/opencode-subagent-bridge.md)**.
 
@@ -155,7 +184,7 @@ Or per-invocation:
 uv run ouroboros run workflow --runtime opencode ~/.ouroboros/seeds/seed_abcd1234ef56.yaml
 ```
 
-The `OpenCodeRuntime` adapter launches `opencode run --format json` as a subprocess, pipes the prompt via stdin, and parses the structured JSON event stream from stdout. `orchestrator.opencode_permission_mode` defaults to `bypassPermissions` since `opencode run` is non-interactive.
+The `OpenCodeRuntime` adapter launches `opencode run --format json --dangerously-skip-permissions` as a subprocess, pipes the prompt via stdin, and parses the structured JSON event stream from stdout. `orchestrator.opencode_permission_mode` defaults to `bypassPermissions`; seed execution forces that mode for fresh and resumed dispatches.
 
 ### When to use subprocess over plugin
 
@@ -210,16 +239,18 @@ After running `ouroboros setup --runtime opencode`, the Ouroboros MCP server is 
 | `ooo status` | Yes | `ouroboros status execution <execution_id>` |
 | `ooo evaluate` | Yes | *(MCP only)* |
 | `ooo evolve` | Yes | *(MCP only)* |
-| `ooo ralph` | Yes | *(MCP only)* |
+| `ooo ralph` | Yes | MCP-owned `ouroboros_ralph`; subprocess mode returns a job, plugin mode delegates a child Task |
 | `ooo cancel` | Yes | `ouroboros cancel execution <execution_id>` |
 | `ooo unstuck` | Yes | *(MCP only)* |
 | `ooo tutorial` | Yes | *(MCP only)* |
 | `ooo welcome` | Yes | *(MCP only)* |
 | `ooo update` | Yes | `pip install --upgrade ouroboros-ai` |
 | `ooo help` | Yes | `ouroboros --help` |
-| `ooo qa` | Yes | *(MCP only)* |
+| `ooo qa` | Yes | `ouroboros qa` |
 | `ooo setup` | Yes | `ouroboros setup --runtime opencode` |
 | `ooo publish` | Yes | *(no direct `ouroboros publish` subcommand; skill/runtime flow uses `gh` CLI)* |
+
+> **Ralph note (#528):** `ooo ralph` now calls the MCP-owned `ouroboros_ralph` surface instead of reimplementing the multi-generation loop with client-side `evolve_step` polling. In OpenCode subprocess/non-plugin mode it returns a standard background `job_id`, which is monitored with job tools and cancelled with `ouroboros_cancel_job(job_id)`. In OpenCode plugin mode it returns `status=delegated_to_plugin` with `job_id=None`; the bridge dispatches a child Task session instead of creating any local JobManager job, so local Ralph job polling/cancellation tools do not apply to that plugin-delegated run. `ouroboros cancel execution <execution_id>` remains only for execution sessions and does not cancel Ralph job IDs.
 
 > **Note on `ooo seed` vs `ooo interview`:** These are two distinct skills with separate roles. `ooo interview` runs a Socratic Q&A session and returns a `session_id`. `ooo seed` accepts that `session_id` and generates a structured Seed YAML (with ambiguity scoring). From the terminal, both steps are performed in a single `ouroboros init start` invocation.
 
@@ -239,6 +270,22 @@ message assembly, and MCP invocation local. See
 opencode --version
 ouroboros --help
 ```
+
+### First command
+
+Configure the OpenCode integration once before opening the first workflow:
+
+```bash
+ouroboros setup --runtime opencode
+```
+
+Then start a new OpenCode session and run:
+
+```
+ooo interview "Build a task management CLI"
+```
+
+The `ooo` command is available after setup registers the Ouroboros MCP server.
 
 ## OpenCode-Specific Strengths
 
@@ -319,9 +366,11 @@ The bridge manages its own lifecycle: child creation, progress rendering (Task p
 
 The adapter uses `opencode run --format json` (non-interactive). Features that require interactive OpenCode sessions (e.g., manual approval prompts) are not available during Ouroboros execution.
 
-### Permission mode not wired to CLI
+### Permission mode
 
-OpenCode's `opencode run` command does not expose a `--permission-mode` flag. The `opencode_permission_mode` config value is stored for forward compatibility but is not currently passed to the subprocess. OpenCode runs non-interactively by default, so there is no approval dialogue to bypass.
+OpenCode has no multi-value `--permission-mode` option, but current releases expose `--dangerously-skip-permissions`. Ouroboros translates `bypassPermissions` to that native flag on both fresh and `--session` resume commands. Narrower stored modes do not add the full-bypass flag.
+
+In plugin mode, the bridge creates every delegated child session with an explicit OpenCode permission ruleset of `permission="*", pattern="*", action="allow"`. This is the session-API equivalent of the subprocess bypass flag; plugin resume remains unsupported because the host bridge cannot durably reattach an already-dispatched child.
 
 ## Troubleshooting
 
@@ -357,7 +406,7 @@ This is normal when using the orchestrator runtime backends. The warning refers 
 
 ### "EventStore not initialized"
 
-The database will be created automatically at `~/.ouroboros/ouroboros.db`.
+The database will be created automatically at the active path shown by `ouroboros config show`.
 
 ## Cost
 
@@ -368,3 +417,17 @@ Using OpenCode as the runtime backend incurs API charges from your configured pr
 - Number of tool calls and iterations
 
 Refer to your provider's pricing page for current rates.
+
+## Active Conductor and Synapse
+
+OpenCode CLI subprocess sessions are proven Synapse `inform`/`after_turn`
+transports using the same OpenCode session ID. This does not claim live
+checkpoint `redirect` or hard `replace`. OpenCode plugin Task dispatch remains a
+separate host-owned lifecycle and is not reinterpreted as runtime interruption.
+
+For pollable runs, one read-only observer relays current model/harness,
+efficiency assurance, bounded Discover targets, dependency/parallel levels,
+first scheduled ACs, attention, and terminal assurance while the main session
+remains available. The main host selects the affected AC by meaning, never by a
+user-supplied internal ID, and speaks naturally in the user's conversation
+language from canonical English guidance.

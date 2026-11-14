@@ -18,32 +18,46 @@ Key features:
 from __future__ import annotations
 
 import asyncio
-import codecs
 from collections import deque
 from collections.abc import AsyncIterator
 import contextlib
 from dataclasses import replace
 from datetime import UTC, datetime
-import json
+import math
 import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 from typing import Any
 
 from ouroboros.config import get_opencode_cli_path
 from ouroboros.core.errors import ProviderError
+from ouroboros.core.session_signal import SessionSignalCapabilities
 from ouroboros.core.types import Result
 from ouroboros.observability.logging import get_logger
 from ouroboros.orchestrator.adapter import (
+    FULL_CAPABILITIES,
     AgentMessage,
+    ParamSupport,
+    ResolvedWorkerCwd,
+    RuntimeCapabilities,
     RuntimeHandle,
     SkillDispatchHandler,
+    SubagentOrchestration,
     TaskResult,
+    resolve_worker_cwd,
+    worker_cwd_failure_message,
 )
+from ouroboros.orchestrator.interview_session import InterviewSessionTransition
 from ouroboros.orchestrator.opencode_event_normalizer import (
     OpenCodeEventContext,
     OpenCodeEventNormalizer,
+)
+from ouroboros.providers.codex_cli_stream import (
+    iter_runtime_stream_lines,
+    parse_json_event,
+    terminate_runtime_process,
 )
 from ouroboros.router import (
     InvalidInputReason,
@@ -53,13 +67,64 @@ from ouroboros.router import (
     ResolveRequest,
     resolve_skill_dispatch,
 )
+from ouroboros.runtime.child_env import DEFAULT_OUROBOROS_STRIP_KEYS, build_child_env
 
 log = get_logger(__name__)
 
 _SAFE_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 _MAX_LINE_BUFFER_BYTES = 50 * 1024 * 1024  # 50 MB
+# Child-env strip set for OpenCode.  OpenCode does NOT strip CLAUDECODE (unlike
+# codex/copilot/kiro) — preserve that divergence; only the Ouroboros markers
+# are removed.
+_CHILD_ENV_STRIP_KEYS = DEFAULT_OUROBOROS_STRIP_KEYS
 
-_INTERVIEW_SESSION_METADATA_KEY = "ouroboros_interview_session_id"
+_STDOUT_IDLE_TIMEOUT_ENV = "OUROBOROS_OPENCODE_STDOUT_IDLE_TIMEOUT"
+
+
+def _resolve_timeout_override(
+    explicit: float | None,
+    env_name: str,
+    fallback: float | None,
+) -> float | None:
+    """Resolve an OpenCode stream-timeout override.
+
+    Priority: explicit kwarg -> environment variable -> class fallback.
+    Non-positive values disable the stream-loop guard so long silent reasoning
+    can be governed by the orchestrator's higher-level watchdog instead.
+    """
+    if explicit is not None:
+        candidate = explicit
+    else:
+        raw = os.environ.get(env_name)
+        if raw is None or not raw.strip():
+            candidate = fallback
+        else:
+            try:
+                candidate = float(raw)
+            except ValueError:
+                log.warning(
+                    "opencode_runtime.timeout_env_invalid",
+                    env=env_name,
+                    raw=raw,
+                    fallback=fallback,
+                )
+                candidate = fallback
+
+    if candidate is None:
+        return None
+    if not math.isfinite(candidate):
+        log.warning(
+            "opencode_runtime.timeout_non_finite_rejected",
+            env=env_name,
+            value=candidate,
+            fallback=fallback,
+        )
+        candidate = fallback
+    if candidate is None:
+        return None
+    if candidate <= 0:
+        return None
+    return candidate
 
 
 class OpenCodeRuntime:
@@ -132,11 +197,12 @@ class OpenCodeRuntime:
         cli_path: str | Path | None = None,
         permission_mode: str | None = None,
         model: str | None = None,
-        cwd: str | Path | None = None,
+        cwd: str | Path | ResolvedWorkerCwd | None = None,
         skills_dir: str | Path | None = None,
         skill_dispatcher: SkillDispatchHandler | None = None,
         llm_backend: str | None = None,
         opencode_mode: str | None = None,
+        stdout_idle_timeout_seconds: float | None = None,
     ) -> None:
         """Initialise the OpenCode runtime.
 
@@ -146,9 +212,9 @@ class OpenCodeRuntime:
                 :func:`~ouroboros.config.get_opencode_cli_path`,
                 then ``PATH`` if not supplied.
             permission_mode: OpenCode permission mode string.
-                Stored for forward compatibility and surfaced in
-                :attr:`RuntimeHandle.approval_mode`, but currently a
-                **no-op**: ``opencode run`` has no permission flag.
+                ``bypassPermissions`` maps to OpenCode's native
+                ``--dangerously-skip-permissions`` flag and is surfaced in
+                :attr:`RuntimeHandle.approval_mode`.
             model: Optional model override passed to the CLI via
                 ``--model``.
             cwd: Working directory for the subprocess.  Defaults to
@@ -162,13 +228,19 @@ class OpenCodeRuntime:
                 MCP tool handlers.
         """
         self._cli_path = self._resolve_cli_path(cli_path)
+        self._permission_mode_requested = permission_mode is not None
         self._permission_mode = permission_mode or "bypassPermissions"
         self._model = model
-        self._cwd = str(Path(cwd).expanduser()) if cwd is not None else os.getcwd()
+        self._cwd = resolve_worker_cwd(cwd)
         self._skills_dir = self._resolve_skills_dir(skills_dir)
         self._skill_dispatcher = skill_dispatcher
         self._llm_backend = llm_backend or self._default_llm_backend
         self._opencode_mode = opencode_mode
+        self._stdout_idle_timeout_seconds = _resolve_timeout_override(
+            stdout_idle_timeout_seconds,
+            _STDOUT_IDLE_TIMEOUT_ENV,
+            type(self)._stdout_idle_timeout_seconds,
+        )
         self._builtin_mcp_handlers: dict[str, Any] | None = None
 
         log.info(
@@ -177,6 +249,7 @@ class OpenCodeRuntime:
             permission_mode=permission_mode,
             model=model,
             cwd=self._cwd,
+            stdout_idle_timeout_seconds=self._stdout_idle_timeout_seconds,
         )
 
     # -- AgentRuntime protocol properties ----------------------------------
@@ -189,6 +262,30 @@ class OpenCodeRuntime:
             The ``_runtime_handle_backend`` class attribute.
         """
         return self._runtime_handle_backend
+
+    @property
+    def capabilities(self) -> RuntimeCapabilities:
+        # OpenCode composes the system prompt and tool guidance into the user
+        # message rather than passing native runtime parameters; surface those
+        # as TRANSLATED while preserving the default feature flags.
+        return replace(
+            FULL_CAPABILITIES,
+            system_prompt_support=ParamSupport.TRANSLATED,
+            tool_restriction_support=ParamSupport.TRANSLATED,
+            empty_tool_restriction_support=ParamSupport.IGNORED,
+            permission_mode_support=ParamSupport.TRANSLATED,
+            session_signals=SessionSignalCapabilities(
+                inform_delivery=True,
+                background_reply=True,
+                after_turn_delivery=True,
+            ),
+            # OpenCode's host bridge spawns a native sub-agent out-of-band via the
+            # ``_subagent`` envelope (ouroboros does NOT drive the child directly) —
+            # the HOST_BRIDGE mode, eligible for plugin dispatch when the bridge is
+            # enabled (opencode_mode=plugin). Contrast EXTERNAL_LEADER_DRIVEN, where
+            # ouroboros itself drives the worker. See SubagentOrchestration.
+            subagent_orchestration=SubagentOrchestration.EXTERNAL_HOST_BRIDGE,
+        )
 
     @property
     def llm_backend(self) -> str | None:
@@ -211,6 +308,11 @@ class OpenCodeRuntime:
             Permission mode string (e.g. ``"bypassPermissions"``).
         """
         return self._permission_mode
+
+    @property
+    def permission_mode_requested(self) -> bool:
+        """Return whether permission mode was supplied by the caller."""
+        return self._permission_mode_requested
 
     # -- CLI resolution ----------------------------------------------------
 
@@ -401,6 +503,13 @@ class OpenCodeRuntime:
         # runtime's isolation explicit regardless of plugin-install state.
         command = [self._cli_path, "run", "--pure", "--format", "json"]
 
+        if self._permission_mode.strip().lower() in {
+            "bypasspermissions",
+            "bypass_permissions",
+            "bypass",
+        }:
+            command.append("--dangerously-skip-permissions")
+
         normalized_model = self._normalize_model(self._model)
         if normalized_model:
             command.extend(["--model", normalized_model])
@@ -429,19 +538,13 @@ class OpenCodeRuntime:
             RuntimeError: If the nesting depth exceeds
                 ``_max_ouroboros_depth``.
         """
-        env = os.environ.copy()
-        for key in ("OUROBOROS_AGENT_RUNTIME", "OUROBOROS_LLM_BACKEND"):
-            env.pop(key, None)
-        # Track and enforce recursion depth
-        try:
-            depth = int(env.get("_OUROBOROS_DEPTH", "0")) + 1
-        except (ValueError, TypeError):
-            depth = 1
-        if depth > self._max_ouroboros_depth:
-            msg = f"Maximum Ouroboros nesting depth ({self._max_ouroboros_depth}) exceeded"
-            raise RuntimeError(msg)
-        env["_OUROBOROS_DEPTH"] = str(depth)
-        return env
+        return build_child_env(
+            strip_keys=_CHILD_ENV_STRIP_KEYS,
+            max_depth=self._max_ouroboros_depth,
+            depth_error_factory=lambda _depth, max_depth: RuntimeError(
+                f"Maximum Ouroboros nesting depth ({max_depth}) exceeded"
+            ),
+        )
 
     # -- Stream parsing ----------------------------------------------------
 
@@ -476,61 +579,17 @@ class OpenCodeRuntime:
             TimeoutError: If a timeout is exceeded.
             ProviderError: If the internal line buffer overflows.
         """
-        if stream is None:
-            return
-
-        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        buffer = ""
-        buffer_byte_estimate = 0
-        saw_chunk = False
-
-        while True:
-            timeout_seconds: float | None = None
-            if not saw_chunk:
-                timeout_seconds = first_chunk_timeout_seconds
-            elif chunk_timeout_seconds is not None:
-                timeout_seconds = chunk_timeout_seconds
-
-            try:
-                if timeout_seconds is None:
-                    chunk = await stream.read(chunk_size)
-                else:
-                    chunk = await asyncio.wait_for(
-                        stream.read(chunk_size),
-                        timeout=timeout_seconds,
-                    )
-            except TimeoutError as exc:
-                phase = "startup" if not saw_chunk else "idle"
-                raise TimeoutError(
-                    f"{self._display_name} produced no stdout during {phase} "
-                    f"window ({timeout_seconds:.0f}s)"
-                ) from exc
-            if not chunk:
-                break
-
-            saw_chunk = True
-            decoded = decoder.decode(chunk)
-            buffer += decoded
-            buffer_byte_estimate += len(decoded) * 4
-            if buffer_byte_estimate > _MAX_LINE_BUFFER_BYTES:
-                log.error(
-                    f"{self._log_namespace}.line_buffer_overflow",
-                    buffer_size=len(buffer),
-                    limit=_MAX_LINE_BUFFER_BYTES,
-                )
-                raise ProviderError(f"JSONL line buffer exceeded {_MAX_LINE_BUFFER_BYTES} bytes")
-            while True:
-                newline_index = buffer.find("\n")
-                if newline_index < 0:
-                    break
-                line = buffer[:newline_index]
-                buffer = buffer[newline_index + 1 :]
-                buffer_byte_estimate = len(buffer) * 4
-                yield line.rstrip("\r")
-
-        buffer += decoder.decode(b"", final=True)
-        if buffer:
-            yield buffer.rstrip("\r")
+        async for line in iter_runtime_stream_lines(
+            stream,
+            display_name=self._display_name,
+            chunk_size=chunk_size,
+            first_chunk_timeout_seconds=first_chunk_timeout_seconds,
+            chunk_timeout_seconds=chunk_timeout_seconds,
+            max_buffer_bytes=_MAX_LINE_BUFFER_BYTES,
+            logger=log,
+            log_namespace=self._log_namespace,
+        ):
+            yield line
 
     async def _collect_stream_lines(
         self,
@@ -566,8 +625,67 @@ class OpenCodeRuntime:
 
     # -- Process management ------------------------------------------------
 
-    async def _terminate_process(self, process: Any) -> None:
-        """Best-effort subprocess shutdown.
+    def _cleanup_windows_child_processes(self, process: Any) -> bool:
+        """Best-effort cleanup for Windows children orphaned by Node CLIs.
+
+        OpenCode may leave session-server children behind after the parent
+        subprocess exits normally. Windows preserves the original parent PID
+        on those orphaned children, so a PPID-targeted cleanup can run even
+        after ``process.wait()`` has completed.
+        """
+        if os.name != "nt":
+            return True
+        pid = getattr(process, "pid", None)
+        if pid is None:
+            return True
+        try:
+            result = subprocess.run(
+                ["wmic", "process", "where", f"(ParentProcessId={pid})", "delete"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            returncode = getattr(result, "returncode", 0)
+            if isinstance(returncode, int) and returncode != 0:
+                log.warning(
+                    f"{self._log_namespace}.windows_child_cleanup_failed",
+                    pid=pid,
+                    returncode=returncode,
+                )
+                return False
+            return True
+        except Exception as exc:
+            log.warning(
+                f"{self._log_namespace}.windows_child_cleanup_failed",
+                pid=pid,
+                error=str(exc),
+            )
+            return False
+
+    async def _collect_stderr_after_windows_cleanup(
+        self,
+        stderr_task: asyncio.Task[list[str]] | None,
+        *,
+        cleanup_succeeded: bool,
+    ) -> list[str]:
+        """Drain stderr, but do not hang forever after failed Windows cleanup.
+
+        Windows child cleanup is best-effort. If it fails while an orphaned
+        child still owns the inherited stderr pipe, waiting for EOF can block
+        normal result emission. In that failure mode, cancel the stderr drain
+        and let the caller return the best available result/error message.
+        """
+        if stderr_task is None:
+            return []
+        if cleanup_succeeded or stderr_task.done():
+            return await stderr_task
+        stderr_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stderr_task
+        return []
+
+    async def _terminate_process(self, process: Any) -> bool:
+        """Shut down the subprocess and report whether its tree is confirmed gone.
 
         Sends ``SIGTERM``, waits up to
         ``_process_shutdown_timeout_seconds``, then escalates to
@@ -577,45 +695,14 @@ class OpenCodeRuntime:
             process: Subprocess object (must expose ``terminate``,
                 ``kill``, and ``wait`` methods).
         """
-        if getattr(process, "returncode", None) is not None:
-            return
-
-        terminate = getattr(process, "terminate", None)
-        kill = getattr(process, "kill", None)
-
-        try:
-            if callable(terminate):
-                terminate()
-            elif callable(kill):
-                kill()
-            else:
-                return
-        except ProcessLookupError:
-            return
-        except Exception as exc:
-            log.warning(
-                f"{self._log_namespace}.process_terminate_failed",
-                error=str(exc),
-            )
-            return
-
-        try:
-            await asyncio.wait_for(
-                process.wait(),
-                timeout=self._process_shutdown_timeout_seconds,
-            )
-            return
-        except (TimeoutError, ProcessLookupError):
-            pass
-
-        if callable(kill):
-            with contextlib.suppress(ProcessLookupError, Exception):
-                kill()
-            with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError, Exception):
-                await asyncio.wait_for(
-                    process.wait(),
-                    timeout=self._process_shutdown_timeout_seconds,
-                )
+        return await terminate_runtime_process(
+            process,
+            shutdown_timeout=self._process_shutdown_timeout_seconds,
+            logger=log,
+            log_namespace=self._log_namespace,
+            workspace=self._cwd,
+            require_owned_tree=True,
+        )
 
     # -- Event conversion --------------------------------------------------
 
@@ -629,11 +716,7 @@ class OpenCodeRuntime:
             Parsed dict, or ``None`` if the line is not valid JSON
             or is not a dict.
         """
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            return None
-        return event if isinstance(event, dict) else None
+        return parse_json_event(line)
 
     def _extract_event_session_id(self, event: dict[str, Any]) -> str | None:
         """Extract the OpenCode session ID from a JSON event.
@@ -732,6 +815,8 @@ class OpenCodeRuntime:
                     runtime_backend=self._runtime_backend,
                     llm_backend=self._llm_backend,
                     opencode_mode=self._opencode_mode,
+                    project_dir=self.working_directory,
+                    runtime_adapter=self,
                 )
             }
         return self._builtin_mcp_handlers
@@ -752,35 +837,8 @@ class OpenCodeRuntime:
         intercept: Resolved,
         current_handle: RuntimeHandle | None,
     ) -> dict[str, Any]:
-        """Build the MCP argument payload for an intercepted skill.
-
-        For ``ouroboros_interview`` tools, injects the persisted
-        interview session ID and the first positional argument as
-        ``answer`` when available.
-
-        Args:
-            intercept: Resolved skill intercept metadata.
-            current_handle: Active runtime handle carrying session
-                metadata, or ``None``.
-
-        Returns:
-            Dict of MCP tool arguments ready for dispatch.
-        """
-        if intercept.mcp_tool != "ouroboros_interview" or current_handle is None:
-            return dict(intercept.mcp_args)
-
-        session_id = current_handle.metadata.get(_INTERVIEW_SESSION_METADATA_KEY)
-        if not isinstance(session_id, str) or not session_id.strip():
-            return dict(intercept.mcp_args)
-
-        # Resume turn: drop initial_context so InterviewHandler branches on
-        # session_id instead of starting a new interview.
-        arguments: dict[str, Any] = dict(intercept.mcp_args)
-        arguments.pop("initial_context", None)
-        arguments["session_id"] = session_id.strip()
-        if intercept.first_argument is not None:
-            arguments["answer"] = intercept.first_argument
-        return arguments
+        """Build arguments through the shared interview transition contract."""
+        return InterviewSessionTransition(intercept, current_handle).tool_arguments()
 
     def _build_resume_handle(
         self,
@@ -788,42 +846,13 @@ class OpenCodeRuntime:
         intercept: Resolved,
         tool_result: Any,
     ) -> RuntimeHandle | None:
-        """Attach interview session metadata to the runtime handle.
-
-        After an ``ouroboros_interview`` tool call, persists the
-        returned ``session_id`` into the handle's metadata so
-        subsequent turns can resume the same interview.
-
-        Args:
-            current_handle: Existing handle, or ``None``.
-            intercept: Skill intercept metadata.
-            tool_result: MCP tool result containing a ``meta`` dict.
-
-        Returns:
-            Updated or new
-            :class:`~ouroboros.orchestrator.adapter.RuntimeHandle`,
-            or ``None`` if no session ID was found.
-        """
-        if intercept.mcp_tool != "ouroboros_interview":
-            return current_handle
-
-        session_id = tool_result.meta.get("session_id")
-        if not isinstance(session_id, str) or not session_id.strip():
-            return current_handle
-
-        metadata = dict(current_handle.metadata) if current_handle is not None else {}
-        metadata[_INTERVIEW_SESSION_METADATA_KEY] = session_id.strip()
-        updated_at = datetime.now(UTC).isoformat()
-
-        if current_handle is not None:
-            return replace(current_handle, metadata=metadata, updated_at=updated_at)
-
-        return RuntimeHandle(
+        """Retain session-local interview state through the shared transition."""
+        return InterviewSessionTransition(intercept, current_handle).resume_handle(
+            tool_result.meta,
             backend=self.runtime_backend,
             cwd=self.working_directory,
             approval_mode=self.permission_mode,
-            updated_at=updated_at,
-            metadata=metadata,
+            log_namespace="opencode_runtime",
         )
 
     async def _dispatch_skill_intercept_locally(
@@ -977,6 +1006,21 @@ class OpenCodeRuntime:
         if handle is None:
             return None
 
+        if (
+            control_state.get("returncode") is None
+            and control_state.get("terminated") is not True
+            and control_state.get("runtime_status")
+            not in {
+                "cancelled",
+                "completed",
+                "failed",
+                "terminated",
+                "terminating",
+                "termination_unconfirmed",
+            }
+        ):
+            control_state["runtime_status"] = handle.lifecycle_state
+
         async def _observe(_handle: RuntimeHandle) -> dict[str, Any]:
             snapshot = _handle.snapshot()
             pid = control_state.get("process_id")
@@ -986,6 +1030,12 @@ class OpenCodeRuntime:
             if isinstance(rc, int):
                 snapshot["returncode"] = rc
                 snapshot["lifecycle_state"] = "completed" if rc == 0 else "failed"
+            status = control_state.get("runtime_status")
+            if isinstance(status, str):
+                snapshot["lifecycle_state"] = status
+            if control_state.get("terminated") is True:
+                snapshot["terminated"] = True
+                snapshot["can_terminate"] = False
             return snapshot
 
         async def _terminate(_handle: RuntimeHandle) -> bool:
@@ -994,7 +1044,10 @@ class OpenCodeRuntime:
             if getattr(process, "returncode", None) is not None:
                 return False
             control_state["runtime_status"] = "terminating"
-            await self._terminate_process(process)
+            confirmed = await self._terminate_process(process)
+            if not confirmed:
+                control_state["runtime_status"] = "termination_unconfirmed"
+                return False
             control_state["terminated"] = True
             rc = getattr(process, "returncode", None)
             control_state["returncode"] = rc
@@ -1041,6 +1094,15 @@ class OpenCodeRuntime:
             :class:`~ouroboros.orchestrator.adapter.AgentMessage`
             values as they arrive from the CLI.
         """
+        cwd_failure = worker_cwd_failure_message(
+            self._cwd,
+            runtime_backend=self._runtime_backend,
+            resume_handle=resume_handle,
+        )
+        if cwd_failure is not None:
+            yield cwd_failure
+            return
+
         current_handle = resume_handle or self._build_runtime_handle(resume_session_id)
 
         # Resolve deterministic skill dispatch once before invoking OpenCode.
@@ -1097,6 +1159,8 @@ class OpenCodeRuntime:
         process: Any | None = None
         process_finished = False
         process_terminated = False
+        windows_child_cleanup_done = False
+        windows_child_cleanup_succeeded = True
         control_state: dict[str, Any] | None = None
         stderr_task: asyncio.Task[list[str]] | None = None
 
@@ -1224,42 +1288,67 @@ class OpenCodeRuntime:
                         yield message
 
         except TimeoutError as e:
+            termination_confirmed = False
             if process is not None and control_state is not None:
-                await self._terminate_process(process)
-                control_state["terminated"] = True
+                termination_confirmed = await self._terminate_process(process)
+                windows_child_cleanup_succeeded = self._cleanup_windows_child_processes(process)
+                windows_child_cleanup_done = True
+                control_state["terminated"] = termination_confirmed
+                control_state["runtime_status"] = (
+                    "terminated" if termination_confirmed else "termination_unconfirmed"
+                )
             process_terminated = True
             if stderr_task is not None:
-                stderr_lines = await stderr_task
+                stderr_lines = await self._collect_stderr_after_windows_cleanup(
+                    stderr_task,
+                    cleanup_succeeded=windows_child_cleanup_succeeded,
+                )
             final_message = "\n".join(stderr_lines).strip()
             if not final_message:
-                final_message = f"{self._display_name} became unresponsive and was terminated: {e}"
+                cleanup = (
+                    "was terminated" if termination_confirmed else "termination was not confirmed"
+                )
+                final_message = f"{self._display_name} became unresponsive; {cleanup}: {e}"
             yield AgentMessage(
                 type="result",
                 content=final_message,
-                data={"subtype": "error", "error_type": type(e).__name__},
+                data={
+                    "subtype": "error",
+                    "error_type": type(e).__name__,
+                    "termination_confirmed": termination_confirmed,
+                },
                 resume_handle=current_handle,
             )
             return
         except asyncio.CancelledError:
             if process is not None:
                 log.warning(f"{self._log_namespace}.task_cancelled", cwd=self._cwd)
-                await self._terminate_process(process)
+                confirmed = await self._terminate_process(process)
                 process_terminated = True
                 if control_state is not None:
-                    control_state["terminated"] = True
+                    control_state["terminated"] = confirmed
+                    control_state["runtime_status"] = (
+                        "terminated" if confirmed else "termination_unconfirmed"
+                    )
             raise
         else:
             # Normal completion — stdout stream finished
             returncode = await process.wait()
             process_finished = True
             control_state["returncode"] = returncode
-            control_state["runtime_status"] = "completed" if returncode == 0 else "failed"
+            if control_state.get("runtime_status") != "termination_unconfirmed":
+                control_state["runtime_status"] = "completed" if returncode == 0 else "failed"
             current_handle = self._bind_runtime_handle_controls(
                 current_handle,
                 process=process,
                 control_state=control_state,
             )
-            stderr_lines = await stderr_task
+            windows_child_cleanup_succeeded = self._cleanup_windows_child_processes(process)
+            windows_child_cleanup_done = True
+            stderr_lines = await self._collect_stderr_after_windows_cleanup(
+                stderr_task,
+                cleanup_succeeded=windows_child_cleanup_succeeded,
+            )
 
             if yielded_final:
                 return
@@ -1298,7 +1387,15 @@ class OpenCodeRuntime:
                     and not process_terminated
                     and getattr(process, "returncode", None) is None
                 ):
-                    await self._terminate_process(process)
+                    confirmed = await self._terminate_process(process)
+                    process_terminated = True
+                    if control_state is not None:
+                        control_state["terminated"] = confirmed
+                        control_state["runtime_status"] = (
+                            "terminated" if confirmed else "termination_unconfirmed"
+                        )
+                if not windows_child_cleanup_done:
+                    self._cleanup_windows_child_processes(process)
             if stderr_task is not None and not stderr_task.done():
                 stderr_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

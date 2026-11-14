@@ -23,6 +23,10 @@ from typing import TYPE_CHECKING, Any
 
 from textual.message import Message
 
+from ouroboros.observability.frugality_retrospective import (
+    project_frugality_retrospective,
+)
+
 if TYPE_CHECKING:
     from ouroboros.events.base import BaseEvent
 
@@ -562,6 +566,82 @@ class AgentThinkingUpdated(Message):
         self.thinking_text = thinking_text
 
 
+class ACModelRouted(Message):
+    """Per-AC model-tier routing telemetry (frugality proof's routing axis).
+
+    Emitted from ``execution.ac.model_routed``: records which model tier ran a
+    unit of work so the dashboard can show a per-AC tier badge. ``node_id`` is the
+    stable per-worker identity when present; ``ac_index`` is the fallback join key.
+    """
+
+    def __init__(
+        self,
+        node_id: str | None,
+        ac_index: int,
+        model_tier: str | None,
+        model: str | None,
+        model_mode: str,
+        retry_attempt: int,
+    ) -> None:
+        super().__init__()
+        self.node_id = node_id
+        self.ac_index = ac_index
+        self.model_tier = model_tier
+        self.model = model
+        self.model_mode = model_mode
+        self.retry_attempt = retry_attempt
+
+
+class ACTokenAttribution(Message):
+    """Per-AC runtime-measured token spend (frugality proof's token axis).
+
+    Emitted from ``execution.ac.token_attribution.reported``. ``token_spend`` is a
+    real runtime-usage measurement (never a character proxy); the dashboard folds
+    it per node and into the run total.
+    """
+
+    def __init__(
+        self,
+        node_id: str | None,
+        ac_index: int,
+        token_spend: float,
+        model_tier: str | None,
+    ) -> None:
+        super().__init__()
+        self.node_id = node_id
+        self.ac_index = ac_index
+        self.token_spend = token_spend
+        self.model_tier = model_tier
+
+
+class FrugalityProofEvaluated(Message):
+    """Run-end deterministic frugality-proof verdict.
+
+    Emitted once from ``execution.frugality_proof.evaluated``: a PASS/FAIL verdict
+    computed over a same-seed cohort with no model in the loop.
+    """
+
+    def __init__(
+        self,
+        status: str,
+        token_reduction_pct: float | None,
+        reason: str,
+    ) -> None:
+        super().__init__()
+        self.status = status
+        self.token_reduction_pct = token_reduction_pct
+        self.reason = reason
+
+
+class FrugalityRetrospectiveReported(Message):
+    """Neutral execution-finalized frugality evidence summary."""
+
+    def __init__(self, execution_id: str, summary: dict[str, Any]) -> None:
+        super().__init__()
+        self.execution_id = execution_id
+        self.summary = dict(summary)
+
+
 # =============================================================================
 # Event Subscription State
 # =============================================================================
@@ -605,6 +685,29 @@ class TUIState:
     ac_tree: dict[str, Any] = field(default_factory=dict)
     logs: list[dict[str, Any]] = field(default_factory=list)
     max_logs: int = 100
+
+    # Provider identity, folded incrementally through the SHARED board derivation
+    # (``ouroboros.dashboard.board.fold_provider_event`` — the exact rules
+    # ``reduce_board`` applies for the web Kanban). ``provider_by_node`` maps
+    # node_id -> runtime_backend (codex_cli / claude / …) for per-worker sessions;
+    # the app's ``ProviderLedger`` wraps this dict and adds the run-level fallback
+    # when stamping tree nodes. ``board_providers`` is the run's provider legend.
+    provider_by_node: dict[str, str] = field(default_factory=dict)
+    board_providers: list[str] = field(default_factory=list)
+
+    # Frugality telemetry, folded from the per-AC routing/token events and the
+    # run-end proof. ``tier_by_node`` / ``model_by_node`` are latest-wins per node
+    # (node_id when present, else ``ac_<index>``); ``tokens_by_node`` accumulates
+    # per node and ``run_total_tokens`` sums the whole run. ``frugality_summary`` is
+    # the one-line run-end verdict, set once. Stamped onto tree nodes the same
+    # order-safe way providers are (``_apply_provider_tags``).
+    tier_by_node: dict[str, str] = field(default_factory=dict)
+    model_by_node: dict[str, str] = field(default_factory=dict)
+    tokens_by_node: dict[str, float] = field(default_factory=dict)
+    run_total_tokens: float = 0.0
+    frugality_summary: str | None = None
+    frugality_retrospective: dict[str, Any] | None = None
+    frugality_retrospective_summary: str | None = None
 
     # P1: Tool/thinking tracking for dashboard
     active_tools: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -652,6 +755,29 @@ def _coerce_event_int(value: object) -> int | None:
     return value if type(value) is int else None
 
 
+def _coerce_finite_spend(value: object, *, reject_negative: bool = False) -> float | None:
+    """A finite, non-bool numeric value, else None (omit — never render NaN).
+
+    Mirrors ``dashboard.board._coerce_spend`` so a malformed telemetry payload
+    (non-numeric, NaN, ±Inf, or an int too large to convert to float) is dropped
+    the same way in the TUI as in the shared web board. ``reject_negative`` is
+    used for ``token_spend`` (a cumulative counter) but not for
+    ``token_reduction_pct`` (a signed delta where negative legitimately means
+    spend increased).
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        spend = float(value)
+    except (OverflowError, ValueError):  # e.g. int too large to convert to float
+        return None
+    if spend != spend or spend in (float("inf"), float("-inf")):  # NaN / inf guard
+        return None
+    if reject_negative and spend < 0:
+        return None
+    return spend
+
+
 def _subtask_root_ac_index(data: dict[str, Any]) -> int:
     """Return the 1-based top-level AC index for subtask dashboard grouping."""
     root_ac_number = _coerce_event_int(data.get("root_ac_number"))
@@ -665,6 +791,57 @@ def _subtask_root_ac_index(data: dict[str, Any]) -> int:
     legacy_ac_index = _coerce_event_int(data.get("legacy_ac_index"))
     ac_index = _coerce_event_int(data.get("ac_index"))
     return ac_index if ac_index is not None else legacy_ac_index or 0
+
+
+def _resolve_tool_completion_success(data: dict[str, Any]) -> bool:
+    """Resolve tool-completion success without laundering a reported failure.
+
+    No producer sets ``success`` on ``execution.tool.completed``:
+    ``ExecutionEventEmitter.emit_atomic_tool_completed`` builds its payload from
+    the runtime identity plus ``serialize_runtime_message_metadata`` output, and
+    neither contributes that key. A plain ``data.get("success", True)`` therefore
+    rendered every failed tool as succeeded — a Codex command exiting 1 arrives
+    carrying ``is_error=True`` and was still displayed as a success.
+
+    ``is_error`` is the authoritative verdict channel, and a malformed claim is
+    treated as failure rather than silently ignored, matching the fail-closed
+    contract the runtime adapters use.
+
+    Both the top-level and the nested envelopes are supported. ``is_error`` is
+    lifted to the top level only when the message itself carries that key, while
+    ``project_runtime_message`` separately persists the normalized ``tool_result``
+    payload — so an adapter that reports failure only inside ``tool_result``
+    (OpenCode does) has no top-level verdict and would otherwise render green.
+
+    A completion carrying no verdict in either envelope stays optimistic: there
+    is no signal to fail closed on, and flipping every signal-less runtime to a
+    failed display would be a louder wrong answer than the one being fixed.
+    """
+    raw_success = data.get("success")
+    if isinstance(raw_success, bool):
+        return raw_success
+
+    tool_result = data.get("tool_result")
+    envelopes: list[dict[str, Any]] = [data]
+    if isinstance(tool_result, dict):
+        envelopes.append(tool_result)
+
+    for envelope in envelopes:
+        if envelope.get("is_error_invalid") is True:
+            return False
+
+        if "is_error" not in envelope:
+            continue
+
+        is_error = envelope.get("is_error")
+        if isinstance(is_error, bool):
+            return not is_error
+
+        # A malformed verdict is a claim that could not be validated, so it is
+        # failure rather than an absent signal.
+        return False
+
+    return True
 
 
 def create_message_from_event(event: BaseEvent) -> Message | None:
@@ -774,37 +951,6 @@ def create_message_from_event(event: BaseEvent) -> Message | None:
             parallel_level=data.get("parallel_level"),
         )
 
-    elif event_type == "execution.subagent.started":
-        # SubAgent started - extract parallel level if available
-        return ACUpdated(
-            execution_id=event.aggregate_id,
-            ac_id=data.get("subagent_id", ""),
-            status="executing",
-            depth=data.get("depth", 0),
-            is_atomic=False,
-            parallel_level=data.get("parallel_level"),
-        )
-
-    elif event_type == "execution.subagent.completed":
-        return ACUpdated(
-            execution_id=event.aggregate_id,
-            ac_id=data.get("subagent_id", ""),
-            status="completed",
-            depth=data.get("depth", 0),
-            is_atomic=False,
-            parallel_level=data.get("parallel_level"),
-        )
-
-    elif event_type == "execution.subagent.failed":
-        return ACUpdated(
-            execution_id=event.aggregate_id,
-            ac_id=data.get("subagent_id", ""),
-            status="failed",
-            depth=data.get("depth", 0),
-            is_atomic=False,
-            parallel_level=data.get("parallel_level"),
-        )
-
     elif event_type == "execution.decomposition.level_started":
         # Parallel batch started
         return ParallelBatchStarted(
@@ -902,7 +1048,7 @@ def create_message_from_event(event: BaseEvent) -> Message | None:
             tool_detail=data.get("tool_detail", ""),
             call_index=data.get("call_index", 0),
             duration_seconds=data.get("duration_seconds", 0.0),
-            success=data.get("success", True),
+            success=_resolve_tool_completion_success(data),
         )
 
     elif event_type == "execution.agent.thinking":
@@ -912,16 +1058,134 @@ def create_message_from_event(event: BaseEvent) -> Message | None:
             thinking_text=data.get("thinking_text", ""),
         )
 
+    elif event_type == "execution.ac.model_routed":
+        node_id = data.get("node_id") if isinstance(data.get("node_id"), str) else None
+        ac_index = data.get("ac_index")
+        ac_index = ac_index if type(ac_index) is int else -1
+        if node_id is None and ac_index < 0:
+            # No usable join key — drop rather than stamp the wrong node.
+            return None
+        return ACModelRouted(
+            node_id=node_id,
+            ac_index=ac_index,
+            model_tier=data.get("model_tier") if isinstance(data.get("model_tier"), str) else None,
+            model=data.get("model") if isinstance(data.get("model"), str) else None,
+            model_mode=data.get("model_mode") if isinstance(data.get("model_mode"), str) else "",
+            retry_attempt=_coerce_event_int(data.get("retry_attempt")) or 0,
+        )
+
+    elif event_type == "execution.ac.token_attribution.reported":
+        # reject_negative=True: a malformed payload never produces a message (it
+        # can no longer poison the run total downstream, where negatives were
+        # previously dropped only after the fact).
+        spend = _coerce_finite_spend(data.get("token_spend"), reject_negative=True)
+        if spend is None:
+            return None
+        node_id = data.get("node_id") if isinstance(data.get("node_id"), str) else None
+        ac_index = data.get("ac_index")
+        ac_index = ac_index if type(ac_index) is int else -1
+        return ACTokenAttribution(
+            node_id=node_id,
+            ac_index=ac_index,
+            token_spend=spend,
+            model_tier=data.get("model_tier") if isinstance(data.get("model_tier"), str) else None,
+        )
+
+    elif event_type == "execution.frugality_proof.evaluated":
+        status = data.get("status")
+        if not isinstance(status, str) or not status:
+            return None
+        return FrugalityProofEvaluated(
+            status=status,
+            # reject_negative=False: a negative pct legitimately means spend increased.
+            token_reduction_pct=_coerce_finite_spend(data.get("token_reduction_pct")),
+            reason=data.get("reason") if isinstance(data.get("reason"), str) else "",
+        )
+
+    elif event_type == "execution.frugality_retrospective.reported":
+        summary = project_frugality_retrospective(data)
+        if summary is None:
+            return None
+        execution_id = data.get("execution_id")
+        return FrugalityRetrospectiveReported(
+            execution_id=(
+                execution_id
+                if isinstance(execution_id, str) and execution_id
+                else event.aggregate_id
+            ),
+            summary=summary,
+        )
+
     # Return None for unhandled event types
     return None
 
 
+_FRUGALITY_STATUS_LABELS = {
+    "pass": "frugal",
+    "fail_grounding_regression": "grounding regressed",
+    "fail_no_frugality": "no savings",
+    "insufficient_sample": "insufficient sample",
+    "insufficient_data": "insufficient data",
+}
+
+
+def format_frugality_summary(
+    status: str,
+    token_reduction_pct: float | None,
+) -> str:
+    """Return a one-line frugality-proof verdict for run-end display.
+
+    Shared by the app (folds it into ``TUIState.frugality_summary``) and the
+    dashboard bar so the two never phrase the same verdict differently. The ``⚖``
+    glyph doubles as a dedup marker when appended to an existing progress line.
+    """
+    label = _FRUGALITY_STATUS_LABELS.get(status, status or "unknown")
+    if (
+        status == "pass"
+        and isinstance(token_reduction_pct, (int, float))
+        and not isinstance(token_reduction_pct, bool)
+    ):
+        return f"⚖ {label} −{float(token_reduction_pct):.0f}% tok"
+    return f"⚖ {label}"
+
+
+def _format_evidence_tokens(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "0 tok"
+    tokens = float(value)
+    if tokens >= 1000:
+        return f"{tokens / 1000:.1f}".rstrip("0").rstrip(".") + "k tok"
+    return f"{tokens:.0f} tok"
+
+
+def format_frugality_retrospective_summary(summary: dict[str, Any]) -> str:
+    """Return one neutral evidence line for the execution-finalized report."""
+    parts: list[str] = []
+    if summary.get("retry_associated_attempts"):
+        parts.append(
+            "retry-associated " + _format_evidence_tokens(summary.get("retry_associated_tokens"))
+        )
+    if summary.get("unaccepted_attempts"):
+        parts.append("unaccepted " + _format_evidence_tokens(summary.get("unaccepted_tokens")))
+    parts.append(
+        "coverage "
+        f"{summary.get('measured_attempts', 0)} measured/"
+        f"{summary.get('unknown_attempts', 0)} unknown/"
+        f"{summary.get('invalid_attempts', 0)} invalid"
+    )
+    return "Evidence: " + " | ".join(parts)
+
+
 __all__ = [
+    "ACModelRouted",
+    "ACTokenAttribution",
     "ACUpdated",
     "AgentThinkingUpdated",
     "CostUpdated",
     "DriftUpdated",
     "ExecutionUpdated",
+    "FrugalityProofEvaluated",
+    "FrugalityRetrospectiveReported",
     "GenerationSelected",
     "LineageSelected",
     "LogMessage",
@@ -936,4 +1200,6 @@ __all__ = [
     "ToolCallStarted",
     "WorkflowProgressUpdated",
     "create_message_from_event",
+    "format_frugality_retrospective_summary",
+    "format_frugality_summary",
 ]

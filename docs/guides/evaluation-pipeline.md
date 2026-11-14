@@ -5,7 +5,21 @@ doc_metadata:
 
 # Evaluation Pipeline Guide
 
-Ouroboros Phase 4 runs every execution result through a **three-stage progressive evaluation pipeline** before marking an acceptance criterion (AC) as approved. Cheaper checks gate the expensive ones: Stage 1 is free, Stage 2 uses one LLM call, and Stage 3 (multi-model consensus) runs only when specifically triggered.
+> 中文说明：[evaluation-pipeline.zh-CN.md](./evaluation-pipeline.zh-CN.md)
+
+Ouroboros Phase 4 runs every execution result through a **three-stage progressive evaluation pipeline** before assigning formal acceptance-criterion (AC) verdicts. Cheaper checks gate the expensive ones: Stage 1 is free, Stage 2 uses one LLM call, and Stage 3 (multi-model consensus) runs only when specifically triggered.
+
+### Acceptance Authority
+
+Model judgment may clarify, construct checks, and withhold approval. It cannot grant acceptance; acceptance comes from executed verification (#2449).
+
+- **Only Stage 1 can grant.** `final_approved` is `true` only when Stage 1 ran at least one configured check and every check passed (`MechanicalResult.has_executed_evidence`).
+- **Stage 2 and Stage 3 are advisory.** Each stage that ran may withhold approval: Stage 2 `ac_compliance=false`, a Stage 2 score below `0.8`, a Stage 3 rejection, or the [reward-hacking veto](#reward-hacking-veto). None of them can grant it, and a Stage 3 approval does not lift a Stage 2 block.
+- **No executed evidence means unverified, not approved.** When Stage 1 did not run or ran no configured check, the result is `final_approved=false` with `acceptance_state="unverified"`. The model review is still produced and attached as feedback; it is neither a crash nor a silent pass.
+
+`EvaluationResult.acceptance_state` (`approved` / `rejected` / `unverified`) and the `evaluation.pipeline.completed` event's `acceptance_state` field expose the outcome. `ouroboros_evaluate` returns it as `meta.acceptance_state` together with `meta.executed_evidence`, and renders an unverified result as `NOT APPROVED (unverified: no executed verification evidence)` rather than `REJECTED`. The single gate is `decide_final_approval()` in `evaluation/models.py`; `EvaluationPipeline._build_result()` is its only caller in the pipeline.
+
+> **Terminology boundary:** worker task completion is not a formal AC verdict, and task failure is not semantic drift. See [Execution vs. Evaluation Contract](./execution-vs-evaluation.md) for the shared `TaskResult` / `ACResult` distinction.
 
 ```
 Artifact ready
@@ -13,36 +27,31 @@ Artifact ready
       ▼
 ┌─────────────────────────────┐
 │  Stage 1: Mechanical ($0)   │ lint / build / test / static / coverage
-│  All checks must pass       │
+│  All checks must pass       │ any failure → REJECTED (stop)
 └────────────┬────────────────┘
-             │ passed
+             │ passed (with or without an executed check)
              ▼
 ┌─────────────────────────────┐
-│  Stage 2: Semantic ($$)     │ LLM evaluates AC compliance, goal
-│  score ≥ 0.8 + ac_compliance│ alignment, drift, uncertainty
-└────────────┬────────────────┘
-             │ passed
+│  Stage 2: Semantic ($$)     │ advisory: may withhold
+│  score ≥ 0.8 + ac_compliance│ (non-compliance stops here unless
+└────────────┬────────────────┘  trigger_consensus=true)
+             │
              ▼
         ┌────┴────┐
-        │ Trigger │ ← 6 conditions checked
+        │ Trigger │ ← 7 conditions checked
         │ matrix  │
         └────┬────┘
-             │ triggered?
-        ┌────┴────────────────────────────┐
-       YES                               NO
-        │                                 │
-        ▼                                 ▼
-┌───────────────────────┐          ┌───────────────┐
-│  Stage 3: Consensus   │          │   APPROVED    │
-│  ($$$, 2/3 majority)  │          └───────────────┘
-└───────────┬───────────┘
-            │
-   ┌────────┴────────┐
-  YES               NO
-   │                 │
-   ▼                 ▼
-APPROVED          REJECTED
+             │ triggered? → Stage 3: Consensus ($$$, ratio ≥ 0.66), advisory: may withhold
+             ▼
+┌──────────────────────────────────────────────┐
+│  Acceptance gate (decide_final_approval)     │
+│  no executed Stage 1 check  → UNVERIFIED     │
+│  a model stage withheld     → REJECTED       │
+│  otherwise                  → APPROVED       │
+└──────────────────────────────────────────────┘
 ```
+
+> `trigger_consensus=true` sends a Stage 2 AC failure on to Stage 3 as a second opinion. The votes are reported, but a consensus approval cannot lift the Stage 2 block. The [reward-hacking veto](#reward-hacking-veto) is one of the withholding gates.
 
 ---
 
@@ -60,9 +69,9 @@ The mechanical verifier runs zero-cost automated shell commands and checks the e
 | `static` | `static_command` in config | Non-zero exit code |
 | `coverage` | `coverage_command` in config | Exit code != 0, OR parsed coverage < `coverage_threshold` (default **70%**) |
 
-**Pipeline behavior:** If **any** check fails, Stage 2 and Stage 3 are skipped entirely and the artifact is rejected immediately.
+**Pipeline behavior:** If **any** executed check fails, Stage 2 and Stage 3 are skipped entirely and the artifact is rejected immediately. `MechanicalResult.disposition` is the one classifier every reader uses: `executed_fail` (a check that ran a command failed) rejects; `executed_pass` (every check passed and at least one ran) is the only disposition that can support approval; `no_evidence` (every check skipped, or a failure no command produced, which only a hand-built result can carry) is unverified, and Stage 2 still runs for feedback.
 
-**Skipped checks:** If a check has no command configured (`None`), it is silently skipped and treated as **passed**. This is the default when you have not set commands in `PipelineConfig.mechanical`.
+**Skipped checks:** If a check has no command configured (`None`), it is skipped and reported as **passed** (`CheckResult.executed=False`) so it does not fail Stage 1. A skipped check is not evidence: when every check is skipped, Stage 1 grants nothing and the result is **unverified**. This is the default when you have not set commands in `PipelineConfig.mechanical`.
 
 ### Stage 1 Failure Modes
 
@@ -72,35 +81,40 @@ The mechanical verifier runs zero-cost automated shell commands and checks the e
 | **Command timeout** | `Check <type> timed out after Ns` | Command exceeded `timeout_seconds` (default 300 s); increase timeout or fix slow tests |
 | **Non-zero exit code** | `Check <type> failed (exit code N)` | Tool found real errors; inspect `stdout_preview`/`stderr_preview` in the event payload |
 | **Coverage below threshold** | `Coverage X.X% below threshold Y.Y%` | Test suite does not meet the minimum coverage requirement; add tests or lower `coverage_threshold` |
-| **Coverage not parseable** | Coverage check passes but no `coverage_score` in events | Output did not match the expected pattern (`TOTAL ... XX%`); ensure `pytest-cov` or compatible tool is used |
+| **Coverage not parseable** | With an enabled threshold, acceptance is unverified and `coverage_score` is `None` | Output is unsupported, malformed, or conflicting; supply a supported measurement row. At `coverage_threshold=0.0`, only command execution is checked |
 | **OS error** | `Check <type> failed` with "OS error" | Permissions problem or missing working directory; verify `working_dir` config |
 
-### Language Auto-Detection
+### Where Stage 1 Commands Come From
 
-When `build_mechanical_config(working_dir)` is used (the default when running via `ouroboros run`), Stage 1 commands are **automatically populated** by scanning the project directory for known marker files. You do not need to configure commands manually for supported toolchains.
+Ouroboros does **not** ship hardcoded per-language presets. For configuration authored in the repository, Stage 1 trusts exactly one file: `.ouroboros/mechanical.toml` in the project root. `build_mechanical_config(working_dir)` is the deterministic reader for that file — when the file and Python `overrides` argument are both absent, every command resolves to `None` and Stage 1 skips gracefully rather than running the wrong tool. A direct Python caller can instead pass `overrides` to that builder or construct `MechanicalConfig` itself; those are separate programmatic authorities, documented under [Project-Level Command Overrides](#project-level-command-overrides). Neither is an MCP request parameter: `ouroboros_evaluate` exposes no mechanical-command parameter (`mcp/tools/evaluation_handlers.py:437`) and its handler calls `build_mechanical_config(working_dir)` without `overrides` (`:742`).
 
-**Detection priority** (first match wins):
+The file is written by `ouroboros.evaluation.detector`, which makes **one AI call** that inspects the project's manifest files (`pyproject.toml`, `uv.lock`, `package.json`, `Cargo.toml`, `go.mod`, `pom.xml`, `build.gradle`, `Makefile`, `justfile`, `Taskfile.yml`, `build.zig`, `CMakeLists.txt`, `mix.exs`, `Gemfile`, and others) and proposes commands for this specific repository. Each proposed command is validated before it is persisted — against the executable allowlist, against shell-operator and absolute-path injection, and against the repo itself (for example, a `cargo` command is only kept when `Cargo.toml` exists) — so the toml contains only safe, repository-supported commands.
 
-| Marker file | Detected toolchain | Default commands |
-|---|---|---|
-| `uv.lock` | `python-uv` | `uv run ruff`, `uv run pytest --cov`, `uv run mypy` |
-| `build.zig` | `zig` | `zig build`, `zig build test` |
-| `Cargo.toml` | `rust` | `cargo clippy`, `cargo build`, `cargo test` |
-| `go.mod` | `go` | `go vet ./...`, `go build ./...`, `go test ./...`, `go test -cover ./...` |
-| `bun.lockb` / `bun.lock` | `node-bun` | `bun lint`, `bun run build`, `bun test` |
-| `pnpm-lock.yaml` | `node-pnpm` | `pnpm lint`, `pnpm build`, `pnpm test` |
-| `yarn.lock` | `node-yarn` | `yarn lint`, `yarn build`, `yarn test` |
-| `package-lock.json` | `node-npm` | `npm run lint`, `npm run build`, `npm test` |
-| `pyproject.toml` / `setup.py` / `setup.cfg` | `python` | `ruff check .`, `pytest --cov`, `mypy .` |
-| `package.json` (no lockfile) | `node-npm` | `npm run lint`, `npm run build`, `npm test` |
+Validation stops there. `_command_is_valid()` deliberately does not consult the host `PATH` (`evaluation/detector.py:496`), so it proves the command is safe and that the repository declares it, not that the executable is installed here. A manifest-declared `pytest` command is persisted even when `pytest` is missing from the environment, and Stage 1 reports "Command not found" at run time.
 
-If no marker file is found, all commands remain `None` and all checks are silently skipped.
+Generate or refresh it explicitly:
 
-> **Go coverage note:** The `go test -cover` output format (`ok  ./... coverage: XX.X% of statements`) is not matched by the coverage parser (which expects `TOTAL ... XX%` or `Coverage: XX%`). For Go projects, `coverage_score` will always be `None` in the event payload and the coverage **threshold check is skipped even if coverage is low**. Use the `.ouroboros/mechanical.toml` override to supply a custom coverage command if you need threshold enforcement on Go projects.
+```bash
+ouroboros detect              # inspect the current directory and write .ouroboros/mechanical.toml
+ouroboros detect --force      # re-detect and overwrite an existing file
+ouroboros detect --backend codex   # use a specific LLM backend for the detect call
+```
+
+`ensure_mechanical_toml()` is idempotent: when the file already exists and `force` is false it returns immediately without an LLM call.
+
+It returns `False` for the failures it handles: no manifests, a provider error surfaced as a returned `Result`, an unparseable proposal, an empty validated proposal, or an `OSError` while writing. Validation is per command, not all-or-nothing — one invalid proposal is dropped while the remaining valid commands can still be persisted, and validation returns `False` only when none remain. That is not the same as never raising. `_ask_llm()` calls `tracked_complete()` outside an exception boundary, and `tracked_complete()` re-raises adapter exceptions (`evolution/provider_usage.py:443-489`), so an adapter that throws propagates out. `ouroboros detect` does not catch it either (`cli/commands/detect.py:90`). The `run` artifact builder and MCP evaluation handler catch unexpected auto-detection exceptions as best-effort work (`evaluation/verification_artifacts.py:119-122`, `mcp/tools/evaluation_handlers.py:729-742`), leaving Stage 1 with no commands. Treat the direct function's fail-closed contract as covering handled failures, not every thrown exception.
+
+> **If every result is unverified, this is usually why.** With no `.ouroboros/mechanical.toml` and no explicitly configured `MechanicalConfig` commands, all five checks are skipped. Stage 1 then reports `passed` but `NO CHECKS EXECUTED`, and because only executed checks can grant acceptance, no result can be approved; each one is unverified with the Stage 2 review attached.
+>
+> Reaching that state through `ouroboros run` or the MCP evaluation path takes a failure, not just a missing file. Both author the file before reading it, by different routes: `run` calls `build_verification_artifacts()`, which invokes `_auto_detect_mechanical_toml()` (`cli/commands/run.py:785`, `evaluation/verification_artifacts.py:437`), while the MCP evaluation handler checks `has_mechanical_toml()` and calls `ensure_mechanical_toml()` followed by `build_mechanical_config()` directly (`mcp/tools/evaluation_handlers.py:724`). The auto-detection behavior is the same; the call path is not. Stage 1 ends up empty when that best-effort detection fails — no LLM adapter, a provider error, an unwritable `.ouroboros/` — or when a caller drives the lower-level pipeline directly and skips detection. If you see the no-op symptom, look for a failed detection before running `ouroboros detect` by hand.
+
+> **Deprecated:** `detect_language()` no longer detects anything. It is a compatibility shim that reads `.ouroboros/mechanical.toml` and emits a `DeprecationWarning`; call `ensure_mechanical_toml()` plus `build_mechanical_config()` instead.
+
+> **Go coverage note:** The `go test -cover` output format (`ok  ./... coverage: XX.X% of statements`) is not matched by the coverage parser (which expects `TOTAL ... XX%` or `Coverage: XX%`). This output leaves `coverage_score` as `None` and an enabled threshold **unverified**, so acceptance is withheld. Use the `.ouroboros/mechanical.toml` override to supply a custom coverage command producing a supported measurement row. Setting `coverage_threshold=0.0` disables the threshold; it does not create a measured score.
 
 ### Project-Level Command Overrides
 
-Create `.ouroboros/mechanical.toml` in your project root to override auto-detected commands without modifying Ouroboros configuration:
+`.ouroboros/mechanical.toml` in your project root is where Stage 1 commands live. The detector writes it, and you can edit it or author it by hand without modifying Ouroboros configuration:
 
 ```toml
 # .ouroboros/mechanical.toml
@@ -111,21 +125,26 @@ coverage_threshold = 0.85
 timeout = 120
 ```
 
-**Override priority** (highest to lowest):
-1. Explicit `overrides` dict passed programmatically (from MCP params)
+Within the Python `build_mechanical_config()` API, **override priority** is:
+
+1. The function's explicit `overrides` dictionary
 2. `.ouroboros/mechanical.toml` in the project root
-3. Auto-detected language preset
-4. All `None` (all checks skip gracefully)
+3. All `None` (all checks skip gracefully)
 
-**TOML parse errors** are logged as a warning (`mechanical.toml_parse_error`) and silently ignored; the auto-detected preset commands are still used.
+Constructing `MechanicalConfig(...)` directly and passing it to `PipelineConfig` bypasses this merge entirely. Neither Python mechanism is an MCP request parameter: the MCP evaluation handler reads the repository TOML without supplying the builder's optional `overrides` argument.
 
-**Security: executable allowlist.** Commands in `.ouroboros/mechanical.toml` may only use executables from a built-in allowlist (e.g., `pytest`, `ruff`, `cargo`, `go`, `npm`, `make`). If a command specifies an executable not in the allowlist, it is silently blocked (logged as `mechanical.blocked_executable`) and the check is skipped. Hardcoded language presets bypass this check. This prevents untrusted repository configs from running arbitrary commands in CI/CD environments.
+**Command quoting.** After TOML decoding, commands are split into arguments, not executed as shell code. POSIX uses normal `shlex` quoting and escaping. On Windows, single or double quotes group an argument and are removed (`pytest -k "slow or fast"` passes one filter argument); backslashes in paths remain literal. Quoted flag values such as `--filter="two words"` and empty quoted arguments are supported. A backslash immediately before either quote character is rejected as ambiguous, including a quoted path's trailing backslash: omit the trailing separator or use forward slashes. This syntax is not a general cmd.exe or PowerShell parser. The detector and the config reader use the same argument splitting and retain the existing command validation rules.
+
+**TOML parse errors** are logged as a warning (`mechanical.toml_parse_error`) and silently ignored. There is no preset to fall back to, so every command stays `None` and Stage 1 skips all checks.
+
+**Security: executable allowlist.** Commands in `.ouroboros/mechanical.toml` may only use executables from a built-in allowlist (e.g., `pytest`, `ruff`, `cargo`, `go`, `npm`, `make`). If a command specifies an executable not in the allowlist — or uses shell operators or an absolute executable path — it is silently blocked (logged as `mechanical.blocked_executable`) and the check is skipped. Python `build_mechanical_config(..., overrides=...)` values still pass the shell-operator and executable-head allowlist/path parser, but skip the repository entry-point and argument-containment validation applied to TOML values. A directly constructed `MechanicalConfig` bypasses both parsers and is therefore trusted caller input. **Neither mechanism is an MCP request parameter**: the MCP evaluation path does not supply `overrides` or construct a privileged `MechanicalConfig`. This prevents untrusted repository configs from running arbitrary commands while keeping an explicit Python escape hatch.
 
 | Override failure mode | Symptom | Cause / Action |
 |---|---|---|
-| **TOML parse error** | Auto-detected preset used; no error raised | Malformed `.ouroboros/mechanical.toml`; check TOML syntax |
+| **TOML parse error** | All Stage 1 checks skipped; no error raised | Malformed `.ouroboros/mechanical.toml`; check TOML syntax |
 | **Blocked executable** | Check silently skipped | Executable not in allowlist; use an allowed tool or set the command in `MechanicalConfig` directly |
-| **Language not detected** | All Stage 1 checks skipped | No marker file found; add a `pyproject.toml` / `Cargo.toml` / etc., or set commands explicitly |
+| **Auto-detection failed** | All Stage 1 checks skipped | `run` and the MCP path author the toml automatically; an empty Stage 1 means that attempt failed (no LLM adapter, provider error, unwritable `.ouroboros/`). Fix the cause, or run `ouroboros detect` / set commands explicitly in `MechanicalConfig` |
+| **No toml present, detection bypassed** | All Stage 1 checks skipped | A caller drove the lower-level pipeline directly instead of `build_verification_artifacts()`; run `ouroboros detect`, or set commands explicitly in `MechanicalConfig` |
 
 ### Stage 1 Configuration
 
@@ -142,9 +161,23 @@ mechanical:
   coverage_command: ["pytest", "--cov=src", "--cov-report=term-missing", "tests/"]
 ```
 
-> **Important:** When using `ouroboros run`, commands are auto-detected from the project directory. All Stage 1 checks are silently skipped (and treated as passed) only when no marker file is found **and** no explicit commands are configured. Use `.ouroboros/mechanical.toml` or `MechanicalConfig` overrides to customize behavior.
+> **Important:** These fields are the programmatic escape hatch. In the normal `ouroboros run` path the commands come from `.ouroboros/mechanical.toml`, which that path authors for you when it is missing. Stage 1 skips every check when the file is absent **and** that automatic detection failed **and** no explicit commands are configured; the result is then unverified, never approved.
 
 ### Diagnosing Stage 1 Failures
+
+Multi-AC MCP evaluation runs Stage 1 once and shares that result across the ACs.
+The response starts with the shared mechanical report, before the AC checklist.
+Its additive `stage1_result` metadata contains `passed`, `coverage_score`, and
+`checks`; each check retains its type, verdict, message, and known diagnostic
+`details`. Background evaluation jobs persist this report and metadata for later
+retrieval. A shared build/test failure is not evidence that each AC's own tests ran.
+
+Diagnostics include the configured `command`, `working_dir`, and, when a launch
+was attempted, `executed_command` (the actual argument list). Exit codes and
+timeout flags are retained when available, together with the last 500 characters
+of stdout and stderr. Missing output is not reconstructed; environment variables
+and full logs are not newly collected. This reporting does not change approval
+decisions or rerun checks.
 
 Event query to inspect what happened:
 
@@ -157,6 +190,24 @@ Look for events of type `evaluation.stage1.completed`. The payload contains:
 - `checks`: list with `check_type`, `passed`, `message` for each check
 - `coverage_score`: numeric coverage if parsed
 - `failed_count`: number of failed checks
+
+### Windows Command Dispatch
+
+Keep validated commands such as `npm run build` in `.ouroboros/mechanical.toml`.
+At execution time, Windows bare executable names are resolved using absolute
+PATH entries and PATHEXT, so an installed `npm.CMD` can run without changing the
+configuration or enabling `shell=True`. This lookup does not prepend the current
+directory. Existing validation and non-Windows execution remain unchanged.
+
+Windows can interpret `.cmd`/`.bat` files even without `shell=True`. For those
+files only, the launcher explicitly rejects paths or arguments containing CMD
+metacharacters (`& | < > ^ % ! " ( )`), control characters, or a space-containing
+argument ending in a backslash. Ordinary spaces, Unicode and empty arguments are
+supported. Unsupported batch input is a failed check, not a skipped or successful
+check; use a native executable for arguments requiring these characters. Native
+executable arguments retain their existing behavior. A missing executable still
+produces a command-not-found failure. The existing policy for unconfigured or
+rejected TOML commands is not changed by this dispatch adaptation.
 
 ---
 
@@ -174,16 +225,35 @@ Stage 2 calls a Standard-tier LLM (default: `OUROBOROS_SEMANTIC_MODEL` / config 
 | `drift_score` | float | 0.0–1.0 | Deviation from seed intent (lower is better) |
 | `uncertainty` | float | 0.0–1.0 | Model's uncertainty about its own evaluation |
 | `reasoning` | string | — | Free-text explanation |
+| `reward_hacking_risk` | float | 0.0–1.0 | Suspicion that the artifact games the evaluator instead of solving the task. Distinct from `drift_score`, and vetoes approval at `>= 0.7` |
+| `questions_used` | list | — | Questions the evaluator asked while verifying the artifact — it has to show its work |
+| `evidence` | list | — | File snippets and observations the verdict relied on |
 
 ### Approval Logic
 
+Stage 2 is advisory. It never approves; it can only withhold an approval that executed Stage 1 evidence would otherwise grant.
+
 ```
-if ac_compliance == False  → REJECTED (Stage 3 not attempted)
-if score < 0.8             → REJECTED (unless Stage 3 is triggered and approves)
-if score >= 0.8 and no trigger → APPROVED
+if ac_compliance == False and not trigger_consensus  → withheld (Stage 3 not attempted)
+if ac_compliance == False and trigger_consensus      → withheld (Stage 3 runs as a reported second opinion)
+if score < 0.8                                       → withheld (a Stage 3 approval does not lift this)
+if reward_hacking_risk >= 0.7                        → withheld (veto)
+otherwise                                            → no objection; approval still requires executed Stage 1 evidence
 ```
 
-> The `satisfaction_threshold` (default `0.8`) is in `SemanticConfig`. Values between 0.0–1.0 are clamped after parsing; out-of-range model responses are corrected automatically.
+> **The score gate is hardcoded at `0.8`.** `SemanticConfig.satisfaction_threshold` (default `0.8`) exists and is validated, but the pipeline compares against a literal `0.8` and never reads the field. Changing it has no effect on approval today — do not rely on it to loosen or tighten the gate.
+
+> **`ac_compliance=False` with `trigger_consensus=True`.** The pipeline continues to the trigger matrix so Stage 3 can deliver a second opinion, whose votes and disagreements are reported. The Stage 2 withhold still stands: model review is advisory, so a consensus approval cannot overturn it.
+
+> Scores are clamped to 0.0–1.0 after parsing; out-of-range model responses are corrected automatically.
+
+### Reward-Hacking Veto
+
+The acceptance gate (`decide_final_approval()`) treats a Stage 2 `reward_hacking_risk >= 0.7` (`REWARD_HACKING_VETO_THRESHOLD`) as one of the model-review withholds: it blocks an approval that executed Stage 1 evidence would otherwise grant. The threshold is deliberately high so that mild suspicion never blocks a genuine pass.
+
+Like every model gate, the veto only withholds; it never rescues a rejected or unverified result.
+
+`failure_reason` names the first withholding gate in this order: Stage 3 rejection, Stage 2 AC non-compliance, Stage 2 score below `0.8`, then the veto (`model_review_withhold_reason()` in `evaluation/models.py`). So a vetoed result that also had `ac_compliance=False` reports the AC non-compliance. Read `stage2_result.reward_hacking_risk` directly when you need to know whether the veto fired.
 
 ### Stage 2 Failure Modes
 
@@ -201,10 +271,10 @@ if score >= 0.8 and no trigger → APPROVED
 ```yaml
 # In PipelineConfig.semantic (SemanticConfig)
 semantic:
-  model: "claude-3-5-sonnet-20241022"   # Standard tier model
+  model: null                            # null = resolve from OUROBOROS_SEMANTIC_MODEL / config
   temperature: 0.2                       # Low for consistency
   max_tokens: 2048                       # Response token budget
-  satisfaction_threshold: 0.8           # Minimum score to approve
+  satisfaction_threshold: 0.8           # Currently inert — the gate is hardcoded to 0.8
 ```
 
 ### Diagnosing Stage 2 Failures
@@ -218,10 +288,13 @@ If `ac_compliance` is `false` but `score` seems high, the LLM may have found a p
 
 ## Consensus Trigger Matrix (Stage 2 → Stage 3 Gate)
 
-After Stage 2 passes (`ac_compliance=True`, `score >= 0.8`), six trigger conditions are evaluated **in priority order**. The first matching condition triggers Stage 3. If none match, the artifact is approved immediately.
+After a **compliant** Stage 2 result (`ac_compliance=True`), trigger conditions are evaluated **in priority order**. The first matching condition triggers Stage 3. Whether or not Stage 3 runs, the acceptance gate then decides, and approval still requires executed Stage 1 evidence.
+
+Note the ordering: triggers are not gated on the score. The pipeline returns early only for `ac_compliance=False` without `trigger_consensus`. A compliant result scoring 0.7 with high drift still reaches Stage 3, but the Stage 2 score withhold stands even if Stage 3 approves.
 
 | Priority | Trigger | Condition |
 |----------|---------|-----------|
+| 0 | `manual_request` | `manual_consensus_request=True`, set from `trigger_consensus=true` on the evaluation context |
 | 1 | `seed_modification` | `seed_modified=True` in context |
 | 2 | `ontology_evolution` | `ontology_changed=True` in context |
 | 3 | `goal_interpretation` | `goal_reinterpreted=True` in context |
@@ -229,7 +302,11 @@ After Stage 2 passes (`ac_compliance=True`, `score >= 0.8`), six trigger conditi
 | 5 | `stage2_uncertainty` | `uncertainty > uncertainty_threshold` (default **0.3**) |
 | 6 | `lateral_thinking_adoption` | `lateral_thinking_adopted=True` in context |
 
+> **`manual_request` short-circuits everything.** It is checked before the other six, so asking for consensus explicitly always reaches Stage 3 regardless of drift, uncertainty, or Stage 2's verdict.
+
 > **Only the first matching trigger fires.** If drift is 0.5 and lateral thinking was also adopted, only `seed_drift_alert` (priority 4) is reported.
+
+> **Both threshold comparisons are strict (`>`).** A `drift_score` exactly equal to `drift_threshold` does not trigger Stage 3. When Stage 2 ran, its `drift_score` and `uncertainty` take precedence over any values pre-populated on the `TriggerContext`.
 
 ### Trigger Configuration
 
@@ -252,15 +329,55 @@ Raising these thresholds reduces Stage 3 cost but may allow low-confidence outpu
 
 ---
 
-## Stage 3: Multi-Model Consensus
+## Stage 3: Consensus (Multi-Model or Single-Model Fallback)
 
-Stage 3 calls multiple Frontier-tier models concurrently. Each votes independently; a **2/3 majority** is required for approval.
+Stage 3 is the consensus stage; its simple evaluator has two execution paths. The multi-model path may first filter the configured roster for reviewer independence, then launches the retained vote calls concurrently through the evaluator's one LLM adapter. It compares the approval ratio among the successfully collected votes with `majority_threshold` (default `0.66`) and errors when fewer than two votes succeed. Separate calls or model labels are not, by themselves, evidence of separate models, vendors, or backends. The fallback path queries the adapter's session model three times with different perspective prompts.
 
 ### Simple Consensus (Default)
 
-Three models are queried in parallel (default: `gpt-4o`, `claude-sonnet-4`, `gemini-2.5-pro`). Each returns `{ approved, confidence, reasoning }`.
+On the multi-model path, the configured roster is the starting point; reviewer-independence filtering may remove entries before the retained slots are queried in parallel through the same adapter. **How the default roster is resolved depends on the configured consensus-role backend**, and that setting need not match an adapter supplied independently by a direct API caller.
 
-**Approval rule:** `approving_votes / total_votes >= 0.66` (i.e., at least 2 of 3).
+**Roster-resolution priority.** `get_consensus_models()` first returns a non-empty `OUROBOROS_CONSENSUS_MODELS` list verbatim. Otherwise it reads `config.consensus.models`: a recognized shipped roster is normalized for the configured backend, while a genuinely custom roster is preserved. If config loading fails or has no roster, the shipped fallback is also normalized for the backend. Outside the sentinel set below, that backend-aware config/default resolution retains these shipped OpenRouter identifiers:
+
+```
+openrouter/openai/gpt-4o
+openrouter/anthropic/claude-opus-4.8
+openrouter/google/gemini-2.5-pro
+```
+
+**OpenRouter-routed adapters.** When the adapter already supplied to `ConsensusEvaluator` is LiteLLM/OpenRouter-capable and actually routes these provider-qualified identifiers, the one adapter can dispatch the three calls to three vendors. The roster alone neither selects that adapter nor attests that this routing occurred. `ConsensusConfig(models=None)` resolves `get_llm_backend_for_role("consensus")` and then `get_consensus_models()` at construction time (still subject to the environment-first priority above); it does not inspect the evaluator's adapter. Direct Python callers must keep the resolved roster and their `llm_adapter` aligned and verify actual transport/provider evidence.
+
+**Local adapters that still receive the OpenRouter roster.** `claude_code`, `gemini`, `goose`, and `ourocode` are not in `_SENTINEL_DEFAULT_BACKENDS`, so backend-aware default resolution can hand them the shipped OpenRouter strings. That does not switch adapters. Without an OpenRouter key, simple consensus sees the `openrouter/` entries and falls back to the session model. With a key present incidentally, it takes the multi-model code path but passes those strings through the local adapter, where they may be unsupported or resolve according to that adapter. Deliberative mode has no credential-based single-model fallback.
+
+In all three backend categories, an OpenRouter-looking roster or recorded requested-model label is not proof that three vendors voted.
+
+**Sentinel-model backends.** With no `OUROBOROS_CONSENSUS_MODELS` override, backend-aware config/default resolution maps a recognized shipped roster to the literal string `"default"` for all three slots when the backend is in `_SENTINEL_DEFAULT_BACKENDS` (`config/loader.py:101`, `:2028-2049`, `:2226-2245`). An environment roster or a non-shipped custom config roster is preserved verbatim instead. The sentinel set is Codex, **OpenCode**, Kiro, Copilot, Hermes, Pi, GJC, Antigravity, Grok, and Zcode.
+
+OpenCode is easy to miss here: it is not a separate member of the union, it rides in through `_CODEX_LLM_BACKENDS`, which is `frozenset({"codex", "codex_cli", "opencode", "opencode_cli"})` (`config/loader.py:76`). Therefore its shipped config/default roster normalizes to `("default", "default", "default")` under the same no-environment-override condition as Codex. The unrelated `_OPENCODE_BACKENDS` constant at `config/loader.py:113` is used for permission-mode resolution, not for model defaults.
+
+**Tier-alias backends.** On the Claude CLI family the automatic roster names the frontier alias in every slot (`("opus", "opus", "opus")`). When `ConsensusConfig(models=None)` resolves a roster with one distinct model for such a backend, `_should_use_multi_model()` selects the single-model perspective fallback below, so the three votes differ by perspective prompt rather than repeating one prompt. A pinned roster with distinct entries keeps the multi-model path.
+
+Otherwise, `_should_use_multi_model()` selects the code's `_evaluate_multi_model()` branch for any roster with no `openrouter/` entry, so `"default"` does **not** trigger the single-model perspective fallback below. The branch name does not prove model diversity: on these backends Stage 3 casts three votes labeled `default`, all from the one model that backend is configured to use.
+
+> **Auditing note.** Three votes labeled `default` are not three independent reviewers. If your consensus evidence shows that, the roster resolved to the sentinel and the votes came from one model.
+
+**Reviewer-independence filtering happens before model-profile resolution.** The multi-model path starts with the configured roster and, when `EvaluationContext.executor_backend` is present, passes those requested labels plus `available_runtime_backends()` to `resolve_reviewer_independence()`. Fewer than two distinct vendor families among the detected installed, runtime-capable backends makes filtering a no-op and reports `unavailable`. Otherwise, labels known to share the executor's vendor are removed only if at least two labels would remain. A label's vendor comes from the backend the roster was resolved for only when that backend runs a tier alias such as `opus`, which always names its own vendor's model (`opus` on Claude is Anthropic). A `"default"` label runs whatever the backend is configured to run, which may be another provider (OpenCode, or Codex with a custom provider), so it stays unknown; explicit backends (`litellm`, `copilot`), caller-supplied rosters and `"default"` labels fall back to reading the vendor from the model id. Unknown-vendor labels are retained, and if filtering would leave fewer than two voters the original roster is kept. The `evaluation.stage3.started` event and the concurrent vote-task list both use this post-filter roster.
+
+**Changing or filtering the roster does not change the adapter.** `ConsensusEvaluator` holds one `self._llm`; every retained vote goes through it.
+
+**Actual per-vote resolution chain.** After the reviewer filter, each retained entry becomes `CompletionConfig(model=entry, role="consensus_vote")`. The already-selected adapter then resolves `llm_role_profiles.consensus_vote` and the referenced `llm_profiles` entry for its own backend before dispatching the resulting effective model through that same adapter and transport. With `ConsensusConfig(models=None)`, `models_are_explicit` remains false even when the resolved roster came from `OUROBOROS_CONSENSUS_MODELS` or `config.consensus.models`; a `consensus_vote` profile model can therefore replace every retained entry, collapsing differently named slots onto one effective model. A direct caller that passes `ConsensusConfig(models=(...))` marks non-empty, non-`default` entries as request pins, but still sends all votes through the same adapter.
+
+Setting `OUROBOROS_CONSENSUS_MODELS` or `consensus.models` alone therefore does not replace the adapter or prove cross-vendor routing. An adapter that is already OpenRouter-capable may interpret provider-qualified strings and route the calls to those providers through that same adapter. A local CLI adapter instead receives the profile-resolved model as its own argument; an `openrouter/...` string does not switch the call to OpenRouter, so it may fail as unsupported or remain on that adapter under a different label.
+
+Cross-vendor independence requires the active LLM backend to be one that can actually reach those providers. Pick the roster to match the backend you are on, not the other way round, and verify effective dispatch plus transport/provider response evidence. Reviewer-independence classification is based on the pre-profile requested labels, while consensus parsing records each post-filter requested label in `Vote.model` rather than the provider-returned model. The labels, Stage 3 events, and `reviewer_independence` status are therefore classifications, not routing attestation.
+
+Each successful vote call returns `{ approved, confidence, reasoning }`.
+
+> **Stage 3 is advisory.** A consensus rejection withholds approval; a consensus approval grants nothing on its own. The pipeline result is approved only when executed Stage 1 evidence exists and no model stage withheld.
+
+**Consensus rule:** `approving_votes / successfully_collected_votes >= majority_threshold` (default `0.66`). The denominator is the successful responses from the post-filter roster, not the configured or pre-filter roster size. “Two of three” is only the common three-success example, not an invariant; see [Parallel Consensus Failure Tolerance](#parallel-consensus-failure-tolerance).
+
+> **Single-model fallback.** When the configured roster contains an `openrouter/*` entry but `OPENROUTER_API_KEY` is missing or still a `YOUR_…` placeholder, `ConsensusEvaluator` silently switches to a single-model mode: the session model is queried three times with the advocate, devil's advocate, and judge system prompts, and those perspectives vote. The same `majority_threshold` comparison is applied over the successfully collected perspective votes, and fewer than two successes is an error. The reviewers are the same vendor by construction, so reviewer independence is reported as unavailable. Stage 3 events carry `session/<perspective>` model names and a `single-model-perspectives:` trigger reason; check for those if Stage 3 looks cheaper than expected. The same mode also runs for an automatic single-model roster on a tier-alias backend (see Tier-alias backends above). Any other roster with no `openrouter/*` entry skips the credential check and uses the multi-model code path, still through the same adapter.
 
 ### Deliberative Consensus
 
@@ -274,10 +391,10 @@ An alternative two-round mode:
 
 | Failure mode | Symptom | Cause / Action |
 |---|---|---|
-| **Fewer than 2 votes collected** | `ValidationError: Not enough votes collected: N/3` | Multiple models returned API errors. Check API keys for all configured consensus models. At least 2 of 3 models must respond. |
-| **All models vote differently** | `majority_ratio` around 0.33–0.50 | Genuine disagreement. Inspect `disagreements` list in the event payload. Consider refining the AC or the artifact. |
-| **Majority ratio below threshold** | `Stage 3 failed: Consensus not reached (XX%)` | Less than 2/3 approval. The `disagreements` tuple in `ConsensusResult` contains dissenters' reasoning. |
-| **Individual model API error** | Logged but tolerated | One model fails; the remaining votes are used. If only 1 remains, a `ValidationError` is raised. |
+| **Fewer than 2 votes collected** | `ValidationError: Not enough votes collected: N/3` | Fewer than two post-filter vote calls succeeded. The `/3` text is hardcoded and may not equal the post-filter roster size; inspect `evaluation.stage3.started` for the labels actually queried. |
+| **Votes disagree** | `majority_ratio` around 0.33–0.50 | The collected calls disagreed. Inspect `disagreements` in the event payload; model labels alone do not establish independent reviewers. |
+| **Majority ratio below threshold** | `Stage 3 failed: Consensus not reached (XX%)` | The approval ratio among successfully collected post-filter votes is below `majority_threshold` (default `0.66`). The `disagreements` tuple in `ConsensusResult` contains dissenters' reasoning. |
+| **Individual vote-call error** | Logged but tolerated | One call fails; the remaining votes are used. If only 1 remains, a `ValidationError` is raised. |
 | **Deliberative: Advocate fails** | `ValidationError: Advocate failed: ...` | Advocate model API error. The error is not tolerated in deliberative mode — the entire Stage 3 fails. |
 | **Deliberative: Devil's Advocate LLM error** | Devil votes `approved=False` with low confidence | The `DevilAdvocateStrategy` handles LLM errors internally and returns `AnalysisResult.invalid` (soft failure) rather than propagating the error. A Devil LLM failure does **not** abort Stage 3; it results in the Devil casting a failing vote, which may cause the Judge to reject. |
 | **Deliberative: Judge fails** | `ProviderError` or `ValidationError` | Judge model error. Stage 3 fails. Deliberative mode has no partial-vote tolerance for the Judge. |
@@ -291,27 +408,31 @@ An alternative two-round mode:
 ```yaml
 # In PipelineConfig.consensus (ConsensusConfig)
 consensus:
+  # Requested model identifiers; all are sent through the one active adapter.
+  # Use this OpenRouter roster only when that adapter actually routes it.
   models:
-    - "gpt-4o"
-    - "claude-sonnet-4-20250514"
-    - "gemini/gemini-2.5-pro"
+    - "openrouter/openai/gpt-4o"
+    - "openrouter/anthropic/claude-opus-4.8"
+    - "openrouter/google/gemini-2.5-pro"
   temperature: 0.3
   max_tokens: 1024
-  majority_threshold: 0.66     # 2/3 majority
-  diversity_required: true     # Prefer models from different providers
+  majority_threshold: 0.66     # Approval ratio threshold over collected votes
+  diversity_required: true     # Currently inert — see note below
 ```
+
+> **`diversity_required` is not enforced.** The field exists on `ConsensusConfig` and in the config schema, but nothing reads it. Provider diversity depends on what the active adapter actually routes; neither this flag nor a roster of differently named models enforces it. If all names resolve through one vendor, setting `diversity_required: true` will not object.
 
 **Deliberative Consensus (`DeliberativeConfig`)**
 
-Used with `DeliberativeConsensus` (not `ConsensusEvaluator`). Each role uses a separate model:
+Used with `DeliberativeConsensus` (not `ConsensusEvaluator`). Each role has a separate requested model field, but all calls still use the one `llm_adapter` passed to `DeliberativeConsensus`; the configured names do not attest separate providers:
 
 ```python
 from ouroboros.evaluation.consensus import DeliberativeConfig, DeliberativeConsensus
 
 config = DeliberativeConfig(
-    advocate_model="claude-sonnet-4-20250514",   # Advocate role
-    devil_model="claude-sonnet-4-20250514",       # Devil's Advocate (ontological analysis)
-    judge_model="gpt-4o",                         # Final judgment
+    advocate_model="openrouter/anthropic/claude-opus-4.8",  # Advocate role
+    devil_model="openrouter/openai/gpt-4o",                 # Devil's Advocate (ontological analysis)
+    judge_model="openrouter/google/gemini-2.5-pro",         # Final judgment
     temperature=0.3,
     max_tokens=2048,
 )
@@ -334,27 +455,29 @@ Look for event `evaluation.stage3.completed`. Key fields:
 
 ## Artifact Collection
 
-Before Stage 2 runs, the `ArtifactCollector` attempts to read the actual source files changed during execution. This gives the semantic evaluator real code rather than just agent text summaries.
+The MCP evaluation paths run `ArtifactCollector` before Stage 2 and attach its result to `EvaluationContext`. Direct `EvaluationPipeline` callers must collect and supply an `artifact_bundle` themselves; the pipeline does not instantiate the collector. When `artifact_bundle.files` is non-empty, the semantic prompt uses those files and does not inline `EvaluationContext.artifact`; when no files are available, it falls back to the full `EvaluationContext.artifact` text. `ArtifactBundle.text_summary` is retained for compatibility but is not read directly by the semantic prompt builder.
 
 ### Collection Limits
 
 | Limit | Value | Effect when exceeded |
 |-------|-------|---------------------|
-| Max files | 30 | Files beyond 30th are silently skipped |
-| Max file size | 50 KB | Files larger than 50 KB are silently skipped |
-| Max total content | 150,000 chars (~37K tokens) | Files are truncated at budget; `FileArtifact.truncated=True` |
+| Max file size (`MAX_FILE_SIZE`) | 100 KB | Files larger than 100 KB are silently skipped |
+| Max collected file content (`MAX_TOTAL_CHARS`) | 150,000 chars (~37K tokens) | The aggregate `FileArtifact.content` budget is shared across files; the last included file is truncated to the remaining budget and marked `FileArtifact.truncated=True` |
 
-> Files that exceed the per-file size limit are **skipped entirely** (not truncated). If a critical file is always skipped, check whether it is a generated binary or minified output that should be excluded from evaluation.
+There is **no explicit cap on the number of files**. File collection is bounded by both the 100 KB per-file limit and the 150,000-character aggregate file-content budget. `ArtifactBundle.text_summary` is stored separately and is not charged to `MAX_TOTAL_CHARS`, so 150,000 characters is not a cap on the whole bundle or eventual prompt.
+
+> The two limits behave differently. A file over the per-file size limit is **skipped entirely** (never truncated); a file that only exhausts the shared character budget is **truncated** and marked `truncated=True`. If a critical file is always missing, check whether it is a generated binary or minified output that should be excluded from evaluation.
 
 ### Artifact Collection Failure Modes
 
 | Failure mode | Symptom | Cause / Action |
 |---|---|---|
-| **project_dir not set** | Evaluation uses only text summary | `ArtifactBundle` built without file content; semantic evaluator falls back to agent text output. Set `project_dir` in the execution context. |
-| **No file paths extracted** | Same as above | Execution output did not contain recognizable `Write:` / `Edit:` / `file_path:` patterns. The fallback is the text summary. |
+| **`project_dir` not passed to the collector** | Semantic prompt falls back to `EvaluationContext.artifact` | `collect()` returns an `ArtifactBundle` with `text_summary` and no files. MCP paths normally resolve and pass a working directory; direct callers must pass their project root. |
+| **No file paths extracted** | Collector scans the project directory | If execution output has no recognizable `Write:` / `Edit:` / `file_path:` paths, `_scan_directory()` falls back to eligible files under `project_dir`, newest first, subject to directory, sensitive-file, size, and aggregate-budget filters (`evaluation/artifact_collector.py:197-201`). |
+| **Directory fallback finds no eligible files** | Semantic prompt falls back to `EvaluationContext.artifact` | The project root is empty, inaccessible, or all files are excluded; the bundle still retains `text_summary`, but prompt fallback reads the context's `artifact` field. |
 | **Path traversal blocked** | File silently skipped | File path resolves outside `project_dir`. This is a security boundary, not a bug. |
 | **Permission error** | File silently skipped | Execution ran as a different user. Verify file permissions. |
-| **Large files skipped** | Missing context in evaluation | File > 50 KB. Refactor to split large files, or accept that the evaluator works from the text summary. |
+| **Large files skipped** | That file is absent from the file-based semantic prompt | Files > 100 KB are skipped. If other eligible collected files remain, Stage 2 evaluates those files; if no files remain, the prompt inlines `EvaluationContext.artifact`. It does not read `ArtifactBundle.text_summary` directly. |
 
 ---
 
@@ -366,7 +489,8 @@ Ouroboros distinguishes between **failures** (the artifact does not meet criteri
 
 | Outcome | Type | What happens |
 |---------|------|-------------|
-| Stage 1 check fails | Failure | `EvaluationResult.final_approved=False`, `failure_reason` set |
+| Stage 1 check fails | Failure | `EvaluationResult.final_approved=False`, `acceptance_state="rejected"`, `failure_reason` set |
+| No executed Stage 1 check (Stage 1 disabled, or every check skipped) | Unverified | `final_approved=False`, `acceptance_state="unverified"`; `failure_reason` starts `Not approved: unverified.` and appends the model review |
 | Stage 2 AC non-compliance | Failure | Same — `EvaluationResult.final_approved=False` |
 | Stage 3 minority vote | Failure | Same — `EvaluationResult.final_approved=False` |
 | LLM API error (Stage 2/3) | Error | `Result.err(ProviderError)` propagated up — the runner receives the error, not a failed result |
@@ -389,9 +513,11 @@ config = PipelineConfig(stage1_enabled=False)
 config = PipelineConfig(stage3_enabled=False)
 ```
 
-> **Warning:** Disabling Stage 1 means that broken code can pass through to semantic evaluation. Disabling Stage 3 means that high-drift or high-uncertainty outputs will never be submitted to multi-model review.
+These are direct-Python runtime controls. The same-named top-level `evaluation.stage1_enabled`, `stage2_enabled`, and `stage3_enabled` keys in `~/.ouroboros/config.yaml` are currently schema-validated but are not copied into `PipelineConfig` by runtime builders. Likewise, top-level `evaluation.uncertainty_threshold` does not populate `TriggerConfig.uncertainty_threshold`.
 
-> **Stage 2 disabled → Stage 3 implicitly disabled.** Stage 3 runs only when a `TriggerContext` is available. When `stage2_enabled=False`, the pipeline never builds a `TriggerContext`, so Stage 3 will not run even if `stage3_enabled=True` and no external `trigger_context` is passed in. To use Stage 3 without Stage 2, pass a pre-populated `TriggerContext` explicitly to `EvaluationPipeline.evaluate()`.
+> **Warning:** Disabling Stage 1 removes the only source of executed evidence, so every result is unverified and none can be approved; Stage 2 still runs and its review is returned as feedback. Disabling Stage 3 means that high-drift or high-uncertainty outputs will never be submitted to multi-model review.
+
+> **Stage 2 disabled does not disable Stage 3.** The trigger context is built outside the Stage 2 block precisely so that `trigger_consensus=True` still works when `stage2_enabled=False` — it fires the `manual_request` trigger and Stage 3 runs on its own. What does silently disable Stage 3 is the combination of `stage2_enabled=False`, `trigger_consensus=False`, and no external `trigger_context`: every trigger field is left at its default, so nothing matches. To reach Stage 3 without Stage 2, either set `trigger_consensus=True` or pass a pre-populated `TriggerContext` to `EvaluationPipeline.evaluate()`.
 
 ### Failure Reason Lookup
 
@@ -400,10 +526,12 @@ config = PipelineConfig(stage3_enabled=False)
 | Condition | `failure_reason` value |
 |-----------|------------------------|
 | Stage 1 failed | `"Stage 1 failed: lint, test"` (comma-separated failed check names) |
-| Stage 2 AC non-compliance (`ac_compliance=False`) | `"Stage 2 failed: AC non-compliance (score=0.62)"` |
-| Stage 2 score below threshold (`ac_compliance=True` but `score < 0.8`) | `"Unknown failure"` — the score check runs after Stage 2 but the `failure_reason` property only tests `ac_compliance`. Inspect `stage2_result.score` directly to distinguish this case. |
+| No executed Stage 1 check | `"Not approved: unverified. No executed verification evidence (Stage 1 did not run)."` or `(... Stage 1 ran no configured check).`, followed by `Advisory model review also withheld approval: <gate>` or `Advisory model review raised no objection, but cannot grant acceptance.` |
+| Stage 2 AC non-compliance (`ac_compliance=False`) | `"Stage 2 failed: AC non-compliance (ac_compliance=false; semantic score 0.62 did not gate this)"` |
+| Stage 2 score below threshold (`ac_compliance=True` but `score < 0.8`) | `"Stage 2 failed: semantic score 0.72 < 0.80 (ac_compliance=true; the score gate decided this)"` |
 | Stage 3 consensus not reached | `"Stage 3 failed: Consensus not reached (44%)"` |
-| All stages passed/skipped but `final_approved=False` | `"Unknown failure"` |
+| Reward-hacking veto (`reward_hacking_risk >= 0.7`) | A message naming the risk score and the 0.70 threshold, **as long as no earlier model gate withheld**. The order is Stage 3, Stage 2 AC non-compliance, Stage 2 score, then the veto. Read `stage2_result.reward_hacking_risk` to be sure. |
+| Executed checks passed, no model gate withheld, but `final_approved=False` | `"Unknown failure"` (only reachable for a hand-built `EvaluationResult`) |
 
 ---
 
@@ -427,11 +555,11 @@ In deliberative consensus, the Judge can return `conditional`. This means the Ju
 
 ### Coverage Score Parsing
 
-Stage 1 parses coverage from `pytest-cov` output by looking for the pattern `TOTAL  N  N  XX%` or `Coverage: XX%`. If your coverage tool outputs a different format, the `coverage_score` will be `None` and the coverage check will pass even if coverage is zero. Configure a compatible coverage command or check the event payload's `coverage_score` field to verify parsing worked.
+Stage 1 parses complete measurement rows in the form `TOTAL  N  N  XX%` or `Coverage: XX%`. Requirements such as `Coverage: 70% required`, malformed rows, conflicting measurements, and unsupported formats do not establish coverage. With an enabled threshold, a successful command without a readable measurement leaves `coverage_score` as `None` and acceptance unverified. A measured value below the threshold is an executed failure. At `coverage_threshold=0.0`, the threshold is disabled: a successful command can pass without a score, but a nonzero exit or another failed check still rejects the artifact. Configure a compatible coverage command and inspect the event payload's `coverage_score` to confirm a measurement was recorded.
 
 ### Parallel Consensus Failure Tolerance
 
-In **simple consensus**, individual model failures are tolerated as long as at least 2 models respond successfully. The `majority_ratio` is calculated over only the collected votes (`approving / len(votes)`), not over the configured number of models. This means:
+In **simple consensus**, the reviewer-independence filter runs first, and individual model failures are then tolerated as long as at least two retained models respond successfully. The `majority_ratio` is calculated over only those successful post-filter votes (`approving / len(votes)`), not over the configured or pre-filter number of models. This means:
 - 2 models respond, 1 approves → `majority_ratio = 0.5` → **rejected** (below 0.66)
 - 2 models respond, both approve → `majority_ratio = 1.0` → **approved**
 
@@ -468,19 +596,32 @@ config = PipelineConfig(
 
     # Stage 2: Semantic evaluation
     semantic=SemanticConfig(
-        model="claude-3-5-sonnet-20241022",
+        model=None,                  # None = resolved from the semantic_evaluation role
         temperature=0.2,
         max_tokens=2048,
-        satisfaction_threshold=0.8,  # Minimum score for approval
+        satisfaction_threshold=0.8,  # Currently inert — the gate is hardcoded to 0.8
     ),
 
     # Stage 3: Simple consensus evaluation
+    #
+    # models=None resolves a roster when ConsensusConfig is constructed. It first
+    # honors OUROBOROS_CONSENSUS_MODELS verbatim; otherwise the configured
+    # `consensus` role backend normalizes the shipped config/default roster:
+    # sentinel backends get ("default",) * 3, while non-sentinel backends retain
+    # the OpenRouter roster. Non-sentinel does not mean OpenRouter-routed — all
+    # votes still use the one adapter later supplied to ConsensusEvaluator.
+    # Direct callers must align the roster with that adapter.
     consensus=ConsensusConfig(
-        models=("gpt-4o", "claude-sonnet-4-20250514", "gemini/gemini-2.5-pro"),
+        models=None,  # or, only when the active adapter routes these identifiers:
+        # models=(
+        #     "openrouter/openai/gpt-4o",
+        #     "openrouter/anthropic/claude-opus-4.8",
+        #     "openrouter/google/gemini-2.5-pro",
+        # ),
         temperature=0.3,
         max_tokens=1024,
-        majority_threshold=0.66,     # 2/3 majority required
-        diversity_required=True,
+        majority_threshold=0.66,     # Compared with collected-vote approval ratio
+        diversity_required=True,     # Currently inert
     ),
 
     # Consensus trigger thresholds
@@ -497,9 +638,9 @@ For deliberative consensus (separate from `EvaluationPipeline`):
 from ouroboros.evaluation.consensus import DeliberativeConfig, DeliberativeConsensus
 
 deliberative_config = DeliberativeConfig(
-    advocate_model="claude-sonnet-4-20250514",  # Advocate role
-    devil_model="claude-sonnet-4-20250514",      # Devil's Advocate (ontological analysis)
-    judge_model="gpt-4o",                        # Final judgment
+    advocate_model="openrouter/anthropic/claude-opus-4.8",  # Advocate role
+    devil_model="openrouter/openai/gpt-4o",                 # Devil's Advocate (ontological analysis)
+    judge_model="openrouter/google/gemini-2.5-pro",         # Final judgment
     temperature=0.3,
     max_tokens=2048,
 )

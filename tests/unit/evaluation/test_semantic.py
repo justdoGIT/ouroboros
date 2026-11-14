@@ -1,10 +1,11 @@
 """Tests for Stage 2 semantic evaluation."""
 
+import json
 from unittest.mock import AsyncMock
 
 import pytest
 
-from ouroboros.core.errors import ProviderError
+from ouroboros.core.errors import ProviderError, ValidationError
 from ouroboros.core.types import Result
 from ouroboros.evaluation.models import ArtifactBundle, EvaluationContext, FileArtifact
 from ouroboros.evaluation.semantic import (
@@ -103,9 +104,118 @@ class TestBuildEvaluationPrompt:
         assert "## Artifact Content" not in prompt
         assert "inline artifact text that should not be duplicated" not in prompt
 
+    def test_spec_with_contract_renders_contract_block(self) -> None:
+        """A spec-carrying AC renders the DECLARED SUCCESS CONTRACT block (PR-H)."""
+        from ouroboros.core.seed import AcceptanceCriterionSpec
+
+        context = EvaluationContext(
+            execution_id="exec-1",
+            seed_id="seed-1",
+            current_ac="CLI prints the version",
+            artifact="print('1.2.3')",
+            current_ac_spec=AcceptanceCriterionSpec(
+                description="CLI prints the version",
+                verify_command="mytool --version",
+                verify_cwd="app",
+                expected_artifacts=("mytool",),
+                output_assertion="stdout equals 1.2.3",
+            ),
+        )
+        prompt = build_evaluation_prompt(context)
+
+        assert "DECLARED SUCCESS CONTRACT" in prompt
+        assert "verify_command: mytool --version" in prompt
+        assert "verify_cwd: app" in prompt
+        assert "expected_artifacts: mytool" in prompt
+        assert "output_assertion: stdout equals 1.2.3" in prompt
+        assert "The AC passes ONLY if the artifact demonstrates the declared contract" in prompt
+        assert "Cite the evidence line." in prompt
+
+    def test_bare_spec_without_contract_renders_no_contract_block(self) -> None:
+        """A description-only spec (no contract) leaves the prompt unchanged."""
+        from ouroboros.core.seed import AcceptanceCriterionSpec
+
+        context = EvaluationContext(
+            execution_id="exec-1",
+            seed_id="seed-1",
+            current_ac="User can login",
+            artifact="def login(): pass",
+            current_ac_spec=AcceptanceCriterionSpec(description="User can login"),
+        )
+        prompt = build_evaluation_prompt(context)
+
+        assert "DECLARED SUCCESS CONTRACT" not in prompt
+        assert "User can login" in prompt
+
+    def test_no_spec_renders_no_contract_block(self) -> None:
+        """When current_ac_spec is None the prompt has no contract block."""
+        context = EvaluationContext(
+            execution_id="exec-1",
+            seed_id="seed-1",
+            current_ac="User can login",
+            artifact="def login(): pass",
+        )
+        prompt = build_evaluation_prompt(context)
+
+        assert "DECLARED SUCCESS CONTRACT" not in prompt
+
 
 class TestParseSemanticResponse:
     """Tests for response parsing."""
+
+    @pytest.mark.parametrize("ac_compliance", [True, False])
+    def test_preserves_boolean_compliance(self, ac_compliance: bool) -> None:
+        response = json.dumps(
+            {
+                "score": 0.95,
+                "ac_compliance": ac_compliance,
+                "goal_alignment": 0.9,
+                "drift_score": 0.0,
+                "uncertainty": 0.05,
+                "reasoning": "Compliance must preserve the reported boolean",
+            }
+        )
+
+        result = parse_semantic_response(response)
+
+        assert result.is_ok
+        assert result.value.ac_compliance is ac_compliance
+
+    @pytest.mark.parametrize(
+        "ac_compliance",
+        ["false", "true", "", 0, 1, 0.0, 1.0, None, [], [False], {}, {"value": False}],
+        ids=[
+            "string-false",
+            "string-true",
+            "empty-string",
+            "integer-zero",
+            "integer-one",
+            "float-zero",
+            "float-one",
+            "null",
+            "empty-array",
+            "nonempty-array",
+            "empty-object",
+            "nonempty-object",
+        ],
+    )
+    def test_rejects_non_boolean_compliance(self, ac_compliance: object) -> None:
+        response = json.dumps(
+            {
+                "score": 0.95,
+                "ac_compliance": ac_compliance,
+                "goal_alignment": 0.9,
+                "drift_score": 0.0,
+                "uncertainty": 0.05,
+                "reasoning": "A malformed approval must be a validation error",
+            }
+        )
+
+        result = parse_semantic_response(response)
+
+        assert result.is_err
+        assert isinstance(result.error, ValidationError)
+        assert result.error.field == "ac_compliance"
 
     def test_valid_json_response(self) -> None:
         """Parse valid JSON response."""
@@ -129,6 +239,27 @@ class TestParseSemanticResponse:
         assert semantic.uncertainty == 0.2
         assert semantic.reasoning == "Good implementation"
         assert semantic.reward_hacking_risk == 0.05
+
+    def test_tab_indented_pretty_raw_response(self) -> None:
+        response = json.dumps(
+            {
+                "score": 0.85,
+                "ac_compliance": True,
+                "goal_alignment": 0.9,
+                "drift_score": 0.1,
+                "uncertainty": 0.2,
+                "reasoning": "Pretty response remains intact",
+                "reward_hacking_risk": 0.05,
+                "evidence": ["nested array survives"],
+            },
+            indent="\t",
+        )
+
+        result = parse_semantic_response(response)
+
+        assert result.is_ok
+        assert result.value.reasoning == "Pretty response remains intact"
+        assert result.value.evidence == ("nested array survives",)
 
     def test_json_with_surrounding_text(self) -> None:
         """Parse JSON embedded in text."""
@@ -406,6 +537,8 @@ class TestSemanticEvaluator:
         schema = config.response_format["json_schema"]
         assert "score" in schema["required"]
         assert "ac_compliance" in schema["required"]
+        assert config.role == "semantic_evaluation"
+        assert config.model_is_explicit is False
 
     @pytest.mark.asyncio
     async def test_evaluate_llm_error(

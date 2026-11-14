@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import stat
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from ouroboros.bigbang.ambiguity import (
+    AmbiguityScore,
+    ComponentScore,
+    ScoreBreakdown,
+)
 from ouroboros.bigbang.interview import InterviewRound, InterviewState
-from ouroboros.bigbang.pm_interview import PMInterviewEngine
+from ouroboros.bigbang.pm_interview import PMInterviewEngine, PMInterviewTurnPlan
 from ouroboros.bigbang.question_classifier import (
     ClassificationResult,
     ClassifierOutputType,
@@ -17,6 +24,7 @@ from ouroboros.bigbang.question_classifier import (
 from ouroboros.core.types import Result
 from ouroboros.mcp.tools.pm_handler import (
     _DATA_DIR,
+    PM_UNCERTAINTY_GUIDANCE,
     PMInterviewHandler,
     _check_completion,
     _compute_deferred_diff,
@@ -59,6 +67,10 @@ def _make_engine_stub(
         deferred_items=list(deferred or []),
         decide_later_items=list(decide_later or []),
     )
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(os.stat(path).st_mode)
 
 
 def _make_state(
@@ -237,9 +249,17 @@ class TestPrdMetaFileLocation:
     alongside interview state files (AC 6)."""
 
     def test_default_data_dir_is_ouroboros_data(self) -> None:
-        """_DATA_DIR points to ~/.ouroboros/data/."""
-        expected = Path.home() / ".ouroboros" / "data"
-        assert expected == _DATA_DIR
+        """_DATA_DIR points to ``<home>/.ouroboros/data/``.
+
+        ``_DATA_DIR`` is a module-level constant captured at import time. conftest
+        redirects ``$HOME`` to a throwaway session home *before* collection, so
+        the constant is captured under that isolated home — never the developer's
+        real ``~``. Assert exactly that, which also proves the pre-collection
+        isolation held (the live per-test ``Path.home()`` differs, so we compare
+        against the recorded session home rather than it).
+        """
+        session_home = Path(os.environ["_OUROBOROS_TEST_SESSION_HOME"])
+        assert session_home / ".ouroboros" / "data" == _DATA_DIR
 
     def test_meta_path_uses_session_id_in_filename(self) -> None:
         """_meta_path produces pm_meta_{session_id}.json naming."""
@@ -289,6 +309,71 @@ class TestPrdMetaFileLocation:
         meta = _load_pm_meta("sess-nested", data_dir=nested_dir)
         assert meta is not None
 
+    def test_save_meta_is_owner_only_and_preserves_supplied_directory_mode(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Caller-supplied pm_meta directories keep their mode; meta files do not."""
+        previous_umask = os.umask(0o022)
+        try:
+            data_dir = tmp_path / "shared-data"
+            data_dir.mkdir(mode=0o755)
+            os.chmod(data_dir, 0o755)
+
+            _save_pm_meta("sess-owner", _make_engine_stub(), data_dir=data_dir)
+        finally:
+            os.umask(previous_umask)
+
+        assert _mode(data_dir) == 0o755
+        assert _mode(_meta_path("sess-owner", data_dir)) == 0o600
+
+    def test_save_meta_write_failure_propagates_without_leftover_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PM meta persistence keeps the owner-only writer's failure contract."""
+        import ouroboros.mcp.tools.pm_handler as pmh
+
+        def _fail_write(*_args: object, **_kwargs: object) -> bool:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(pmh, "write_owner_only", _fail_write)
+
+        with pytest.raises(OSError, match="disk full"):
+            _save_pm_meta("sess-fail", _make_engine_stub(), data_dir=tmp_path)
+
+        assert not _meta_path("sess-fail", tmp_path).exists()
+
+    def test_save_meta_logs_unconfirmed_durability(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The helper returns None, so an unconfirmed durable write is logged."""
+        import ouroboros.mcp.tools.pm_handler as pmh
+
+        warnings: list[tuple[str, dict[str, object]]] = []
+
+        monkeypatch.setattr(pmh, "write_owner_only", lambda *_args, **_kwargs: False)
+        monkeypatch.setattr(
+            pmh.log,
+            "warning",
+            lambda event, **kwargs: warnings.append((event, kwargs)),
+        )
+
+        _save_pm_meta("sess-uncertain", _make_engine_stub(), data_dir=tmp_path)
+
+        assert warnings == [
+            (
+                "pm_handler.meta_save_durability_unconfirmed",
+                {
+                    "session_id": "sess-uncertain",
+                    "path": str(_meta_path("sess-uncertain", tmp_path)),
+                },
+            )
+        ]
+
     def test_meta_file_has_expected_fields(self, tmp_path: Path) -> None:
         """pm_meta JSON contains all required fields."""
         engine = _make_engine_stub(deferred=["d1"], decide_later=["dl1"])
@@ -304,6 +389,7 @@ class TestPrdMetaFileLocation:
             "decide_later_items",
             "codebase_context",
             "pending_reframe",
+            "pending_reframes",
             "cwd",
             "brownfield_repos",
             "classifications",
@@ -549,7 +635,11 @@ class TestGetEngine:
         """When no engine is injected, creates one via create_llm_adapter factory."""
         with (
             patch("ouroboros.mcp.tools.pm_handler.create_llm_adapter") as mock_create,
-            patch("ouroboros.mcp.tools.pm_handler.get_clarification_model") as mock_model,
+            patch(
+                "ouroboros.mcp.tools.pm_handler.get_llm_backend_for_role",
+                return_value="claude",
+            ),
+            patch("ouroboros.mcp.tools.pm_handler.get_llm_model_for_role") as mock_model,
             patch("ouroboros.mcp.tools.pm_handler.PMInterviewEngine") as mock_engine_cls,
         ):
             mock_adapter = MagicMock()
@@ -561,21 +651,71 @@ class TestGetEngine:
             handler._get_engine()
 
             mock_create.assert_called_once_with(
-                backend=None,
+                backend="claude",
                 max_turns=1,
                 use_case="interview",
                 allowed_tools=[],
+                strict_mcp_config=True,
             )
             mock_engine_cls.create.assert_called_once()
             call_kwargs = mock_engine_cls.create.call_args
             assert call_kwargs.kwargs["llm_adapter"] is mock_adapter
             assert call_kwargs.kwargs["model"] == "claude-opus-4-6"
 
+    def test_omits_tool_envelope_for_hermes_backend(self) -> None:
+        """Hermes is interview-capable but does not expose auditable tool envelopes."""
+        with (
+            patch("ouroboros.mcp.tools.pm_handler.create_llm_adapter") as mock_create,
+            patch("ouroboros.mcp.tools.pm_handler.get_llm_model_for_role") as mock_model,
+            patch("ouroboros.mcp.tools.pm_handler.PMInterviewEngine") as mock_engine_cls,
+        ):
+            mock_create.return_value = MagicMock()
+            mock_model.return_value = "default"
+            mock_engine_cls.create.return_value = MagicMock()
+
+            handler = PMInterviewHandler(llm_backend="hermes")
+            handler._get_engine()
+
+            mock_create.assert_called_once_with(
+                backend="hermes",
+                max_turns=1,
+                use_case="interview",
+                allowed_tools=None,
+                strict_mcp_config=True,
+            )
+
+    def test_omits_tool_envelope_for_configured_hermes_backend(self) -> None:
+        """Default-configured Hermes also omits unsupported interview envelopes."""
+        with (
+            patch("ouroboros.mcp.tools.pm_handler.create_llm_adapter") as mock_create,
+            patch(
+                "ouroboros.mcp.tools.pm_handler.get_llm_backend_for_role",
+                return_value="hermes",
+            ),
+            patch("ouroboros.mcp.tools.pm_handler.get_llm_model_for_role") as mock_model,
+            patch("ouroboros.mcp.tools.pm_handler.PMInterviewEngine") as mock_engine_cls,
+            patch("ouroboros.mcp.tools.pm_handler.resolve_llm_backend", return_value="hermes"),
+        ):
+            mock_create.return_value = MagicMock()
+            mock_model.return_value = "default"
+            mock_engine_cls.create.return_value = MagicMock()
+
+            handler = PMInterviewHandler()
+            handler._get_engine()
+
+            mock_create.assert_called_once_with(
+                backend="hermes",
+                max_turns=1,
+                use_case="interview",
+                allowed_tools=None,
+                strict_mcp_config=True,
+            )
+
     def test_uses_custom_data_dir(self, tmp_path: Path) -> None:
         """When data_dir is set, passes it to PMInterviewEngine.create."""
         with (
             patch("ouroboros.mcp.tools.pm_handler.create_llm_adapter"),
-            patch("ouroboros.mcp.tools.pm_handler.get_clarification_model", return_value="m"),
+            patch("ouroboros.mcp.tools.pm_handler.get_llm_model_for_role", return_value="m"),
             patch("ouroboros.mcp.tools.pm_handler.PMInterviewEngine") as mock_engine_cls,
         ):
             mock_engine_cls.create.return_value = MagicMock()
@@ -585,6 +725,26 @@ class TestGetEngine:
 
             call_kwargs = mock_engine_cls.create.call_args
             assert call_kwargs.kwargs["state_dir"] == tmp_path
+
+    @pytest.mark.asyncio
+    async def test_start_response_places_uncertainty_guidance_before_question(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """MCP start response must show PM uncertainty guidance before question text."""
+        engine = _make_engine_stub()
+        state = _make_state(interview_id="pm_guidance")
+        engine.ask_opening_and_start = AsyncMock(return_value=Result.ok(state))
+        engine.ask_next_question = AsyncMock(return_value=Result.ok("What should we build first?"))
+        engine.save_state = AsyncMock(return_value=Result.ok(tmp_path / "pm_guidance.json"))
+        handler = PMInterviewHandler(pm_engine=engine, data_dir=tmp_path)
+
+        result = await handler.handle({"initial_context": "Build a launch checklist"})
+
+        assert result.is_ok
+        text = result.value.text_content
+        assert PM_UNCERTAINTY_GUIDANCE in text
+        assert text.index(PM_UNCERTAINTY_GUIDANCE) < text.index("What should we build first?")
 
 
 # ── Action auto-detection tests (AC 13) ───────────────────────
@@ -729,3 +889,266 @@ class TestDetectAction:
             }
         )
         assert result == "start"
+
+
+class TestSelectReposSessionContinuity:
+    """Regression coverage for the in-process 2-step PM start flow."""
+
+    async def test_select_repos_continues_existing_session_id(self, tmp_path: Path) -> None:
+        """Step 2 must start the interview under the session created in step 1."""
+        session_id = "interview_existing_session"
+        _save_pm_meta(
+            session_id,
+            engine=None,
+            cwd="/tmp/project",
+            data_dir=tmp_path,
+            extra={"initial_context": "Build a planning app"},
+        )
+
+        engine = _make_engine_stub()
+        engine.ask_opening_and_start = AsyncMock(return_value=Result.ok(_make_state(session_id)))
+        engine.ask_next_question = AsyncMock(return_value=Result.ok("What should it do first?"))
+        engine.save_state = AsyncMock(return_value=Result.ok(None))
+
+        handler = PMInterviewHandler(pm_engine=engine, data_dir=tmp_path)
+        result = await handler._handle_select_repos(
+            engine,
+            selected_repos=[],
+            session_id=session_id,
+            initial_context=None,
+            cwd="/tmp/project",
+        )
+
+        assert result.is_ok
+        engine.ask_opening_and_start.assert_awaited_once_with(
+            user_response="Build a planning app",
+            interview_id=session_id,
+            brownfield_repos=None,
+        )
+        assert result.value.meta["session_id"] == session_id
+
+
+@pytest.mark.asyncio
+async def test_atomic_pm_failure_returns_recoverable_session_envelope(tmp_path: Path) -> None:
+    from ouroboros.core.errors import ProviderError
+
+    engine = PMInterviewEngine.create(
+        llm_adapter=MagicMock(),
+        model="test-model",
+        state_dir=tmp_path,
+    )
+    state = InterviewState(
+        interview_id="pm_atomic_failure",
+        initial_context="Build a planning workflow",
+        rounds=[
+            InterviewRound(round_number=1, question="Q1", user_response="A1"),
+            InterviewRound(round_number=2, question="Q2", user_response="A2"),
+            InterviewRound(round_number=3, question="Q3", user_response="A3"),
+        ],
+    )
+    assert (await engine.save_state(state)).is_ok
+    engine.plan_next_turn = AsyncMock(return_value=Result.err(ProviderError("empty response")))
+    handler = PMInterviewHandler(pm_engine=engine, data_dir=tmp_path)
+
+    result = await handler.handle(
+        {
+            "session_id": state.interview_id,
+            "answer": "A4",
+            "last_question": "Q4",
+            "cwd": str(tmp_path),
+        }
+    )
+
+    assert result.is_ok
+    assert result.value.is_error is True
+    assert result.value.meta == {"session_id": state.interview_id, "recoverable": True}
+    reloaded = (await engine.load_state(state.interview_id)).value
+    assert reloaded.rounds[-1].user_response == "A4"
+    assert "Resume with" in result.value.text_content
+
+
+@pytest.mark.asyncio
+async def test_legacy_pm_engine_checks_completion_before_asking_question(
+    tmp_path: Path,
+) -> None:
+    from ouroboros.core.errors import ProviderError
+
+    state = InterviewState(
+        interview_id="pm_legacy_complete",
+        initial_context="ctx",
+        rounds=[
+            InterviewRound(round_number=1, question="Q1", user_response="A1"),
+            InterviewRound(round_number=2, question="Q2", user_response="A2"),
+            InterviewRound(round_number=3, question="Q3", user_response="A3"),
+        ],
+    )
+    engine = _make_engine_stub()
+    engine.load_state = AsyncMock(return_value=Result.ok(state))
+    engine.check_completion = AsyncMock(
+        return_value={
+            "interview_complete": True,
+            "completion_reason": "ambiguity_resolved",
+            "rounds_completed": 3,
+            "ambiguity_score": 0.1,
+        }
+    )
+    engine.complete_interview = AsyncMock(return_value=Result.ok(state))
+    engine.save_state = AsyncMock(return_value=Result.ok(tmp_path / "state.json"))
+    engine.generate_pm_seed = AsyncMock(return_value=Result.err(ProviderError("skip generation")))
+    engine.ask_next_question = AsyncMock()
+    handler = PMInterviewHandler(data_dir=tmp_path)
+
+    with patch("ouroboros.mcp.tools.pm_handler._save_pm_meta"):
+        result = await handler._handle_answer(
+            engine,
+            state.interview_id,
+            None,
+            str(tmp_path),
+        )
+
+    assert result.is_ok
+    engine.check_completion.assert_awaited_once_with(state)
+    engine.complete_interview.assert_awaited_once_with(state)
+    engine.ask_next_question.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("answer", "classification", "expected_item"),
+    [
+        ("[decide_later]", "decide_later", "Q4"),
+        ("[deferred]", "deferred", "Q4"),
+    ],
+)
+async def test_skip_metadata_survives_atomic_planner_failure(
+    tmp_path: Path,
+    answer: str,
+    classification: str,
+    expected_item: str,
+) -> None:
+    from ouroboros.core.errors import ProviderError
+
+    engine = PMInterviewEngine.create(
+        llm_adapter=MagicMock(),
+        model="test-model",
+        state_dir=tmp_path,
+    )
+    state = InterviewState(
+        interview_id=f"pm_skip_{classification}",
+        initial_context="ctx",
+        rounds=[
+            InterviewRound(round_number=1, question="Q1", user_response="A1"),
+            InterviewRound(round_number=2, question="Q2", user_response="A2"),
+            InterviewRound(round_number=3, question="Q3", user_response="A3"),
+        ],
+    )
+    assert (await engine.save_state(state)).is_ok
+    engine.classifications.append(_make_classification(ClassifierOutputType(classification)))
+    engine.plan_next_turn = AsyncMock(return_value=Result.err(ProviderError("timeout")))
+    handler = PMInterviewHandler(pm_engine=engine, data_dir=tmp_path)
+
+    result = await handler.handle(
+        {
+            "session_id": state.interview_id,
+            "answer": answer,
+            "last_question": "Q4",
+            "cwd": str(tmp_path),
+        }
+    )
+
+    assert result.is_ok
+    reloaded_engine = PMInterviewEngine.create(
+        llm_adapter=MagicMock(),
+        model="test-model",
+        state_dir=tmp_path,
+    )
+    meta = _load_pm_meta(state.interview_id, tmp_path)
+    assert meta is not None
+    reloaded_engine.restore_meta(meta)
+    combined = reloaded_engine.deferred_items + reloaded_engine.decide_later_items
+    assert expected_item in combined
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("is_brownfield", "goal_clarity", "context_clarity"),
+    [
+        (False, 0.70, None),
+        (True, 0.90, 0.55),
+    ],
+)
+async def test_atomic_pm_floor_failure_continues_interview(
+    tmp_path: Path,
+    is_brownfield: bool,
+    goal_clarity: float,
+    context_clarity: float | None,
+) -> None:
+    engine = PMInterviewEngine.create(
+        llm_adapter=MagicMock(),
+        model="test-model",
+        state_dir=tmp_path,
+    )
+    state = InterviewState(
+        interview_id=f"pm_floor_failure_{is_brownfield}",
+        initial_context="Build a planning workflow",
+        is_brownfield=is_brownfield,
+        rounds=[
+            InterviewRound(round_number=1, question="Q1", user_response="A1"),
+            InterviewRound(round_number=2, question="Q2", user_response="A2"),
+            InterviewRound(round_number=3, question="Q3", user_response="A3"),
+        ],
+    )
+    assert (await engine.save_state(state)).is_ok
+    ambiguity = AmbiguityScore(
+        overall_score=0.18,
+        breakdown=ScoreBreakdown(
+            goal_clarity=ComponentScore(
+                name="Goal Clarity",
+                clarity_score=goal_clarity,
+                weight=0.35 if is_brownfield else 0.40,
+                justification="Needs one more decision.",
+            ),
+            constraint_clarity=ComponentScore(
+                name="Constraint Clarity",
+                clarity_score=0.90,
+                weight=0.25 if is_brownfield else 0.30,
+                justification="Clear.",
+            ),
+            success_criteria_clarity=ComponentScore(
+                name="Success Criteria Clarity",
+                clarity_score=0.90,
+                weight=0.25 if is_brownfield else 0.30,
+                justification="Clear.",
+            ),
+            context_clarity=(
+                ComponentScore(
+                    name="Context Clarity",
+                    clarity_score=context_clarity,
+                    weight=0.15,
+                    justification="Repository context needs one more decision.",
+                )
+                if context_clarity is not None
+                else None
+            ),
+        ),
+    )
+    next_question = "Which unresolved dimension should we clarify?"
+    engine.plan_next_turn = AsyncMock(
+        return_value=Result.ok(
+            PMInterviewTurnPlan(
+                question=next_question,
+                ambiguity=ambiguity,
+                classification=_make_classification(ClassifierOutputType.PASSTHROUGH),
+                raw_payload={"next_question": next_question},
+            )
+        )
+    )
+    engine.complete_interview = AsyncMock(wraps=engine.complete_interview)
+    handler = PMInterviewHandler(pm_engine=engine, data_dir=tmp_path)
+
+    result = await handler.handle({"session_id": state.interview_id, "cwd": str(tmp_path)})
+
+    assert result.is_ok
+    assert result.value.meta["is_complete"] is False
+    assert result.value.meta["question"] == next_question
+    engine.complete_interview.assert_not_awaited()

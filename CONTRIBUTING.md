@@ -6,15 +6,18 @@ Thank you for your interest in contributing to Ouroboros! This guide covers ever
 
 - [Quick Setup](#quick-setup)
 - [Development Workflow](#development-workflow)
+- [Review Boundary Contract](#review-boundary-contract)
 - [Ways to Contribute](#ways-to-contribute)
 - [Development Environment](#development-environment)
 - [Code Style Guide](#code-style-guide)
 - [Commit Message Convention](#commit-message-convention)
+- [Release Maintenance](#release-maintenance)
 - [Project Structure](#project-structure)
 - [Key Patterns](#key-patterns)
 - [Documentation Coverage](#documentation-coverage)
   - [CLI Commands → Doc Mapping](#cli-commands--doc-mapping)
   - [Orchestrator → Doc Mapping](#orchestrator--doc-mapping)
+  - [Capability Graph → Doc Mapping](#capability-graph--doc-mapping)
   - [Configuration → Doc Mapping](#configuration--doc-mapping)
   - [Evaluation Pipeline → Doc Mapping](#evaluation-pipeline--doc-mapping)
   - [TUI Source → Doc Mapping](#tui-source--doc-mapping)
@@ -41,7 +44,23 @@ uv run ouroboros --version   # verify
 uv run pytest tests/unit/ -q # run tests
 ```
 
-**Requirements**: Python >= 3.12, [uv](https://github.com/astral-sh/uv)
+> **`uv sync` is not the whole loop.** The checked-in `.mcp.json` points at the
+> **published PyPI package**, so a clone that you edit is not the code your
+> client runs. Before your first change, read
+> [The Development Loop](./docs/contributing/developing.md) — it covers pointing
+> the tooling at your working tree, where config and state live, and the fastest
+> way to verify each kind of change.
+
+**Requirements**: Python >= 3.12, [uv](https://github.com/astral-sh/uv). LiteLLM-bearing profiles support Python 3.12-3.13.
+
+This repository's `.python-version` defaults source checkouts to **stable Python 3.14** for local development. Core and non-LiteLLM contributor environments support Python 3.12-3.14. LiteLLM-bearing environments, including `--all-extras`, support Python 3.12-3.13; examples prefer Python 3.13 without making it the minimum.
+
+```bash
+uv sync --python 3.13                  # base dependencies on the preferred current interpreter
+uv sync --python 3.13 --all-extras     # include optional backends/extras, including LiteLLM
+uv run --python 3.13 ouroboros --version
+uv run --python 3.13 pytest tests/unit/ -q
+```
 
 ---
 
@@ -97,14 +116,156 @@ uv run ruff format src/ tests/
 
 # Type check
 uv run mypy src/ouroboros
+
+# ooo auto product boundary check (Q00/ouroboros#725)
+python3 scripts/check-auto-boundary.py
 ```
+
+The last command enforces that the `ooo auto` core source files do
+not introduce domain-specific keywords (`github`, `pull_request`,
+`jira`, `slack`, …). Domain workflows belong in UserLevel plugins,
+not in `ooo auto`. The CI workflow `ooo-auto-boundary` runs the same
+check on every PR.
+
+Coverage is the union of (a) every `*.py` under `src/ouroboros/auto/`
+and (b) `src/ouroboros/cli/commands/auto.py`, so any new module added
+under the auto package is scanned automatically. Forbidden keywords
+are matched as case-insensitive substrings, which catches realistic
+identifier forms such as `GitHubClient`, `github_client`, `JiraIssue`,
+or `SlackNotifier`. The script also fails loud if a load-bearing
+anchor file (declared in `ANCHOR_FILES` inside the script) is missing,
+so a refactor that renames or removes one of those files cannot
+silently strip enforcement coverage — update `ANCHOR_FILES` in the
+same PR.
+
+If a forbidden keyword is genuinely necessary on a line (rare),
+append `# domain-keyword-allowed: <reason>` and include rationale in
+the PR description.
 
 ### 6. Submit PR
 
+`main` is protected — direct pushes are rejected for everyone, owner included.
+Every change lands through a squash-merged PR.
+
 - Write a clear PR description explaining **what** and **why**
-- Reference the related issue (e.g., `Closes #123`)
+- Include the structured boundary required by [Review Boundary Contract](#review-boundary-contract)
+- Reference the related issue (e.g., `Closes #123`, or a plain `Refs #123`) —
+  the `Issue link present` gate requires it
 - Ensure all tests pass and linting is clean
 - Wait for code review and address feedback
+
+Four checks are required to merge (`Ruff Lint`, `MyPy Type Check`,
+`Test Python 3.12`, `Bridge TypeScript`), and several more fire conditionally
+on the paths you touched. Every gate, its local reproduction command, and its
+legitimate escape hatch are documented in
+[CI Gates and Branch Protection](./docs/contributing/ci-gates.md).
+
+`ouroboros-agent[bot]` ties each review verdict to the commit it checked. It
+grades your PR against the linked issue's requirements and reproduces the
+defects it reports. Confirm the applicable verdict belongs to the current head,
+then read
+[Review Conventions](./docs/contributing/review-conventions.md) before your first
+push — most review rounds are lost to objections you can preempt.
+
+### Release Maintenance
+
+Before creating a release tag, synchronize every version-bearing plugin artifact in the release commit:
+
+```bash
+python scripts/sync-plugin-version.py --write --version 0.50.7
+python scripts/sync-plugin-version.py --require-canonical --version 0.50.7
+git diff --check
+```
+
+The metadata change must be committed before the tag exists, and because `main`
+is protected it can only get there through a PR. Squash-merging mints a new
+commit SHA, so create `v0.50.7` on the **merged** `main` commit — tagging the
+pre-merge commit produces a tag that points at a commit `main` never contained:
+
+```bash
+git checkout main && git pull origin main --ff-only
+git tag -a v0.50.7 -m "Release v0.50.7" && git push origin v0.50.7
+```
+
+The tag-triggered release workflow repeats the read-only check and refuses to build when the tag version and tracked metadata differ. It also owns the PyPI publish — never run `uv publish` locally.
+
+The full sequence, including the release-notes convention, is in
+[CI Gates and Branch Protection](./docs/contributing/ci-gates.md#releases).
+
+---
+
+## Review Boundary Contract
+
+Review speed depends on whether the PR boundary is explicit. A focused PR gives contributors, review bots, and maintainers the same contract to evaluate. Every PR that changes code, documentation, or operational guidance MUST define the following before implementation and keep it current in the PR description:
+
+| Boundary field | Required declaration |
+|----------------|----------------------|
+| User problem | One concrete user problem the PR solves |
+| Promised contract | Supported inputs, preconditions, execution conditions, observable behavior, and invariants |
+| Implementation boundary | Existing subsystems and components changed, data or security boundaries crossed, and the current owner |
+| Non-goals | Unsupported inputs or conditions and related risks intentionally excluded from this PR |
+| Evidence | Reproduction steps or tests that prove each promised behavior under the declared conditions |
+
+The declared boundary narrows implementation scope; it MUST NOT waive an existing public or repository contract, an approved issue or RFC requirement, or a maintainer decision. If a proposed non-goal conflicts with one of those baseline obligations, the contributor MUST ask the maintainer to approve a scope change or revisit the RFC before implementation.
+
+Do not begin from an unsupported solution assumption and then absorb every lifecycle, rollback, concurrency, or authority concern that follows from it. If implementation reveals a new subsystem or ownership boundary, stop and let a maintainer decide whether the PR expands, splits, or returns to RFC discussion.
+
+### Responsibilities
+
+- **Contributor**: declares the contract and boundary, keeps the implementation inside them, and does not silently widen either while addressing review feedback.
+- **Review bot or reviewer**: blocks only direct contract violations and immediate user-data or security risks. A valid risk outside the declared boundary becomes a follow-up only when it has a named owner.
+- **Maintainer**: decides whether a proposed subsystem, ownership change, or scope expansion belongs in the current PR, a follow-up PR, or a revised RFC.
+
+### Five-question review rubric
+
+Every finding MUST answer these questions with evidence:
+
+1. Does the finding reproduce under the inputs and execution conditions promised by the PR?
+2. Does the finding violate the contract promised by the PR?
+3. Would resolving it require a new subsystem or a new ownership boundary?
+4. Can the original user problem be solved without the subsystem introduced by the PR?
+5. If the scope is split, does an immediate user-data or security risk remain?
+
+Apply outcomes in this order:
+
+| Evidence | Review outcome |
+|----------|----------------|
+| Questions 1 and 2 are **yes** | **Changes Requested**. The finding is reproducible inside the promised boundary and breaks the PR contract. |
+| Question 5 is **yes**, but resolving the direct risk does not require a new subsystem or owner | **Changes Requested**. Immediate user-data and security risks introduced by the PR are blockers. |
+| Questions 3 and 5 are **yes** | **Stop the PR and revisit the RFC with a maintainer**. The safe fix requires scope or ownership that the current PR cannot decide. |
+| Questions 3 and 4 are **yes**, and question 5 is **no** | **Owned follow-up**. Create or link a follow-up issue or PR with a named owner; it is not a blocker once the current contract is satisfied. |
+| The finding does not reproduce inside the declared conditions, or question 2 is **no** | **Not a blocker**. Record it only as an owned follow-up when it is independently valid and actionable. |
+
+Severity alone does not decide whether a review comment blocks a PR. Boundary, contract impact, and immediate risk do.
+
+### Why unstructured boundaries create review loops
+
+```mermaid
+flowchart LR
+    A[Small user problem] --> B[Unsupported solution assumption]
+    B --> C[New lifecycle ownership]
+    C --> D[Rollback requirement]
+    C --> E[Concurrency requirement]
+    C --> F[Filesystem authority requirement]
+    D --> G[PR scope expands]
+    E --> G
+    F --> G
+    G --> H[New review blockers repeat]
+```
+
+### Preferred flow
+
+```mermaid
+flowchart LR
+    A[Small user problem] --> B[Declare inputs, conditions, and contract]
+    B --> C[Declare subsystem, ownership, and non-goals]
+    C --> D[Implement the smallest contract-satisfying change]
+    D --> E[Prove behavior under declared conditions]
+    E --> F{Five-question review}
+    F -->|Q1 + Q2| G[Changes Requested]
+    F -->|Q3 + Q4 and not Q5| H[Owned follow-up]
+    F -->|Q3 + Q5| I[Stop and revisit RFC]
+```
 
 ---
 
@@ -176,10 +337,11 @@ See the [Issue Quality Policy](./docs/contributing/issue-quality-policy.md) for 
 
 When submitting a PR:
 
-1. **Small, focused changes**: One logical change per PR
-2. **Tests included**: New features need tests
-3. **Docs updated**: Update relevant documentation
-4. **Clean history**: Squash commits before submitting if needed
+1. **Boundary declared**: State the user problem, promised contract, implementation boundary, non-goals, and evidence required by [Review Boundary Contract](#review-boundary-contract)
+2. **Small, focused changes**: One logical change per PR
+3. **Tests included**: New observable behavior needs contract-level tests
+4. **Docs updated**: Update relevant documentation
+5. **Clean history**: Squash commits before submitting if needed
 
 ### Documentation
 
@@ -190,15 +352,16 @@ Help improve docs by:
 - Translating documentation (if you speak multiple languages)
 - Creating tutorials or guides
 
-When reporting or fixing a documentation problem, apply the [Documentation Issue Severity Rubric](#documentation-issue-severity-rubric) to label the issue (`docs:critical`, `docs:high`, `docs:medium`, or `docs:low`) so maintainers can triage and prioritise correctly.
+When reporting or fixing a documentation problem, apply the [Documentation Issue Severity Rubric](#documentation-issue-severity-rubric): use the existing `documentation` label and add a `**Severity:** critical/high/medium/low` line so maintainers can triage and prioritise correctly.
 
 ### Code Review
 
-Review open PRs to:
+Review open PRs using the [five-question review rubric](#five-question-review-rubric):
 
-- Catch bugs before merge
-- Suggest improvements
-- Learn the codebase
+- Request changes only for contract violations or immediate user-data or security risks
+- Move valid out-of-boundary risks to an owned follow-up instead of expanding the PR
+- Escalate new subsystem or ownership requirements to a maintainer when they also carry immediate risk
+- Suggest non-blocking improvements without presenting them as merge requirements
 
 ---
 
@@ -300,8 +463,10 @@ uv run ruff check src/ tests/
 
 ### Python Version
 
-- **Minimum**: Python 3.12
-- **Target**: Python >= 3.12
+- **Minimum supported**: Python 3.12
+- **Test matrix**: Python 3.12, 3.13, and 3.14 for core/non-LiteLLM profiles; Python 3.12 and 3.13 for LiteLLM-bearing profiles
+- **Source-checkout default**: `.python-version` selects stable Python 3.14 for local development
+- Use `uv sync --python 3.13 --all-extras` before `uv run --python 3.13 ...` for current LiteLLM-bearing contributor environments. Python 3.12 remains supported for lower-bound validation.
 - Use modern Python features (type unions `|`, match statements, etc.)
 
 ---
@@ -456,6 +621,8 @@ class ExecutionStrategy(Protocol):
 
 This section defines **which documentation files must be updated when a specific source file or code path changes**. Reviewers should verify that all relevant doc files are updated before merging any PR that touches the listed source paths.
 
+The mapping itself lives in one place, [`docs/doc-map.yml`](./docs/doc-map.yml): each entry lists source globs, the docs that describe them, and what to check. On every pull request the advisory `doc-impact (advisory)` job lists the mapped docs whose sources changed while the docs did not; it never blocks a merge (see [CI Gates](./docs/contributing/ci-gates.md#doc-impact-advisory-doc-impactyml)). Reproduce it locally with `uv run python3 scripts/check-doc-impact.py --base origin/main`, and check the map with `--validate`. Change the map in the same PR that adds, moves, or removes a mapped source or doc.
+
 ### Source of Truth
 
 The authoritative implementation directories are:
@@ -470,155 +637,50 @@ The authoritative implementation directories are:
 
 ### CLI Commands → Doc Mapping
 
-Any change to a file under `src/ouroboros/cli/commands/` requires reviewing and updating the corresponding documentation:
-
-#### `init.py` — `ouroboros init` / `ouroboros init start`
-
-Flags covered: `--resume`, `--state-dir`, `--orchestrator`, `--runtime`, `--llm-backend`, `--debug`
-
-**Must update:**
-- `docs/cli-reference.md` — `init` command section (flags, examples)
-- `docs/getting-started.md` — interview workflow description
-- `docs/getting-started.md` — introductory `ooo init` / `ouroboros init` examples
-- `docs/getting-started.md` — onboarding flow
-
-**Also check:**
-- `docs/runtime-guides/claude-code.md` and `docs/runtime-guides/codex.md` — if `--orchestrator` or `--runtime` behavior changes
-
-#### `run.py` — `ouroboros run workflow`
-
-Flags covered: `--orchestrator/--no-orchestrator`, `--resume`, `--mcp-config`, `--mcp-tool-prefix`, `--dry-run`, `--debug`, `--sequential`, `--runtime`, `--no-qa`
-
-**Must update:**
-- `docs/cli-reference.md` — `run` command section (flags, examples, defaults)
-- `docs/getting-started.md` — execution workflow description
-- `docs/getting-started.md` — `ooo run` / `ouroboros run` examples
-
-**Also check:**
-- `docs/runtime-guides/claude-code.md` and `docs/runtime-guides/codex.md` — if `--runtime` semantics change
-- `docs/runtime-capability-matrix.md` — if a runtime backend is added or removed
-
-#### `config.py` — `ouroboros config`
-
-Subcommands: `show`, `init`, `set`, `validate`
-
-> **Note**: All four subcommands are currently placeholder stubs. Mark as `[Placeholder — not yet implemented]` in docs until fully implemented.
-
-**Must update:**
-- `docs/cli-reference.md` — `config` command section
-- `docs/getting-started.md` — configuration management section
-
-#### `status.py` — `ouroboros status`
-
-Subcommands: `executions`, `execution`, `health`
-
-> **Note**: All subcommands return placeholder data. Mark as `[Placeholder — not yet implemented]` in docs until real persistence reads are wired in.
-
-**Must update:**
-- `docs/cli-reference.md` — `status` command section
-
-#### `mcp.py` — `ouroboros mcp`
-
-**Must update:**
-- `docs/cli-reference.md` — `mcp` command section
-- `docs/api/mcp.md` — MCP server/client configuration
-
-#### `setup.py` — `ouroboros setup`
-
-**Must update:**
-- `docs/cli-reference.md` — `setup` command section
-- `docs/getting-started.md` — setup step in onboarding
-
-#### `tui.py` — `ouroboros tui`
-
-**Must update:**
-- `docs/cli-reference.md` — `tui` command section
-- `docs/guides/tui-usage.md` — TUI usage guide
-
-#### `cancel.py` — `ouroboros cancel`
-
-**Must update:**
-- `docs/cli-reference.md` — `cancel` command section
+Which docs describe each file under `src/ouroboros/cli/commands/`, and what to
+check in them, is recorded in [`docs/doc-map.yml`](./docs/doc-map.yml).
 
 ---
 
 ### Orchestrator → Doc Mapping
 
-Changes under `src/ouroboros/orchestrator/` affect runtime behavior documentation:
+The docs for each source under `src/ouroboros/orchestrator/`, and for the
+execution sandbox under `src/ouroboros/runtime/`, are recorded in
+[`docs/doc-map.yml`](./docs/doc-map.yml).
 
-| Source file | Must update |
-|-------------|-------------|
-| `runtime_factory.py` | `docs/runtime-capability-matrix.md`, `docs/runtime-guides/claude-code.md`, `docs/runtime-guides/codex.md` — if a backend is added, removed, or changes its `NotImplementedError` status |
-| `adapter.py` (`ClaudeAgentAdapter`) | `docs/runtime-guides/claude-code.md` — permission modes, session flow |
-| `codex_cli_runtime.py` (`CodexCliRuntime`) | `docs/runtime-guides/codex.md` — permission modes, `--runtime codex` behavior |
-| `opencode_runtime.py` (`OpenCodeRuntime`) | `docs/runtime-capability-matrix.md`, `docs/runtime-guides/opencode.md` — permission modes, `--runtime opencode` behavior |
-| `runner.py` (`OrchestratorRunner`) | `docs/architecture.md` — orchestration lifecycle; `docs/getting-started.md` — session ID output, resume flow |
-| `parallel_executor.py` | `docs/cli-reference.md` — `--sequential` flag behavior; `docs/architecture.md` — parallel execution strategy |
-| `coordinator.py` (`LevelCoordinator`) | `docs/architecture.md` — inter-level conflict resolution and coordinator review gate |
-| `session.py` | `docs/cli-reference.md` — session ID format, resume semantics |
-| `workflow_state.py` | `docs/architecture.md` — AC state machine, `ActivityType` values; `docs/guides/tui-usage.md` — if activity display changes |
-| `dependency_analyzer.py` | `docs/architecture.md` — dependency level computation description |
-| `execution_strategy.py` | `docs/architecture.md` — execution strategy types (`code`, `research`, `analysis`); `docs/guides/seed-authoring.md` if strategy selection is user-facing |
-| `mcp_config.py` / `mcp_tools.py` | `docs/api/mcp.md` — MCP config YAML schema |
-| `command_dispatcher.py` | `docs/architecture.md` — command dispatch model |
-| `level_context.py` | `docs/architecture.md` — level context description |
+**Runtime availability rule**: If `create_agent_runtime()` raises `NotImplementedError` for a backend, that backend **must not** appear in docs as a working option. Runtime backend availability is registry-owned; when `runtime_backend_choices()` or setup support changes, update the runtime capability matrix, setup docs, and per-runtime guide/gap documentation together.
 
-**Runtime availability rule**: If `create_agent_runtime()` raises `NotImplementedError` for a backend, that backend **must not** appear in docs as a working option. All three backends (`claude`, `codex`, `opencode`) are fully implemented and documented.
+---
+
+### Capability Graph → Doc Mapping
+
+Changes that add, remove, rename, or reinterpret a skill execution capability
+must keep the capability graph and generated runtime instructions in sync. The
+docs and packaged snapshots to update are recorded in [`docs/doc-map.yml`](./docs/doc-map.yml).
+
+Before submitting a capability graph PR, run the checklist in
+[`docs/runtime-guides/skill-capability-guides.md`](./docs/runtime-guides/skill-capability-guides.md#contributor-checklist-for-capability-changes).
 
 ---
 
 ### Configuration → Doc Mapping
 
-Changes under `src/ouroboros/config/` affect configuration reference documentation:
-
-| Source class | Config key path | Must update |
-|---|---|---|
-| `OrchestratorConfig` | `orchestrator.*` | `docs/cli-reference.md` — `--runtime` flag; `README.md` config snippet |
-| `LLMConfig` | `llm.*` | `docs/architecture.md`, `docs/api/core.md` — model defaults |
-| `EconomicsConfig` / `TierConfig` | `economics.*` | `docs/architecture.md` — tier descriptions |
-| `ClarificationConfig` | `clarification.*` | `docs/guides/seed-authoring.md` — ambiguity threshold |
-| `ExecutionConfig` | `execution.*` | `docs/architecture.md` — iteration limits |
-| `ResilienceConfig` | `resilience.*` | `docs/architecture.md` — stagnation/lateral thinking |
-| `EvaluationConfig` | `evaluation.*` | `docs/architecture.md` — three-stage evaluation |
-| `ConsensusConfig` | `consensus.*` | `docs/architecture.md` — Stage 3 consensus |
-| `DriftConfig` | `drift.*` | `docs/architecture.md` — drift monitoring thresholds |
-| `PersistenceConfig` | `persistence.*` | `docs/getting-started.md` — database path |
-
-When a **new config key** is added to any model class, check `README.md` and `docs/getting-started.md` for any sample `config.yaml` snippets that may need updating.
-
-**`config/loader.py`**: If the config file search path, environment variable names (e.g., `OUROBOROS_CONFIG`), or YAML loading logic change, update:
-- `docs/getting-started.md` — config file location instructions
-- `docs/config-reference.md` — environment variable overrides section
-- `README.md` — any config bootstrap snippet
+The docs for each config section in `src/ouroboros/config/models.py`, and for
+`src/ouroboros/config/loader.py`, are recorded in [`docs/doc-map.yml`](./docs/doc-map.yml).
 
 ---
 
 ### Evaluation Pipeline → Doc Mapping
 
-Changes under `src/ouroboros/evaluation/` affect:
-
-| Source file | Must update |
-|-------------|-------------|
-| `pipeline.py` | `docs/architecture.md` — Stage descriptions (Stage 1 Mechanical, Stage 2 Semantic, Stage 3 Consensus); `docs/guides/evaluation-pipeline.md` |
-| `trigger.py` | `docs/architecture.md` — consensus trigger thresholds; `docs/guides/evaluation-pipeline.md` — when Stage 3 is invoked |
-| `mechanical.py` | `docs/guides/evaluation-pipeline.md` — Stage 1 check list |
-| `models.py` | `docs/api/core.md` — evaluation result types |
-| `artifact_collector.py` | `docs/architecture.md` — artifact collection description |
+The docs for each source under `src/ouroboros/evaluation/` are recorded in
+[`docs/doc-map.yml`](./docs/doc-map.yml).
 
 ---
 
 ### TUI Source → Doc Mapping
 
-Changes under `src/ouroboros/tui/` that alter the visible interface or user interactions affect:
-
-| Source path | Must update |
-|-------------|-------------|
-| `screens/dashboard_v3.py` | `docs/guides/tui-usage.md` — dashboard layout, key bindings |
-| `widgets/ac_tree.py` | `docs/guides/tui-usage.md` — AC tree display; `docs/architecture.md` if AC state rendering changes |
-| `widgets/drift_meter.py` | `docs/guides/tui-usage.md` — drift meter description |
-| `widgets/phase_progress.py` | `docs/guides/tui-usage.md` — phase progress bar description |
-| `screens/lineage_selector.py` / `lineage_detail.py` | `docs/guides/tui-usage.md` — lineage navigation section |
-| Any new screen added to `screens/` | `docs/guides/tui-usage.md` — add a new section; `docs/cli-reference.md` if a new key binding or `tui` sub-command is introduced |
+The docs for TUI screens and widgets under `src/ouroboros/tui/` are recorded in
+[`docs/doc-map.yml`](./docs/doc-map.yml).
 
 > **Note**: TUI key bindings visible in `screens/*.py` (`BINDINGS = [...]`) are user-facing and must be listed in `docs/guides/tui-usage.md`.
 
@@ -626,16 +688,11 @@ Changes under `src/ouroboros/tui/` that alter the visible interface or user inte
 
 ### Skills / Plugin → Doc Mapping
 
-Changes under `skills/` (YAML skill definitions used by Claude and Codex) or `src/ouroboros/plugin/` affect:
+The docs for `skills/*/SKILL.md`, the bundled agents in `src/ouroboros/agents/`,
+the managed Codex rules in `src/ouroboros/codex/ouroboros.md`, and
+`src/ouroboros/plugin/` are recorded in [`docs/doc-map.yml`](./docs/doc-map.yml).
 
-| Source path | Must update |
-|-------------|-------------|
-| `skills/codex.md` | `docs/runtime-guides/codex.md` — if skill instructions change |
-| `skills/*.yaml` or `src/ouroboros/agents/*.md` | `docs/` guide that describes the affected skill/agent behaviour |
-| `src/ouroboros/plugin/skills/executor.py` | `docs/architecture.md` — skill execution model |
-| `src/ouroboros/plugin/agents/registry.py` | `docs/architecture.md` — agent registry; `docs/runtime-capability-matrix.md` if supported agents change per runtime |
-
-> **Note**: `skills/` YAML files are a user-visible configuration surface. Any new skill must be listed in the relevant runtime guide before the PR is merged.
+> **Note**: Skill definitions under `skills/` are a user-visible surface. Any new skill must be listed in the relevant runtime guide before the PR is merged.
 
 ---
 
@@ -661,14 +718,14 @@ When adding support for a **new runtime backend** (e.g., new entry in `AgentRunt
 
 ### Documentation Issue Severity Rubric
 
-When a reviewer or contributor identifies a documentation problem, classify it by severity before filing an issue or leaving a PR comment. This classification determines urgency and whether a PR can be merged with the issue open.
+When a reviewer or contributor identifies a documentation problem, classify it by severity for urgency and triage. Apply the [Review Boundary Contract](#review-boundary-contract) first: severity does not independently decide whether a PR comment blocks.
 
-| Severity | Label | Definition | User Impact | Merge Policy |
-|----------|-------|------------|-------------|--------------|
-| **Critical** | `docs:critical` | The documented information is **factually wrong**: a command, flag, path, or option described in the docs does not exist or behaves differently than described. | User follows the docs and **fails** — the command errors, the path is missing, the flag is rejected. | **Block merge.** The PR must not ship until fixed. |
-| **High** | `docs:high` | The documentation is **misleading**: information is technically present but framed in a way that causes confusion, omits a required step, or implies a capability that is unimplemented. This includes wrong environment variable names that silently have no effect. | User follows the docs and **proceeds incorrectly** — they finish the step but reach a wrong state or have false expectations. | **Block merge** unless the issue is filed and linked. Fix within the same sprint. |
-| **Medium** | `docs:medium` | The documentation has **inconsistent style or terminology**: the same concept is named differently across files, formatting does not follow the project's conventions, or phrasing is ambiguous but not incorrect. Also applies to missing-content findings where the gap is for an edge case or optional feature and users can succeed with defaults or alternative docs. | User is mildly confused by inconsistency but can still succeed. | **Non-blocking.** Can merge; fix before the next release. |
-| **Low** | `docs:low` | The documentation has a **minor cosmetic gap**: an alternative invocation form is undocumented, a behavior note is absent but has no user-visible impact, or an edge case is missing from one file but covered elsewhere. No confusion or incorrect behavior results. | User experiences minor friction at most; no incorrect outcome. | **Non-blocking.** Address opportunistically. |
+| Severity | Issue marker | Definition | User Impact | Merge Policy |
+|----------|--------------|------------|-------------|--------------|
+| **Critical** | `documentation` label + `**Severity:** critical` in the issue/PR body | The documented information is **factually wrong**: a command, flag, path, or option described in the docs does not exist or behaves differently than described. | User follows the docs and **fails** — the command errors, the path is missing, or the flag is rejected. | **Changes Requested** when it reproduces under the PR's declared conditions and violates its contract, or when it creates immediate user-data/security risk. Otherwise use an owned follow-up. |
+| **High** | `documentation` label + `**Severity:** high` in the issue/PR body | The documentation is **misleading**: information is technically present but framed in a way that causes confusion, omits a required step, or implies an unimplemented capability. | User follows the docs and **proceeds incorrectly** — they finish the step but reach a wrong state or have false expectations. | Apply the boundary and contract test. Do not block by severity alone; link a named owner for valid out-of-boundary follow-up. |
+| **Medium** | `documentation` label + `**Severity:** medium` in the issue/PR body | The documentation has **inconsistent style or terminology** or an ambiguity that does not make the documented path incorrect. | User is mildly confused by inconsistency but can still succeed. | **Non-blocking.** Can merge; assign an owner when follow-up is needed. |
+| **Low** | `documentation` label + `**Severity:** low` in the issue/PR body | The documentation has a **minor cosmetic gap** or an edge case missing where another safe documented path exists. | User experiences minor friction at most; no incorrect outcome. | **Non-blocking.** Address opportunistically. |
 
 #### Severity Examples
 
@@ -677,8 +734,8 @@ When a reviewer or contributor identifies a documentation problem, classify it b
 | `docs/cli-reference.md` lists `--foo` flag that does not exist in the source | Critical | User runs the command and gets "no such option" |
 | `docs/getting-started.md` omits `uv sync` before `uv run ouroboros` | Critical | User's first command fails with ModuleNotFoundError |
 | `opencode` listed as a working `--runtime` value without `[Not yet available]` | High | User configures `--runtime opencode` and gets a confusing `NotImplementedError` |
-| `OUROBOROS_AGENT_RUNTIME` written as `OUROBOROS_RUNTIME_BACKEND` in one file | High | User sets the wrong env var and the setting silently has no effect |
-| Docs recommend `export OUROBOROS_MAX_PARALLEL=2` but the variable does not exist | High | User sets the variable; parallelism is not actually limited (false expectation) |
+| `OUROBOROS_AGENT_RUNTIME` written as `OUROBOROS_RUNTIME_BACKEND` in one file | High | User sets the wrong env var and the setting silently has no effect <!-- docs-drift: ignore --> |
+| Docs recommend `export OUROBOROS_MAX_PARALLEL=2` but the variable does not exist | High | User sets the variable; parallelism is not actually limited (false expectation) <!-- docs-drift: ignore --> |
 | A major config section (`economics:`, `evaluation:`) entirely absent from docs | High | User who needs non-default configuration for that section has no documentation to follow; they omit a required step |
 | `claude-code` vs `claude_code` used interchangeably across different docs files | Medium | Minor confusion; both forms resolve correctly in the CLI |
 | Section headings use Title Case in some files and Sentence case in others | Medium | Style inconsistency; no functional impact |
@@ -688,26 +745,30 @@ When a reviewer or contributor identifies a documentation problem, classify it b
 #### How to Apply the Rubric in PRs
 
 1. **When reviewing a docs-affecting PR**, scan each changed file against the [Documentation Decay Detection](#documentation-decay-detection) checks below and classify any finding using the table above.
-2. **When filing a GitHub issue** for a documentation problem, add the appropriate `docs:critical`, `docs:high`, `docs:medium`, or `docs:low` label.
-3. **When writing a PR description** that fixes a documentation problem, state the severity in the PR summary (e.g., _"Fixes docs:critical — `--resume` flag was listed with wrong default"_).
-4. **Critical and High issues found during review must be resolved or have a linked follow-up issue before the PR is approved.**
-5. **Record new findings** in [`docs/doc-issues-register.md`](./docs/doc-issues-register.md) using the filing template at the bottom of that file. When a fix is merged, move the entry to "Resolved Issues" and add the resolution date.
+2. **When filing a GitHub issue** for a documentation problem, add the existing `documentation` label and include a body line such as `**Severity:** critical`, `**Severity:** high`, `**Severity:** medium`, or `**Severity:** low`.
+3. **When writing a PR description** that fixes a documentation problem, state the severity in the PR summary (e.g., _"Fixes documentation severity: critical — `--resume` flag was listed with wrong default"_).
+4. **Apply the Review Boundary Contract before severity:** direct contract violations and immediate user-data/security risks require changes; valid risks outside the boundary require a linked follow-up with a named owner; new subsystem or ownership plus immediate risk requires maintainer/RFC escalation.
+5. **Track open documentation findings in GitHub issues** with the `documentation` label; do not rely on a separate register file unless one is introduced and kept current.
 
-> **Current open issues** are tracked in [`docs/doc-issues-register.md`](./docs/doc-issues-register.md).
+> **Current open documentation issues** are tracked with the [`documentation`](https://github.com/Q00/ouroboros/issues?q=is%3Aissue+is%3Aopen+label%3Adocumentation) label.
 
 ---
 
 ### Documentation Decay Detection
 
-To catch doc drift during development, reviewers should check:
+Drift that can be detected mechanically is moving into pytest checks under
+`tests/unit/docs/`, which run in the required test job. The policy, the
+corpus they scan, and what to do when one fails are in
+[Docs Freshness](./docs/contributing/docs-freshness.md). Until a check below is
+automated there, reviewers should check it by hand:
 
 1. **Flag parity**: Run `ouroboros <cmd> --help` and compare every flag to `docs/cli-reference.md`. Any mismatch is a documentation bug.
 2. **Placeholder honesty**: If a command's implementation body is `# Placeholder implementation`, the corresponding doc entry must say `[Placeholder — not yet implemented]`.
 3. **Runtime parity**: `claude`, `codex`, and `opencode` are all fully-implemented backends. Any doc that lists a backend as available must have a corresponding runtime guide in `docs/runtime-guides/`.
 4. **Config key drift**: After any change to `src/ouroboros/config/models.py`, grep for the changed key name across `docs/` to find stale references.
 5. **TUI key bindings**: If `screens/*.py` `BINDINGS` arrays change, verify `docs/guides/tui-usage.md` reflects the new keys.
-6. **Skills registry drift**: If a new `skills/*.yaml` file is added, check that `docs/runtime-guides/codex.md` or the relevant guide mentions it.
-7. **Orchestrator new file**: If a new `.py` file is added to `src/ouroboros/orchestrator/`, add it to the Orchestrator → Doc Mapping table above before the PR is merged.
+6. **Skills registry drift**: If a new `skills/<name>/SKILL.md` is added, check that `docs/runtime-guides/codex.md` or the relevant guide mentions it.
+7. **Orchestrator new file**: If a new `.py` file is added to `src/ouroboros/orchestrator/`, add an entry for it to [`docs/doc-map.yml`](./docs/doc-map.yml) before the PR is merged, then run `uv run python3 scripts/check-doc-impact.py --validate`.
 
 ```bash
 # Quick doc-drift scan: compare CLI help output with cli-reference.md
@@ -719,14 +780,11 @@ uv run ouroboros status --help
 # Find stale config key references
 grep -r "opencode_permission_mode\|runtime_backend\|codex_cli_path" docs/
 
-# Find any 'opencode' reference in docs that lacks the [Not yet available] marker
-grep -rn "opencode" docs/ | grep -v "Not yet available" | grep -v "semantic-link-rot" | grep -v "cli-audit"
-
 # Check TUI key bindings are documented
 grep -rn "BINDINGS" src/ouroboros/tui/screens/ | grep -v "__pycache__"
 
-# List skill YAML files to cross-check against runtime guides
-ls skills/*.yaml 2>/dev/null || echo "No skill YAML files found"
+# List skill definitions to cross-check against runtime guides
+ls skills/*/SKILL.md
 ```
 
 ---
@@ -735,7 +793,12 @@ ls skills/*.yaml 2>/dev/null || echo "No skill YAML files found"
 
 - [Architecture Overview](./docs/contributing/architecture-overview.md) - How the system fits together
 - [Testing Guide](./docs/contributing/testing-guide.md) - How to write and run tests
+- [The Development Loop](./docs/contributing/developing.md) - Run your own code: local MCP, config, state, per-change verification
+- [Review Conventions](./docs/contributing/review-conventions.md) - What the review bot demands, and how to preempt a round
 - [Key Patterns](./docs/contributing/key-patterns.md) - Core patterns with code examples
+- [CI Gates and Branch Protection](./docs/contributing/ci-gates.md) - What CI enforces, how to reproduce it locally, and how releases land
+- [Issue Reference Report](./docs/contributing/issue-reference-report.md) - Read-only, manually triggered evidence for issue review
+- [Docs Freshness](./docs/contributing/docs-freshness.md) - How docs drift is detected, and what to do when a docs check fails
 
 ---
 

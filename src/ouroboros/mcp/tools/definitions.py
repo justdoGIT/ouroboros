@@ -8,10 +8,13 @@ the default handler tuple for MCP registration.
 Handler modules:
 - execution_handlers: ExecuteSeedHandler, StartExecuteSeedHandler
 - query_handlers: SessionStatusHandler, QueryEventsHandler, ACDashboardHandler
+- project_status_handler: ProjectStatusHandler
+- projection_handlers: ProjectionQueryHandler
 - authoring_handlers: GenerateSeedHandler, InterviewHandler
 - evaluation_handlers: MeasureDriftHandler, EvaluateHandler, LateralThinkHandler
 - evolution_handlers: EvolveStepHandler, StartEvolveStepHandler,
                       EvolveRewindHandler, LineageStatusHandler
+- ralph_handlers: RalphHandler
 - job_handlers: CancelExecutionHandler, JobStatusHandler, JobWaitHandler,
                 JobResultHandler, CancelJobHandler
 - qa: QAHandler
@@ -19,6 +22,7 @@ Handler modules:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ouroboros.mcp.tools.ac_tree_hud_handler import ACTreeHUDHandler
@@ -29,8 +33,11 @@ from ouroboros.mcp.tools.authoring_handlers import (
 from ouroboros.mcp.tools.evaluation_handlers import (
     ChecklistVerifyHandler,
     EvaluateHandler,
+    FetchArtifactHandler,
     LateralThinkHandler,
     MeasureDriftHandler,
+    StartEvaluateHandler,
+    SubmitFanoutResultsHandler,
 )
 from ouroboros.mcp.tools.evolution_handlers import (
     EvolveRewindHandler,
@@ -42,6 +49,11 @@ from ouroboros.mcp.tools.execution_handlers import (
     ExecuteSeedHandler,
     StartExecuteSeedHandler,
 )
+from ouroboros.mcp.tools.fanout_handler import (  # noqa: F401
+    create_artifact_fetch_handler,
+    create_fanout_handler,
+    create_fanout_handlers,
+)
 from ouroboros.mcp.tools.job_handlers import (
     CancelExecutionHandler,
     CancelJobHandler,
@@ -49,12 +61,17 @@ from ouroboros.mcp.tools.job_handlers import (
     JobStatusHandler,
     JobWaitHandler,
 )
+from ouroboros.mcp.tools.project_status_handler import ProjectStatusHandler
+from ouroboros.mcp.tools.projection_handlers import ProjectionQueryHandler
 from ouroboros.mcp.tools.qa import QAHandler
 from ouroboros.mcp.tools.query_handlers import (
     ACDashboardHandler,  # noqa: F401 — re-exported for adapter.py
     QueryEventsHandler,
     SessionStatusHandler,
 )
+from ouroboros.mcp.tools.ralph_handlers import RalphHandler, StartRalphHandler
+from ouroboros.mcp.tools.seed_handoff import SeedHandoffRegistry
+from ouroboros.mcp.tools.subagent import FanoutRegistry
 
 if TYPE_CHECKING:
     from ouroboros.orchestrator.agent_runtime_context import AgentRuntimeContext
@@ -179,6 +196,16 @@ def query_events_handler() -> QueryEventsHandler:
     return QueryEventsHandler()
 
 
+def projection_query_handler() -> ProjectionQueryHandler:
+    """Create a ProjectionQueryHandler instance."""
+    return ProjectionQueryHandler()
+
+
+def project_status_handler() -> ProjectStatusHandler:
+    """Create a ProjectStatusHandler instance."""
+    return ProjectStatusHandler()
+
+
 def generate_seed_handler(
     *,
     llm_backend: str | None = None,
@@ -212,6 +239,51 @@ def interview_handler(
     )
 
 
+def auto_handler(
+    *,
+    llm_backend: str | None = None,
+    runtime_backend: str | None = None,
+    mcp_manager: object | None = None,
+    mcp_tool_prefix: str = "",
+    opencode_mode: str | None = None,
+) -> object:
+    """Create an AutoHandler instance without adding it to legacy static tool tuples."""
+    from ouroboros.mcp.tools.auto_handler import AutoHandler
+
+    return AutoHandler(
+        llm_backend=llm_backend,
+        agent_runtime_backend=runtime_backend,
+        opencode_mode=opencode_mode,
+        mcp_manager=mcp_manager,
+        mcp_tool_prefix=mcp_tool_prefix,
+    )
+
+
+def start_auto_handler(
+    *,
+    llm_backend: str | None = None,
+    runtime_backend: str | None = None,
+    mcp_manager: object | None = None,
+    mcp_tool_prefix: str = "",
+    opencode_mode: str | None = None,
+) -> object:
+    """Create a StartAutoHandler instance (fire-and-forget ``ooo auto``).
+
+    Imports lazily to mirror :func:`auto_handler`; the underlying module
+    pulls in the full auto pipeline graph and would otherwise reintroduce
+    the import cycles that ``_LazyAutoHandler`` exists to avoid.
+    """
+    from ouroboros.mcp.tools.auto_handler import StartAutoHandler
+
+    return StartAutoHandler(
+        llm_backend=llm_backend,
+        agent_runtime_backend=runtime_backend,
+        opencode_mode=opencode_mode,
+        mcp_manager=mcp_manager,
+        mcp_tool_prefix=mcp_tool_prefix,
+    )
+
+
 def lateral_think_handler(
     *,
     runtime_backend: str | None = None,
@@ -232,6 +304,26 @@ def evaluate_handler(
 ) -> EvaluateHandler:
     """Create an EvaluateHandler instance."""
     return EvaluateHandler(
+        llm_backend=llm_backend,
+        agent_runtime_backend=runtime_backend,
+        opencode_mode=opencode_mode,
+    )
+
+
+def start_evaluate_handler(
+    *,
+    llm_backend: str | None = None,
+    runtime_backend: str | None = None,
+    opencode_mode: str | None = None,
+) -> StartEvaluateHandler:
+    """Create a StartEvaluateHandler instance."""
+    evaluate = EvaluateHandler(
+        llm_backend=llm_backend,
+        agent_runtime_backend=runtime_backend,
+        opencode_mode=opencode_mode,
+    )
+    return StartEvaluateHandler(
+        evaluate_handler=evaluate,
         llm_backend=llm_backend,
         agent_runtime_backend=runtime_backend,
         opencode_mode=opencode_mode,
@@ -278,6 +370,38 @@ def start_evolve_step_handler(
     )
 
 
+def ralph_handler(
+    *,
+    runtime_backend: str | None = None,
+    opencode_mode: str | None = None,
+) -> RalphHandler:
+    """Create a RalphHandler instance."""
+    return RalphHandler(
+        evolve_handler=EvolveStepHandler(
+            agent_runtime_backend=runtime_backend,
+            opencode_mode=opencode_mode,
+        ),
+        agent_runtime_backend=runtime_backend,
+        opencode_mode=opencode_mode,
+    )
+
+
+def start_ralph_handler(
+    *,
+    runtime_backend: str | None = None,
+    opencode_mode: str | None = None,
+) -> StartRalphHandler:
+    """Create a fire-and-forget Ralph start handler alias."""
+    return StartRalphHandler(
+        evolve_handler=EvolveStepHandler(
+            agent_runtime_backend=runtime_backend,
+            opencode_mode=opencode_mode,
+        ),
+        agent_runtime_backend=runtime_backend,
+        opencode_mode=opencode_mode,
+    )
+
+
 def lineage_status_handler() -> LineageStatusHandler:
     """Create a LineageStatusHandler instance."""
     return LineageStatusHandler()
@@ -292,6 +416,9 @@ def evolve_rewind_handler() -> EvolveRewindHandler:
 # Tool handler tuple type and factory
 # ---------------------------------------------------------------------------
 from ouroboros.mcp.tools.brownfield_handler import BrownfieldHandler  # noqa: E402
+from ouroboros.mcp.tools.fanout_composition import (  # noqa: E402
+    create_fanout_wiring,
+)
 from ouroboros.mcp.tools.pm_handler import PMInterviewHandler  # noqa: E402
 
 OuroborosToolHandlers = tuple[
@@ -304,14 +431,21 @@ OuroborosToolHandlers = tuple[
     | ACTreeHUDHandler
     | CancelJobHandler
     | QueryEventsHandler
+    | ProjectionQueryHandler
+    | ProjectStatusHandler
     | GenerateSeedHandler
     | MeasureDriftHandler
     | InterviewHandler
     | EvaluateHandler
+    | StartEvaluateHandler
     | ChecklistVerifyHandler
     | LateralThinkHandler
+    | SubmitFanoutResultsHandler
+    | FetchArtifactHandler
     | EvolveStepHandler
     | StartEvolveStepHandler
+    | RalphHandler
+    | StartRalphHandler
     | LineageStatusHandler
     | EvolveRewindHandler
     | CancelExecutionHandler
@@ -326,10 +460,13 @@ def get_ouroboros_tools(
     *,
     runtime_backend: str | None = None,
     llm_backend: str | None = None,
+    project_dir: str | Path | None = None,
     mcp_manager: object | None = None,
     mcp_tool_prefix: str = "",
     opencode_mode: str | None = None,
+    include_auto: bool = True,
     context: AgentRuntimeContext | None = None,
+    runtime_adapter: object | None = None,
 ) -> OuroborosToolHandlers:
     """Create the default set of Ouroboros MCP tool handlers.
 
@@ -340,34 +477,72 @@ def get_ouroboros_tools(
     falls through to its real in-process path. See
     ``ouroboros.mcp.tools.subagent.should_dispatch_via_plugin``.
 
+    ``project_dir`` is the effective runtime workspace for project-local
+    disposable artifacts.  Callers that only inspect definitions may omit it;
+    executable runtime surfaces must pass their already-resolved workspace so
+    artifact placement never depends on the launcher process CWD.
+
     When ``context`` is provided and carries an ``mcp_bridge``, the
     bridge supersedes the explicit ``mcp_manager`` / ``mcp_tool_prefix``
     kwargs (see :func:`_resolve_bridge_fields`). This is the migration
     path captured by #474; legacy kwargs continue to work unchanged.
+
+    Runtime-owned builtin interceptors receive the same configured object graph
+    as the MCP server composition root. The lightweight constructor path
+    remains for capability discovery, where ``runtime_adapter`` is absent.
     """
     resolved_manager, resolved_prefix = _resolve_bridge_fields(
         context, mcp_manager, mcp_tool_prefix
     )
+    needs_configured_runtime_graph = runtime_adapter is not None and (
+        runtime_backend in {"codex", "hermes"}
+        or (runtime_backend == "opencode" and opencode_mode == "plugin")
+    )
+    if needs_configured_runtime_graph and (
+        resolved_manager is None or (context is not None and context.mcp_bridge is not None)
+    ):
+        from ouroboros.mcp.tools.runtime_tool_composition import configured_runtime_tools
+
+        configured_tools = configured_runtime_tools(
+            runtime_backend=runtime_backend,
+            llm_backend=llm_backend,
+            opencode_mode=opencode_mode,
+            include_auto=include_auto,
+            mcp_bridge=(context.mcp_bridge if context is not None else None),
+            runtime_adapter=runtime_adapter,
+            project_dir=project_dir,
+        )
+        if configured_tools is not None:
+            return configured_tools
+
+    # One shared fan-out registry: interview/lateral producers register pending
+    # fan-outs into it, and the submit tool reads them back for synthesis.
+    fanout_registry = FanoutRegistry()
+    from ouroboros.persistence.event_store import EventStore
+
+    # Both producers take the store from the side that publishes into it,
+    # through the one factory the server's composition root also calls
+    # (RFC #2153).
+    submit_fanout, fetch_artifact, interview, pm_interview = create_fanout_wiring(
+        fanout_registry=fanout_registry,
+        workspace=project_dir,
+        event_store=context.event_store if context is not None else EventStore(),
+        llm_backend=llm_backend,
+        agent_runtime_backend=runtime_backend,
+        opencode_mode=opencode_mode,
+    )
+    seed_handoff_registry = SeedHandoffRegistry()
     execute_seed = ExecuteSeedHandler(
         agent_runtime_backend=runtime_backend,
         llm_backend=llm_backend,
         mcp_manager=resolved_manager,
         mcp_tool_prefix=resolved_prefix,
         opencode_mode=opencode_mode,
-    )
-    start_execute = StartExecuteSeedHandler(
-        execute_handler=execute_seed,
-        agent_runtime_backend=runtime_backend,
-        opencode_mode=opencode_mode,
+        seed_handoff_registry=seed_handoff_registry,
     )
     job_status = JobStatusHandler()
     job_wait = JobWaitHandler()
     job_result = JobResultHandler()
-    interview = InterviewHandler(
-        llm_backend=llm_backend,
-        agent_runtime_backend=runtime_backend,
-        opencode_mode=opencode_mode,
-    )
     generate_seed = GenerateSeedHandler(
         llm_backend=llm_backend,
         agent_runtime_backend=runtime_backend,
@@ -378,9 +553,44 @@ def get_ouroboros_tools(
         agent_runtime_backend=runtime_backend,
         opencode_mode=opencode_mode,
     )
+    start_evaluate = StartEvaluateHandler(
+        evaluate_handler=evaluate,
+        llm_backend=llm_backend,
+        agent_runtime_backend=runtime_backend,
+        opencode_mode=opencode_mode,
+        seed_handoff_registry=seed_handoff_registry,
+    )
+    start_execute = StartExecuteSeedHandler(
+        execute_handler=execute_seed,
+        agent_runtime_backend=runtime_backend,
+        opencode_mode=opencode_mode,
+        start_evaluate_handler=start_evaluate,
+        seed_handoff_registry=seed_handoff_registry,
+    )
+    auto = (
+        (
+            auto_handler(
+                llm_backend=llm_backend,
+                runtime_backend=runtime_backend,
+                mcp_manager=resolved_manager,
+                mcp_tool_prefix=resolved_prefix,
+                opencode_mode=opencode_mode,
+            ),
+            start_auto_handler(
+                llm_backend=llm_backend,
+                runtime_backend=runtime_backend,
+                mcp_manager=resolved_manager,
+                mcp_tool_prefix=resolved_prefix,
+                opencode_mode=opencode_mode,
+            ),
+        )
+        if include_auto
+        else ()
+    )
     return (
         execute_seed,
         start_execute,
+        *auto,
         SessionStatusHandler(),
         job_status,
         job_wait,
@@ -388,15 +598,21 @@ def get_ouroboros_tools(
         ACTreeHUDHandler(),
         CancelJobHandler(),
         QueryEventsHandler(),
+        ProjectionQueryHandler(),
+        ProjectStatusHandler(),
         generate_seed,
         MeasureDriftHandler(),
         interview,
         evaluate,
+        start_evaluate,
         ChecklistVerifyHandler(evaluate_handler=evaluate, llm_backend=llm_backend),
         LateralThinkHandler(
             agent_runtime_backend=runtime_backend,
             opencode_mode=opencode_mode,
+            fanout_registry=fanout_registry,
         ),
+        submit_fanout,
+        fetch_artifact,
         EvolveStepHandler(
             agent_runtime_backend=runtime_backend,
             opencode_mode=opencode_mode,
@@ -409,15 +625,27 @@ def get_ouroboros_tools(
             agent_runtime_backend=runtime_backend,
             opencode_mode=opencode_mode,
         ),
+        RalphHandler(
+            evolve_handler=EvolveStepHandler(
+                agent_runtime_backend=runtime_backend,
+                opencode_mode=opencode_mode,
+            ),
+            agent_runtime_backend=runtime_backend,
+            opencode_mode=opencode_mode,
+        ),
+        StartRalphHandler(
+            evolve_handler=EvolveStepHandler(
+                agent_runtime_backend=runtime_backend,
+                opencode_mode=opencode_mode,
+            ),
+            agent_runtime_backend=runtime_backend,
+            opencode_mode=opencode_mode,
+        ),
         LineageStatusHandler(),
         EvolveRewindHandler(),
         CancelExecutionHandler(),
         BrownfieldHandler(),
-        PMInterviewHandler(
-            llm_backend=llm_backend,
-            agent_runtime_backend=runtime_backend,
-            opencode_mode=opencode_mode,
-        ),
+        pm_interview,
         QAHandler(
             llm_backend=llm_backend,
             agent_runtime_backend=runtime_backend,
@@ -426,5 +654,54 @@ def get_ouroboros_tools(
     )
 
 
-# List of all Ouroboros tools for registration
-OUROBOROS_TOOLS: OuroborosToolHandlers = get_ouroboros_tools()
+class _LazyAutoHandler:
+    """Lazy static auto handler to avoid import cycles in OUROBOROS_TOOLS."""
+
+    @property
+    def definition(self):
+        from ouroboros.mcp.tools.auto_handler import AutoHandler
+
+        return AutoHandler().definition
+
+    async def handle(self, arguments):
+        from ouroboros.mcp.tools.auto_handler import AutoHandler
+
+        return await AutoHandler().handle(arguments)
+
+
+class _LazyStartAutoHandler:
+    """Lazy static fire-and-forget auto handler — mirror of _LazyAutoHandler."""
+
+    @property
+    def definition(self):
+        from ouroboros.mcp.tools.auto_handler import StartAutoHandler
+
+        return StartAutoHandler().definition
+
+    async def handle(self, arguments):
+        from ouroboros.mcp.tools.auto_handler import StartAutoHandler
+
+        return await StartAutoHandler().handle(arguments)
+
+
+def __getattr__(name: str) -> object:
+    """Lazily re-export handlers that would otherwise create import cycles."""
+    if name == "AutoHandler":
+        from ouroboros.mcp.tools.auto_handler import AutoHandler
+
+        return AutoHandler
+    if name == "StartAutoHandler":
+        from ouroboros.mcp.tools.auto_handler import StartAutoHandler
+
+        return StartAutoHandler
+    raise AttributeError(name)
+
+
+# Static legacy registry for definition/name lookups.  Runtime registration that
+# needs dependency injection should call ``get_ouroboros_tools(...)`` instead;
+# the auto entry here is a lazy proxy to avoid import cycles.
+OUROBOROS_TOOLS = (
+    *get_ouroboros_tools(include_auto=False),
+    _LazyAutoHandler(),
+    _LazyStartAutoHandler(),
+)

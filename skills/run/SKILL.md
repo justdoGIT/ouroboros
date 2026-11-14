@@ -1,251 +1,224 @@
 ---
-name: run
-description: "Execute a Seed specification through the workflow engine"
-mcp_tool: ouroboros_execute_seed
+name: ouroboros-run
+description: "Use when an Ouroboros Seed (a spec file with a goal and acceptance criteria, such as *.seed.yaml) already exists and the user wants it executed: 'run the seed', 'execute this spec', 'ooo run'. Executes it and verifies every acceptance criterion. Not for raw requests without a Seed (use interview or auto)."
+aliases: [execute]
+mcp_tool: ouroboros_start_execute_seed
 mcp_args:
   seed_path: "$1"
   cwd: "$CWD"
 ---
 
-# /ouroboros:run
+# /ouroboros:ouroboros-run
 
-Execute a Seed specification through the Ouroboros workflow engine.
+Execute a Seed specification through the Ouroboros workflow engine as a background job. A completed run enqueues formal evaluation by default, and a rejection continues through a bounded Ralph loop.
 
 ## Usage
 
 ```
-/ouroboros:run [seed_file_or_content]
+/ouroboros:ouroboros-run [seed_file_or_content]
 ```
-
-**Trigger keywords:** "ouroboros run", "execute seed"
-
-## How It Works
-
-1. **Input**: Provide seed YAML content directly or a path to a `.yaml` file
-2. **Validation**: Seed is parsed and validated (goal, constraints, acceptance criteria, ontology)
-3. **Execution**: The orchestrator runs the workflow with PAL routing
-4. **Progress**: Real-time progress updates via session tracking
-5. **Result**: Execution summary with pass/fail status
 
 ## Instructions
 
-When the user invokes this skill:
+### Loading MCP tools (deferred-schema guard)
 
-### Load MCP Tools (Required first)
-
-The Ouroboros MCP tools are often registered as **deferred tools** that must be explicitly loaded before use. **You MUST perform this step before proceeding.**
-
-1. Use the `ToolSearch` tool to find and load the execution MCP tools:
-   ```
-   ToolSearch query: "+ouroboros execute"
-   ```
-2. The tools will typically be named with prefix `mcp__plugin_ouroboros_ouroboros__` (e.g., `ouroboros_execute_seed`, `ouroboros_session_status`). After ToolSearch returns, the tools become callable.
-3. If ToolSearch finds the tools → proceed with the steps below. If not → skip to **Fallback** section.
-
-**IMPORTANT**: Do NOT skip this step. Do NOT assume MCP tools are unavailable just because they don't appear in your immediate tool list. They are almost always available as deferred tools that need to be loaded first.
+Ouroboros tools may be deferred, and a schema loaded on one turn can unload by the next. Immediately before each `ouroboros_*` call, load it with the active runtime's tool-discovery capability: `"+ouroboros execute"` for `ouroboros_start_execute_seed`, `ouroboros_job_wait`, `ouroboros_job_result`, and `ouroboros_ac_tree_hud`; `"+ouroboros session signal"` for `ouroboros_session_signal_targets` and `ouroboros_session_signal`. A call whose schema is not loaded fails with "Invalid tool parameters". If the tool is already callable, discovery is a no-op and an empty result is expected. Use the **Fallback (No MCP Server)** section only when the tools are genuinely absent.
 
 ### Execution Steps
 
-1. **Detect git workflow** (before any code changes):
-   - Read the project's `CLAUDE.md` for git workflow preferences
-   - If PR-based workflow detected and currently on `main`/`master`:
-     - Create a feature branch: `ooo/run/<session_id>`
-     - All code changes go to this branch
-   - If no preference: use current branch (backward compatible)
+1. **Do not create or switch branches yourself.** For a background execution
+   job, `use_worktree` defaults to true: the server runs the task in its own
+   worktree and reports `worktree_path` / `worktree_branch` in the job result.
+   Tell the user the task was isolated only when those fields are present. A
+   `dispatch_mode="plugin"` response delegates to a child session and carries
+   no worktree.
 
-2. Check if the user provided seed content or a file path:
-   - If a file path: Read the file with the Read tool
-   - If inline YAML: Use directly
-   - If neither: Check conversation history for a recently generated seed
+2. **Get the Seed.** Read a given file path with the active runtime's `inspect_code` capability, use inline YAML directly, or otherwise take the most recently generated Seed in the conversation.
 
-3. **Start background execution** with `ouroboros_start_execute_seed`:
+   Before a fresh start, do not ask about an efficiency policy unless the user
+   raised it or `execution.default_policy` in `~/.ouroboros/config.yaml` is
+   explicitly `ask`. Otherwise omit both arguments: the server applies the
+   configured default (quality-first when nothing is configured), and its start
+   receipt names the running policy and the change command. If the user did
+   choose, or the config says `ask`, map the choice in outcome language:
+
+   - **Efficient execution**: start parallel/decomposed work economically and
+     strengthen the route only when recovery requires it. Send
+     `efficiency_mode="adaptive"` and `frugality_assurance="observe"`.
+   - **Quality-first execution**: keep child work at the parent starting tier.
+     Send `efficiency_mode="quality_first"` and `frugality_assurance="off"`.
+
+   `frugality_assurance="strict"` is a separate explicit opt-in because it may
+   spend extra work on proof; never infer it from the efficiency choice. Do not
+   ask again on resume: the server restores the persisted policy and rejects a
+   resume-time change.
+
+3. **Start background execution:**
    ```
    Tool: ouroboros_start_execute_seed
    Arguments:
      seed_content: <the seed YAML>
-     model_tier: "medium"  (or as specified by user)
-     max_iterations: 10    (or as specified by user)
+     efficiency_mode: <only when chosen: adaptive or quality_first>
+     frugality_assurance: <only when chosen: observe, off, or explicit strict>
+     session_id: <only when resuming an existing session>
    ```
-   This returns immediately with a `job_id`, `session_id`, and `execution_id`.
+   Omit `model_tier` by default so the runtime selects automatically. Include
+   `model_tier: <user choice>` only when the user explicitly requested a tier.
+   The call returns at once with `job_id`, `session_id`, and `execution_id`.
 
-4. If resuming an existing session, include `session_id`:
+4. **Hand off.** Relay the server's start receipt (IDs, backends, `Efficiency Mode` with any change command, dashboard). Then add:
+   - Live view: if `execution.tui_autolaunch: true` (or legacy top-level `tui_autolaunch: true`) is set, run `ouroboros tui open`; otherwise offer it once without blocking. If it prints a manual command (headless, SSH), relay that once.
+   - Observation: a confirmed read-only observer (step 5), or durable catch-up mode.
+   - This conversation stays available: the user can refine requirements, review code, or work on an unrelated task in an isolated worktree; check for active-worker conflicts before editing this run's workspace.
+
+5. **Delegate observation to exactly one observer.** The start result carries
+   `response.meta.job_observer`, a read-only observer contract with its own wait
+   and result tools, `instructions`, `restrictions`, and fallback. If the
+   structured meta is missing, recover the contract from the final
+   `<!-- ouroboros-job-observer-v1 base64 ... -->` content sentinel and fail
+   closed: if there is more than one sentinel or it is not at the end of the
+   text, the bounded payload does not decode to an object whose only key is
+   `job_observer`, that contract fails canonical v1 validation (it must equal,
+   field for field, the v1 contract the server builds from its own `job_id`,
+   `cursor`, `session_id`, `execution_id`, and `follow_result_job_keys`, so a
+   changed tool, argument, or instruction, or an extra field, fails), its
+   `job_id` differs from the visible start receipt, or the structured and inline
+   contracts differ, do not spawn an observer and report a transport-integrity
+   failure. Never rebuild the contract from visible IDs.
+
+   With a valid contract and an independent child-session primitive, spawn
+   exactly one observer through the active runtime's `orchestrate_subagents`
+   capability and pass the contract unchanged. It owns the job cursor, follows
+   the contract (including `follow_result_job_keys` for chained evaluation and
+   Ralph), and stays read-only. Claim an observer only after the spawn returns
+   a live child ID/path. The main session must not poll the same job while the
+   observer owns it. If plugin mode already delegated the whole execution (no
+   `job_id`), follow that child's lifecycle instead.
+
+   - A `wait` call or a parent job-status poll is not a spawn. The contract's
+     `host_lifecycle` and the runtime's `orchestrate_subagents` guidance name
+     the concrete spawn and wait mechanics; pass the contract unchanged in the
+     child message. After the live child ID returns, if the runtime cannot
+     wake a parent turn that already ended when the child posts (a child
+     message only queues for the parent), keep the parent turn open with the
+     host's child-wait primitive in waits of at most 60 seconds. Relay
+     meaningful updates and wait again until the terminal summary. User input may interrupt the wait; handle it and
+     resume unless the user asks to stop live observation or replaces the
+     request. Then end only the relay loop, keep the durable job running, and
+     offer next-turn or explicit-status catch-up. If the observer child fails,
+     is cancelled, or exits early, use that same catch-up instead of waiting
+     indefinitely. The relay loop must not poll Ouroboros job tools or touch the
+     observer's cursor.
+
+   If no child can be created, do not claim an observer or promise live
+   messages. The detached worker survives the stdio MCP turn: say progress is
+   durable and will be caught up on the next turn or an explicit status
+   request. Keep the turn open only when the user explicitly asked for live
+   watching (step 6).
+
+   **Relaying observer events.** Relay each meaningful event in 1-2 lines;
+   suppress unchanged heartbeats, raw tool output, commands, and reasoning.
+   - `run_configuration`: runtime/harness, starting model or tier when known,
+     efficiency mode, frugality assurance.
+   - `execution_plan`: total ACs, dependency/parallel levels, and the first
+     scheduled AC summaries.
+   - `discovery_summary`: bounded targets and purpose.
+   - `level_started` / `level_completed`, `ac_routing` / `harness_changed`
+     ("currently running with"), `ac_attempt_judged`: only real changes.
+   - `ac_accepted` / `ac_rejected`: the AC's final acceptance and compact
+     disposition evidence.
+   - `attention_required`: surface immediately (see Active Conductor below).
+   - Synapse `.queued` / `.delivering`: pending, not applied yet. `.applied` /
+     `.completed`: confirm and relay any bounded AC reply. `.rejected` /
+     `.delivery_uncertain`: surface immediately; never claim the AC changed
+     course.
+
+   These are English canonical host instructions: render every relay in the
+   user's current conversation language, keeping event codes and mode values
+   only when exact diagnostics help.
+
+6. **Fallback: live relay in the main session.** Only when there is no
+   observer contract or no child primitive, and the user explicitly asked to
+   keep watching this turn. Never run it beside a delegated observer;
+   otherwise end the turn and catch up from the same cursor next turn.
    ```
-   Tool: ouroboros_start_execute_seed
+   Tool: ouroboros_job_wait
    Arguments:
-     seed_content: <the seed YAML>
-     session_id: <existing session ID>
+     job_id: <job_id>
+     cursor: <latest cursor, or 0>
+     timeout_seconds: 180
+     view: "summary"
+     stream: "linked"
+     wait_for: "attention_or_ac_change"
    ```
+   Replace the cursor from `response.meta.cursor` after every call. Treat
+   `response.meta` as the source of truth and `response.text` only as a hint.
+   If `response.meta.changed` is false, repeat silently; otherwise emit one
+   compact line (phase, AC/sub-AC counts, new current-work hint), never raw
+   JSON, the full tree, or an ETA. On `completed`, `failed`, `cancelled`, or
+   `interrupted`, say so explicitly and go to step 8.
 
-5. **Recommended monitoring stance: relay compact progress in the main session.**
-
-   After IDs are returned, print only this short handoff:
-
+7. **Drill-down only.** Use `ouroboros_ac_tree_hud` when the user asks for
+   details or progress looks stuck, never in the routine loop. `view` is
+   `"compact"`, `"summary"`, or `"tree"` (add `max_nodes: 30`); treat
+   `unchanged cursor=<cursor>` as a silent no-op.
    ```
-   Execution started in background.
-   Job ID: <job_id>
-   Session ID: <session_id>
-   Execution ID: <execution_id>
-
-   I will wait in low-token relay mode and report only meaningful state changes.
-   For full details later: `ouroboros_ac_tree_hud(session_id=<session_id>)`
-   ```
-
-   Rationale: the main chat session must wait for MCP calls. Frequent full-tree
-   polling burns context without improving execution. The user usually wants
-   "what is it doing now?" rather than the whole tree, so use compact job
-   read-model snapshots and narrate them like a brief live relay.
-
-6. **Low-token relay loop with `ouroboros_job_wait` (recommended default).**
-
-   Use `ouroboros_job_wait`, not repeated `ouroboros_ac_tree_hud`, for routine
-   monitoring. Keep the latest cursor and previous progress counters from the
-   tool meta payload.
-
-   This loop is intentionally harness/model friendly:
-   - Treat `response.meta` as the source of truth.
-   - Do not parse `response.text` for counts, status, or cursor.
-   - Use `response.text` only as a human-readable current-message hint.
-   - Keep all local monitor state in simple scalar variables.
-   - Emit at most one short relay message per changed response.
-   - Always continue to final `ouroboros_job_result` after a terminal status.
-
-   ```
-   cursor = <cursor from start/status response, or 0>
-   prev_status = "running"
-   prev_phase = null
-   prev_ac_completed = 0
-   prev_sub_ac_completed = 0
-   prev_message = null
-
-   loop:
-     Tool: ouroboros_job_wait
-     Arguments:
-       job_id: <job_id from step 3>
-       cursor: <cursor>
-       timeout_seconds: 180
-       view: "summary"
-
-     cursor = response.meta.cursor
-
-     if response.meta.changed is false:
-       # Do not narrate unless the user explicitly asked for heartbeat updates.
-       continue
-
-     status = response.meta.status
-     phase = response.meta.current_phase
-     ac_completed = response.meta.ac_completed
-     ac_total = response.meta.ac_total
-     sub_ac_completed = response.meta.sub_ac_completed
-     sub_ac_total = response.meta.sub_ac_total
-     message_hint = first non-empty non-metadata line from response.text, or null
-
-     # Build one short relay update from structured fields.
-     if status in ["completed", "failed", "cancelled", "interrupted"]:
-       print terminal_relay(status, phase, ac_completed, ac_total, sub_ac_completed, sub_ac_total)
-       break
-
-     if ac_completed > prev_ac_completed:
-       print ac_progress_relay(phase, ac_completed, ac_total, sub_ac_completed, sub_ac_total, message_hint)
-     elif sub_ac_completed > prev_sub_ac_completed:
-       print sub_ac_progress_relay(phase, ac_completed, ac_total, sub_ac_completed, sub_ac_total, message_hint)
-     elif phase != prev_phase or status != prev_status:
-       print phase_or_status_relay(status, phase, ac_completed, ac_total, sub_ac_completed, sub_ac_total)
-     elif message_hint != prev_message:
-       print current_work_relay(phase, ac_completed, ac_total, sub_ac_completed, sub_ac_total, message_hint)
-
-     prev_status = status
-     prev_phase = phase
-     prev_ac_completed = ac_completed or prev_ac_completed
-     prev_sub_ac_completed = sub_ac_completed or prev_sub_ac_completed
-     prev_message = message_hint or prev_message
-   ```
-
-   Notes:
-   - `timeout_seconds: 180` means the MCP call can block for up to 3 minutes.
-     This keeps the main session available often enough for a live relay while
-     still avoiding noisy polling.
-   - Use `view: "compact"` for very long jobs or when the user only wants a
-     heartbeat. It returns one-line state such as `job_x | running | AC 3/17`.
-   - Use `view: "summary"` for normal monitoring. It includes the job message
-     plus AC/Sub-AC counts.
-   - Use `view: "full"` only when the user asks for detailed job status.
-
-   Relay style examples:
-   - `In progress: Deliver is at AC 1/3 and Sub-AC 12/16. Current work is the Sub-AC 3 regression test.`
-   - `Level update: parallel level 1/1 has finished, and AC progress advanced to 3/3.`
-   - `Completed: execution finished. Fetching the final job result now.`
-
-   Relay output contract for other harnesses/models:
-   - One update should be 1-2 sentences or 1 compact line.
-   - Include `phase`, `AC completed/total`, and `Sub-AC completed/total` when present.
-   - Include the current work hint only if it changes.
-   - Never include the full AC tree in routine relay output.
-   - Never include raw JSON, raw meta dumps, or repeated unchanged cursor lines.
-   - Terminal statuses must be explicit: completed, failed, cancelled, or interrupted.
-
-   Do not paste the full raw tool output unless the user asks for raw status.
-   Do not add speculative ETA unless the tool provides one.
-
-7. **Use `ouroboros_ac_tree_hud` only for manual drill-down or anomaly checks.**
-
-   Do not call full tree HUD in the normal polling loop.
-
-   Use these targeted calls:
-
-   ```
-   # Explicit short HUD, useful for a one-off check
    Tool: ouroboros_ac_tree_hud
    Arguments:
      session_id: <session_id>
      cursor: <cursor>
      view: "summary"
-
-   # Lowest-token one-line HUD
-   Tool: ouroboros_ac_tree_hud
-   Arguments:
-     session_id: <session_id>
-     cursor: <cursor>
-     view: "compact"
-
-   # Full tree only when user asks "show details", progress looks stuck,
-   # or debugging requires seeing AC/Sub-AC structure.
-   Tool: ouroboros_ac_tree_hud
-   Arguments:
-     session_id: <session_id>
-     cursor: <cursor>
-     view: "tree"
-     max_nodes: 30
    ```
 
-   Treat `unchanged cursor=<cursor>` from explicit compact/summary views as a
-   no-op. Do not explain it to the user unless they explicitly asked for
-   heartbeat messages.
-
-8. **Fetch final result** with `ouroboros_job_result`:
+8. **Fetch the final result in the polling owner** (the observer by default,
+   the main session only on the step 6 fallback):
    ```
    Tool: ouroboros_job_result
    Arguments:
      job_id: <job_id>
    ```
+   Present status, session ID, and summary. Its QA verdict (skippable with
+   `skip_qa: true` at start) is not the formal 3-stage evaluator.
 
-9. Present the execution results to the user:
-   - Show success/failure status
-   - Show session ID (for later status checks)
-   - Show execution summary
+   If the result meta has `chained_evaluate_job_id`, the polling owner follows
+   that job and fetches its result: render **APPROVED** when
+   `final_approved: true`, otherwise not approved with the failed ACs or
+   reason. If the evaluate job failed or timed out, keep the run success and
+   show `Next: ooo evaluate <session_id>` as the manual retry. If the
+   evaluation has `chained_ralph_job_id`, follow it too and report approval or
+   the bounded Ralph stop reason; a rejected first evaluation does not make
+   the run blocked.
 
-10. **Post-execution QA** (automatic):
-   `ouroboros_start_execute_seed` automatically runs QA after successful execution.
-   The QA verdict is included in the final job result text.
-   To skip: pass `skip_qa: true` to the tool.
-
-   Present QA verdict with next step:
+   Without `chained_evaluate_job_id`, show:
    - **PASS**: `Next: ooo evaluate <session_id> for formal 3-stage verification`
-   - **REVISE**: Show differences/suggestions, then `Next: Fix the issues above, then ooo run to retry -- or ooo unstuck if blocked`
+   - **REVISE**: the differences/suggestions, then `Next: Fix the issues above, then ooo run to retry -- or ooo unstuck if blocked`
    - **FAIL/ESCALATE**: `Next: Review failures above, then ooo run to retry -- or ooo unstuck if blocked`
+
+### Synapse intent refinement
+
+Synapse is the `ouroboros_session_signal` channel that delivers bounded user intent to one running AC. When the user adds implementation intent during an active run, the main session picks the target; never ask the user for internal AC or session IDs.
+
+1. Call `ouroboros_session_signal_targets(execution_id=...)` with the `execution_id` from the start result or observer contract.
+2. Match the user's meaning against each target's `ac_content`, display path, and current HUD activity. Select one active target directly; with several, select only a materially more relevant one, and ask a short clarification only for a genuine tie.
+3. Additive implementation refinement: call `ouroboros_session_signal` with the target's exact scope/attempt/execution guards, `contract_effect="additive"`, `source="user"`, `mode="redirect"`, `fallback_mode="after_turn"`, `expected_contract_version` when discovery supplies it, and one stable idempotency key for this user turn. If the target went stale, rediscover once instead of asking for IDs.
+4. Read-only question or assurance request: use `mode="inform"` and `contract_effect="additive"`, and omit `fallback_mode` (valid only for redirect). Relay the bounded reply from the completed event.
+5. Tell the user which AC was selected and the effective mode; say it was reflected only after `.applied` or `.completed`.
+
+Never use Synapse to change approved goals, ACs, constraints, or non-goals; those need an approved shared successor or replacement contract.
+
+### Active Conductor attention handling
+
+`recommended_host_actions` is the authoritative menu; never invent a mutating tool call.
+
+1. VERIFY with at most one short-lived read-only host child using the supplied evidence IDs. Without a verifier primitive, surface the attention and stop before mutation.
+2. DECIDE among the ordered menu actions only after engine-owned retry/routing is closed.
+3. LOG `phase="selected"` through `ouroboros_record_conductor_decision` before ACT. A specification change in run mode needs explicit user approval with its receipt bound.
+4. ACT only when the menu names a currently registered MCP tool. A corrective successor preserves the approved contract unless the user approved the shared specification change.
+5. LOG exactly one terminal `completed`, `failed`, or `declined` outcome. Never silently retry a failed conductor action.
 
 ## Fallback (No MCP Server)
 
-If the MCP server is not available, inform the user:
+Tell the user:
 
 ```
 Ouroboros MCP server is not configured.
@@ -257,35 +230,6 @@ Without MCP, you can still:
 - Manually implement the seed specification
 ```
 
-## Example
+## RFC #1392 State Breadcrumb Footer
 
-```
-User: /ouroboros:run seed.yaml
-
-[Reads seed.yaml, validates, starts background execution]
-
-Background execution started.
-Job ID: job_a1b2c3d4e5f6
-Session ID: orch_x1y2z3
-Execution ID: exec_m1n2o3
-
-[Relay]
-In progress: Deliver is at AC 1/3 and Sub-AC 12/16.
-Current work is finishing the workflow routing Sub-AC.
-
-[Relay]
-Level update: parallel level 1/1 has finished, and AC progress advanced to 3/3.
-Execution is complete. Fetching the final job result now.
-
-[Fetching final result...]
-
-Result:
-  Seed Execution SUCCESS
-  ========================
-  Session ID: orch_x1y2z3
-  Goal: Build a CLI task manager
-  Duration: 45.2s
-  Messages Processed: 12
-
-  Next: `ooo evaluate orch_x1y2z3` for formal 3-stage verification
-```
+End the final response with exactly one line `◆ <current state> → next: <recommended action>`. Derive the state from live session state via `ouroboros_session_status` when available, otherwise from this skill's actual outcome. Never use a linear `Step N of M` footer; when the next step is a real choice, list 2-3 options.

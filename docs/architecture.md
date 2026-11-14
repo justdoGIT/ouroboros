@@ -12,20 +12,27 @@ for the canonical meanings of `AgentRuntimeContext`, `ControlPlane`,
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│                                 OUROBOROS ARCHITECTURE                                               │
+│                            USERLEVEL PROGRAMS LAYER  (Section 7)                                     │
+│        Installable plugins:  github-pr-ops  ·  jira-sync  ·  release-coordinator   ...               │
+│        First-party programs: ooo auto       ·  ooo run    ·  ooo pm                                  │
+└──────────────────────────────────────────────┬──────────────────────────────────────────────────────┘
+                                               │ declared manifest contract / declared scopes
+                                               ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                          OUROBOROS ARCHITECTURE  (core, Sections 1–6)                                │
 ├─────────────────────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                                     │
 │  ┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────────┐                 │
-│  │      PLUGIN LAYER    │     │      CORE LAYER     │     │      PRESENTATION    │                 │
-│  │                     │     │                     │     │      LAYER           │                 │
+│  │  SKILLS & AGENTS    │     │      CORE LAYER     │     │      PRESENTATION    │                 │
+│  │     REGISTRY        │     │                     │     │      LAYER           │                 │
 │  │  ┌───────────────┐  │     │  ┌───────────────┐  │     │  ┌───────────────┐  │                 │
 │  │  │   Skills      │──┼─────┼─▶│   Seed Spec    │──┼─────┼─▶│   TUI Dashboard │  │                 │
-│  │  │   (9)         │  │     │  │   (Immutable)  │  │     │  │   (Textual)   │  │                 │
+│  │  │   (23)        │  │     │  │   (Immutable)  │  │     │  │   (Textual)   │  │                 │
 │  │  └───────────────┘  │     │  └───────────────┘  │     │  └───────────────┘  │                 │
 │  │                     │     │                     │     │                     │                 │
 │  │  ┌───────────────┐  │     │  ┌───────────────┐  │     │  ┌───────────────┐  │                 │
 │  │  │   Agents      │──┼─────┼─▶│  Acceptance    │──┼─────┼─▶│   CLI Interface│  │                 │
-│  │  │   (9)         │  │     │  │  Criteria Tree │  │     │  │   (Typer)    │  │                 │
+│  │  │   (21)        │  │     │  │  Criteria Tree │  │     │  │   (Typer)    │  │                 │
 │  │  └───────────────┘  │     │  └───────────────┘  │     │  └───────────────┘  │                 │
 │  └─────────────────────┘     └─────────────────────┘     └─────────────────────┘                 │
 │           │                         │                         │                                 │
@@ -37,8 +44,8 @@ for the canonical meanings of `AgentRuntimeContext`, `ControlPlane`,
 │  │    EXECUTION LAYER   │     │    STATE LAYER     │     │    ORCHESTRATION    │                 │
 │  │                     │     │                     │     │      LAYER         │                 │
 │  │  ┌───────────────┐  │     │  ┌───────────────┐  │     │  ┌───────────────┐  │                 │
-│  │  │ 7 Execution  │  │     │  │ Event Store  │  │     │  │ 6-Phase       │  │                 │
-│  │  │   Modes      │  │     │  │  (SQLite)    │  │     │  │ Pipeline      │  │                 │
+│  │  │ Execution    │  │     │  │ Event Store  │  │     │  │ 6-Phase       │  │                 │
+│  │  │   Engine     │  │     │  │  (SQLite)    │  │     │  │ Pipeline      │  │                 │
 │  │  └───────────────┘  │     │  └───────────────┘  │     │  └───────────────┘  │                 │
 │  │                     │     │                     │     │                     │                 │
 │  │  ┌───────────────┐  │     │  │ Checkpoint   │  │     │  │ PAL Router    │  │                 │
@@ -51,12 +58,23 @@ for the canonical meanings of `AgentRuntimeContext`, `ControlPlane`,
 
 ## Core Components Overview
 
-### 1. Plugin Layer
-**Auto-discovery of skills and agents through the plugin system**
-- Skills: 14 core workflow skills (interview, seed, run, evaluate, evolve, cancel, unstuck, update, help, setup, ralph, tutorial, welcome, status)
-- Agents: 9 specialized agents for different thinking modes
+### 1. Skills & Agents Registry
+**Auto-discovery of bundled skills and agents that ship with Ouroboros core**
+- Skills: 23 core workflow skills (auto, brownfield, cancel, config, evaluate, evolve, help, idk, interview, ooo, pm, publish, qa, ralph, resume-session, run, seed, setup, status, tutorial, unstuck, update, welcome)
+- Agents: 21 specialized agents for different thinking modes
 - Hot-reload capabilities without restart
 - Magic prefix detection (`/ouroboros:`)
+
+> **Note**: This layer is the in-process registry of bundled skills and agents
+> that ship with core. It is **not** the user-installable UserLevel plugin
+> layer (introduced in [#725](https://github.com/Q00/ouroboros/issues/725)).
+> User-installable plugins live one layer above this — see
+> [`Section 7: UserLevel Programs Layer`](#7-userlevel-programs-layer) below.
+> The full layer-model and contract are described in issue
+> [#725](https://github.com/Q00/ouroboros/issues/725); a long-form RFC is
+> being drafted in PR [#743](https://github.com/Q00/ouroboros/pull/743) and
+> will land at `docs/rfc/userlevel-plugins.md` once merged. Do not conflate
+> the two registries in PRs.
 
 ### 2. Core Layer
 **Immutable data models and specifications**
@@ -76,16 +94,23 @@ for the canonical meanings of `AgentRuntimeContext`, `ControlPlane`,
 - SQLite event store with append-only writes
 - Full replay capability
 - Checkpoint system with compression
+- Disposable Memory artifact bodies in `.ouroboros/artifacts/artifacts.db`,
+  one row per contract; the EventStore keeps only the bounded envelope, which
+  names the contract and never the body
 - 5 optimized indexes for performance
 
 ### 5. Orchestration Layer
-**6-phase pipeline ensuring comprehensive execution**
+
+CLI workflow runs, MCP seed execution, and evolution generations assemble
+`OrchestratorRunner` through `orchestrator/runner_factory.py`. The builder
+initializes the checkpoint store and applies common depth and worker defaults;
+each entry point supplies its resolved request, workspace, and host context.
+**5-phase pipeline ensuring comprehensive execution**
 - Phase 0: Big Bang (Interview → Seed)
 - Phase 1: PAL Router (Cost optimization)
-- Phase 2: Double Diamond (Discover → Define → Design → Deliver)
+- Phase 2: Execution (dependency-staged AC fan-out to agent runtimes)
 - Phase 3: Resilience (Lateral thinking)
 - Phase 4: Evaluation (3-stage pipeline)
-- Phase 5: Secondary Loop (TODO registry)
 
 ### 6. Presentation Layer
 **Rich TUI interface with real-time visibility**
@@ -94,6 +119,61 @@ for the canonical meanings of `AgentRuntimeContext`, `ControlPlane`,
 - Agent activity monitor
 - Cost tracking and drift visualization
 - Interactive debugging capabilities
+
+### 7. UserLevel Programs Layer
+
+**Workflows composed on top of core primitives via a declared manifest
+contract** — both first-party programs that ship today (`ooo auto`, `ooo run`,
+`ooo pm`) and a planned third-party plugin surface (introduced in
+[#725](https://github.com/Q00/ouroboros/issues/725); long-form RFC in flight
+in PR [#743](https://github.com/Q00/ouroboros/pull/743), which will land at
+`docs/rfc/userlevel-plugins.md`). The third-party install surface
+(`ooo plugin add ...`) is not yet implemented on `main`; this section
+documents the architectural target so PRs can be discussed in consistent
+terms.
+
+This layer is distinct from the in-process Skills & Agents Registry
+(Section 1):
+
+- **Skills & Agents Registry** = in-process subsystem of bundled
+  skills/agents that ship with core. Discovered via `/ouroboros:` magic
+  prefix. Used by `ooo interview`, `ooo qa`, etc.
+- **UserLevel Programs Layer** = workflows composed on top of core
+  primitives via a declared manifest contract. First-party programs
+  shipped today: `ooo auto`, `ooo run`, `ooo pm`. Installable third-party
+  plugins (e.g. `github-pr-ops`, `merge-assistant`, `jira-sync`) are
+  **planned**: the manifest schema is being prototyped at
+  [Q00/ouroboros-plugins/schemas/0.1/](https://github.com/Q00/ouroboros-plugins/tree/main/schemas/0.1)
+  and the `ooo plugin add <repo-url>` install surface is tracked under
+  [#725](https://github.com/Q00/ouroboros/issues/725); it does not exist
+  on `main` yet. First-party and installable programs will share the
+  same manifest format.
+
+```text
++----------------------------------------------------------------------+
+| UserLevel Programs Layer                                             |
+|                                                                      |
+|   Shipped (first-party):     ooo auto   ooo run   ooo pm             |
+|   Planned (third-party):     github-pr-ops  jira-sync  ...  (#725)   |
++--------------------------+-------------------------------------------+
+                           | declared manifest contract
+                           v
+                      Ouroboros core
+                      (Sections 1–6 above)
+```
+
+**Why a separate layer?** To keep `ooo auto` coherent (`goal → interview
+→ Seed → handoff` only), keep core small, and route domain-specific
+operational workflows (GitHub PR ops, Jira triage, Slack incident
+response) into pluggable packages rather than into core or `ooo auto`.
+
+**Manifest contract**: see [Q00/ouroboros-plugins/schemas/0.1/](https://github.com/Q00/ouroboros-plugins/tree/main/schemas/0.1). Core currently supports archived v0.1 plus a local v0.2 extension for optional hook declarations.
+
+> **Terminology guard**: in this codebase, "plugin" by itself can refer to
+> either the in-process Skills/Agents Registry or the UserLevel Programs
+> Layer. When writing PRs or docs, qualify the term — e.g.
+> "skill plugin" (Section 1) vs "UserLevel plugin" (Section 7). When in
+> doubt, link the relevant section.
 
 ## Philosophy
 
@@ -113,7 +193,7 @@ Ouroboros applies two ancient methods to transmute irrational input into executa
 ```
 Phase 0: BIG BANG         -> Crystallize requirements into a Seed
 Phase 1: PAL ROUTER       -> Select appropriate model tier
-Phase 2: DOUBLE DIAMOND   -> Decompose and execute tasks
+Phase 2: EXECUTION        -> Fan out and execute acceptance criteria
 Phase 3: RESILIENCE       -> Handle stagnation with lateral thinking
 Phase 4: EVALUATION       -> Verify outputs at three stages
 Phase 5: SECONDARY LOOP   -> Process deferred TODOs
@@ -140,82 +220,91 @@ The Big Bang phase transforms vague ideas into crystallized specifications throu
 
 ### Phase 1: PAL Router (Progressive Adaptive LLM)
 
-The PAL Router selects the most cost-effective model tier based on task complexity.
+The PAL Router picks a model tier for each unit of work and escalates it on retry.
+It is a stateless decision point in the orchestrator; there is no `routing/` package
+(`src/ouroboros/router/` is the unrelated skill-dispatch router).
 
 **Components:**
-- `routing/router.py` - Main routing logic
-- `routing/complexity.py` - Task complexity estimation
-- `routing/tiers.py` - Model tier definitions
-- `routing/escalation.py` - Escalation logic on failure
-- `routing/downgrade.py` - Downgrade logic on success
+- `orchestrator/model_routing.py` - Tier ladder, `build_model_router()`, and per-unit `decide_model()`
+- `orchestrator/effort_routing.py` - Sibling policy for reasoning effort (not model tier)
+- `config/models.py` - `EconomicsConfig` and `TierConfig` (tier definitions and thresholds)
 
 **Tiers:**
-| Tier | Cost | Complexity Threshold |
-|------|------|---------------------|
-| FRUGAL | 1x | < 0.4 |
-| STANDARD | 10x | < 0.7 |
-| FRONTIER | 30x | >= 0.7 or critical |
+| Tier | `cost_factor` (shipped default) |
+|------|------|
+| FRUGAL | 1 |
+| STANDARD | 10 |
+| FRONTIER | 30 |
 
-**Strategy:** Start frugal, escalate only on failure.
+**Starting tier:**
+- The base tier is one tier above `economics.default_tier`, capped at frontier: the shipped `frugal` gives `standard`, and both `standard` and `frontier` give `frontier`.
+- Top-level ACs and decomposed children without an explicit trust signal start at the base tier.
+- In adaptive efficiency mode, a decomposed child whose decomposition carries an explicit trust signal starts one tier lower, never below frugal. That equals `default_tier` when it is `frugal` or `standard`, but is `standard` when it is `frontier`. Quality-first runs never lower.
+- An execution-profile hint can suggest a different starting tier.
+- No complexity score is computed: token count, tool count, and AC depth do not affect the tier.
+- Routing stays dormant, leaving model choice to the runtime, when `OUROBOROS_MODEL_TIER_ROUTING` is `0`, `off`, or `false`; when an explicit Execute-stage model pin is in effect; when the runtime backend has no mapped tier ladder (for example OpenCode); or when Codex runs on plain automatic model selection (opt in with `OUROBOROS_MODEL_TIER_ROUTING=1`).
 
-**Complexity Scoring Algorithm:**
+**Escalation:** failures move a unit toward the frontier tier. Top-level ACs on the bounded route path escalate in `orchestrator/route_escalation.py` (`advance_route()`); the retry-count rule in `decide_model()` (`orchestrator/model_routing.py`) covers the remaining units.
 
-The complexity score is a weighted sum of three normalized factors:
+**No downgrade path:** a tier is never lowered after consecutive successes.
+`economics.downgrade_success_streak` is accepted by the config schema, but nothing reads it.
 
-| Factor | Weight | Normalization | Threshold |
-|--------|--------|---------------|-----------|
-| Token count | 30% | `min(tokens / 4000, 1.0)` | 4000 tokens |
-| Tool dependencies | 30% | `min(tools / 5, 1.0)` | 5 tools |
-| AC nesting depth | 40% | `min(depth / 5, 1.0)` | depth 5 |
+### Phase 2: Execution
 
-```
-complexity = 0.30 * norm_tokens + 0.30 * norm_tools + 0.40 * norm_depth
-```
+The execution phase fans seed acceptance criteria out to agent runtimes,
+optionally splitting an AC into sub-ACs when it genuinely spans multiple
+independently-verifiable units.
 
-**Escalation Path:**
-
-When a task fails consecutively at its current tier (threshold: 2 failures), it escalates:
-
-```
-Frugal → Standard → Frontier → Stagnation Event (triggers resilience)
-```
-
-**Downgrade Path:**
-
-After sustained success (threshold: 5 consecutive successes), the tier downgrades:
-
-```
-Frontier → Standard → Frugal
-```
-
-Similar task patterns (Jaccard similarity >= 0.80) inherit tier preferences from previously successful tasks.
-
-### Phase 2: Double Diamond
-
-The execution phase uses the Double Diamond design process with recursive decomposition.
+> **Note:** an earlier methodology-first executor (`execution/double_diamond.py`
+> + `execution/decomposition.py` + `execution/atomicity.py`) was removed once it
+> was found to have no live caller. Its philosophy (understand-then-judge,
+> disciplined recursion) survives as the live executor's discipline; the modules
+> below are the live path.
 
 **Components:**
-- `execution/double_diamond.py` - Four-phase execution cycle
-- `execution/decomposition.py` - Hierarchical task decomposition
-- `execution/atomicity.py` - Atomicity detection for tasks
-- `execution/subagent.py` - Isolated subagent execution
+- `orchestrator/parallel_executor.py` - Live recursive AC executor (dependency-staged fan-out, profile-based decomposition, evidence-gated delivery)
+- `orchestrator/decomposition_params.py` - Profile-driven decomposition prompts (axis / `min_unit` / branching)
+- `orchestrator/runner.py` - Orchestration entry point and dependency analysis
+- `orchestrator/process_local_authority.py` - Runner-owned process-local authority lifecycle, including liveness leases and retry retention
 
-**Four Phases:**
-1. **Discover** (divergent) - Explore the problem space broadly
-2. **Define** (convergent) - Converge on the core problem
-3. **Design** (divergent) - Explore solution approaches
-4. **Deliver** (convergent) - Converge on implementation
+**Dependency planning:**
+
+For dependency-analyzed AC execution, the analyzer combines structured constraints
+with inferred edges and computes deterministic topological levels. A cycle in the
+resulting graph returns `Result.err(DependencyCycleError)`, including the blocked
+AC indices (which may also contain downstream dependents). The runner must not
+replace this error with an independent parallel plan: it records the planning
+failure through its existing session failure path before dispatching any workers.
+Direct planner callers receive the same `ExecutionPlanningError`-compatible error.
+
+Cycle detection does not add model calls or attempt automatic graph repair.
+Ordinary provider or response-parsing failures still use the existing structured
+fallback, which is checked for cycles too. Explicit sequential execution and
+reuse of a persisted resume plan retain their existing behavior.
 
 **Recursive Decomposition:**
 
-Each AC goes through Discover and Define, then atomicity is checked:
-- **Atomic** (single-focused, 1-2 files) → proceed to Design and Deliver
-- **Non-atomic** → decompose into 2-5 child ACs, recurse on each child
+Each AC defaults to **atomic** execution. Preflight splitting is retired: a split
+may be proposed only after an evidence-backed `TOO_BIG` bounce. It is accepted as
+`MIN_SUB_ACS`–`MAX_SUB_ACS` (2–5) sub-ACs only when it genuinely spans multiple
+units along the profile's axis — splitting is conservative because each sub-AC
+costs a full agent session. Sub-ACs recurse within a bounded depth.
 
 Key constraints:
-- `MAX_DEPTH = 5` — hard recursion limit
-- `COMPRESSION_DEPTH = 3` — context truncated to 500 chars at depth 3+
-- Children are dependency-sorted and executed in parallel within each level
+- `DEFAULT_MAX_DECOMPOSITION_DEPTH = 2`; any non-negative depth remains accepted through Seed/env/CLI for backward compatibility. Depths `0..4` may use Routing D crash replay: the maximum five-way tree has 780 child nodes and the completion/pause envelope is derived from that durable boundary. Larger values execute through the historical legacy parallel path without the Routing D resume-owner guarantee. At the configured cap a non-atomic unit executes as atomic with a recorded depth warning.
+- Failures are handled by an attempt-then-bounce loop (bounded retries + evaluation feedback) rather than ever-deeper pre-execution splitting
+- Children are dependency-sorted and executed within each level
+
+Delivery receipts are matched against completed runtime tool calls. Shell transport
+wrappers are normalized conservatively, including POSIX `sh -c` and native Windows
+PowerShell `-Command` wrappers, while trailing or executable PowerShell arguments are
+rejected. Command and test claims must still match successful journal entries exactly.
+
+Values above `4` remain executable on the legacy path, but cannot authorize
+Routing D route switching or its crash-resumable parallel owner. Reducing the
+value to `4` or less opts a fresh run into that stronger durable boundary.
+
+Malformed wrapper receipts remain rejected. A current-attempt Bash start/completion pair for the exact trusted wrapper and inner command changes the rejection to `EVIDENCE_FORM_MISMATCH` with guidance to retry using a contract-compliant receipt; a failed command also counts as related work, and classification grants no artifact authority. Missing or untrusted runtime support retains `FABRICATION_SUSPECTED`. The trusted runner opens all three output parent chains before the inner command starts, then publishes exclusively through held no-follow directory capabilities with inode and parent postvalidation. Its isolated bootstrap freezes the directory helper together with the runner; the task cannot supply that helper. The inner command keeps its existing execution contract.
 
 For the current recursive execution flow, see [parallel_executor.py](../src/ouroboros/orchestrator/parallel_executor.py) and [runner.py](../src/ouroboros/orchestrator/runner.py).
 
@@ -265,12 +354,13 @@ Three-stage progressive evaluation ensures quality while minimizing cost.
 1. **Mechanical ($0)** — Lint, build, test, static analysis, coverage (threshold: 70%)
    - Auto-detects project language from marker files (e.g., `uv.lock` → Python/uv, `Cargo.toml` → Rust, `go.mod` → Go, `package-lock.json` → Node). Supported: Python, Rust, Go, Zig, Node (npm/pnpm/bun/yarn).
    - Projects can override or extend commands via `.ouroboros/mechanical.toml`. Overrides are validated against an executable allowlist for security in CI/CD environments.
-   - If no language is detected, Stage 1 checks are skipped and evaluation proceeds to Stage 2.
+   - If no command is configured, Stage 1 checks are skipped and evaluation proceeds to Stage 2, but a skipped check is not evidence: the result is unverified, never approved.
    - If any check fails → pipeline stops, returns failure
+   - Stage 1 is the only stage that can grant acceptance: approval requires at least one executed check and every check passing.
 2. **Semantic ($$)** — AC compliance, goal alignment, drift, uncertainty scoring
-   - If score >= 0.8 and no trigger → approved without consensus
+   - Advisory: non-compliance, a score below 0.8, or reward-hacking risk >= 0.7 withholds approval; a favorable review grants nothing on its own and is attached as feedback
    - Uses Standard tier model (temperature: 0.2)
-3. **Consensus ($$$)** — Multi-model voting, only when triggered by 1 of 6 conditions
+3. **Consensus ($$$)**: Multi-model voting, only when triggered by 1 of 6 conditions; advisory like Stage 2 (a rejection withholds, an approval cannot lift a Stage 2 block or grant acceptance)
    - Simple mode: 3 models vote (GPT-4o, Claude Sonnet 4, Gemini 2.5 Pro), 2/3 majority required
    - Deliberative mode: Advocate/Devil's Advocate/Judge roles with ontological questioning
 
@@ -286,19 +376,6 @@ For the current evaluation flow, see [pipeline.py](../src/ouroboros/evaluation/p
 
 For failure modes, error-handling guidance, and configuration reference, see the [Evaluation Pipeline Guide](./guides/evaluation-pipeline.md).
 
-### Phase 5: Secondary Loop
-
-Non-critical tasks are deferred to maintain focus on the primary goal.
-
-**Components:**
-- `secondary/todo_registry.py` - TODO item tracking
-- `secondary/scheduler.py` - Batch processing scheduler
-
-**Process:**
-1. During execution, non-blocking TODOs registered
-2. After primary goal completion, TODOs batch-processed
-3. Low-priority tasks executed during idle time
-
 ## Module Structure
 
 ```
@@ -312,17 +389,15 @@ src/ouroboros/
 |   +-- ac_tree.py     # Acceptance criteria tree
 |
 +-- bigbang/        # Phase 0: Interview and seed generation
-+-- routing/        # Phase 1: PAL router
-+-- execution/      # Phase 2: Double Diamond execution
 +-- resilience/     # Phase 3: Stagnation and lateral thinking
 +-- evaluation/     # Phase 4: Three-stage evaluation
-+-- secondary/      # Phase 5: TODO registry and scheduling
 |
 +-- orchestrator/   # Runtime abstraction and orchestration
 |   +-- adapter.py     # AgentRuntime protocol, ClaudeAgentAdapter
 |   +-- codex_cli_runtime.py  # CodexCliRuntime adapter
 |   +-- runtime_factory.py    # create_agent_runtime() factory
 |   +-- runner.py      # Orchestration logic
+|   +-- model_routing.py      # Phase 1: PAL model-tier routing
 |   +-- session.py     # Session state tracking
 |   +-- events.py      # Orchestrator events
 |   +-- mcp_tools.py   # MCP tool provider for external tools
@@ -387,7 +462,7 @@ else:
 ### Event Sourcing
 
 All state changes are persisted as immutable events in a single SQLite table (`events`) via SQLAlchemy Core:
-- **Event types** use dot-notation past tense (e.g., `orchestrator.session.started`, `execution.ac.completed`)
+- **Event types** use dot-notation past tense (e.g., `orchestrator.session.started`, `orchestrator.session.completed`)
 - **Append-only** — events can never be modified or deleted
 - **Unit of Work** pattern groups events + checkpoint into atomic commits
 - **Replay** capability — reconstruct any session by replaying its events
@@ -467,22 +542,158 @@ Every runtime adapter satisfies the `AgentRuntime` protocol (defined in `src/our
 
 The orchestrator never inspects backend-specific internals — each adapter maps its native events into these shared types.
 
+Codex CLI and OpenCode require an owned, captured process tree and confirmed
+leader exit before reporting successful termination. Copilot CLI, Gemini CLI,
+Antigravity CLI, Goose CLI, Grok CLI, Megacode and Zcode inherit Codex CLI's
+`_terminate_process` and therefore share this stricter cleanup requirement.
+Copilot ACP's read-only CLI fallback also inherits it; the ACP transport's own
+termination path instead closes its client without this process-tree proof.
+This scope concerns those CLI timeout and cancellation paths, not every
+provider adapter.
+
+If cleanup cannot be confirmed, a live handle's `terminate()` returns false and
+observation reports `termination_unconfirmed`; this is not proof that the
+process is gone. Rebinding an OpenCode handle refreshes its live lifecycle
+state without replacing a terminal state or an unconfirmed cleanup receipt.
+If the leader has already exited without a confirmed tree receipt, the handle
+does not promise it can rediscover or terminate remaining descendants. This
+does not establish bounded termination for every runtime or execution path.
+
+Native Windows currently has no supported process-table ownership proof in
+`worker_process_tree`: non-POSIX capture produces no owned members. These
+strict cleanup paths therefore cannot confirm termination on native Windows,
+even if best-effort cleanup stops the leader. Timeouts report
+`termination_confirmed: false`, and bound handle observations retain
+`termination_unconfirmed`. This conservative result does not mean cleanup
+necessarily failed; it means tree ownership and exit were not proved. Native
+Windows termination has not been verified by the POSIX tests, and confirmation
+must not be weakened to treat an empty capture as success.
+
+### Interview calibration control turns
+
+Unfamiliar terminology must not force a user to guess at a requirements decision.
+`ooo idk <evidence>` adjusts the current conversation's explanation level while
+preserving the interview's decisions, ambiguity checks, and closure gates.
+It carries one overall `foundational`, `working`, or `fluent` level plus explicit
+unknown terms; it is not a per-domain proficiency model or a permanent profile.
+
+`InterviewSessionTransition` in `orchestrator/interview_session.py` owns command
+classification, MCP arguments, and returned runtime metadata. The shared
+dispatcher and every direct runtime interceptor use this same contract:
+
+| Turn | MCP arguments | State effect |
+|------|---------------|--------------|
+| Start | `initial_context`, optional `interview_calibration` | Attach the returned interview session ID |
+| Answer | `session_id`, `answer`, optional `interview_calibration` | Advance only after a real answer |
+| Calibrate | `calibration_input`, optional `session_id`; never `answer` | Replace calibration and rephrase the same pending question |
+| Resume | `session_id`, optional `interview_calibration`; no answer | Retain the current pending round |
+
+Calibration can precede the first interview. Later results that return only a
+session ID retain the calibration, native runtime identity, and unrelated
+metadata. The bounded payload lives only in the active `RuntimeHandle` and is
+removed by durable serialization; loading a saved session requires recalibration.
+Claude/plugin clients relay `meta.interview_calibration` into subsequent MCP
+calls as `interview_calibration`, as specified by the canonical `idk` and
+`interview` skills. The server does not persist a user profile.
+
+The engine extension is optional: legacy `ask_next_question(state)` engines
+remain supported, and engines without `rephrase_pending_question` return the
+unchanged question. Provider errors, raised exceptions, and empty rephrases also
+return calibration with `question_rephrased=false` and explicitly state that
+the pending question is unchanged. Cancellation propagates after resource cleanup.
+Neither successful rephrasing nor fallback writes an answer to interview state.
+
+The runtime sequence tests live in `tests/unit/orchestrator/test_interview_session.py`;
+engine/fallback, inference, PM composition, and packaging contracts live in their
+owning MCP, calibration, Big Bang, and skill suites. Structured choices and the
+broader novice-friendly presentation work in #1638 remain separate from this
+wording control turn.
+
 ### Shipped adapters
 
-- **`ClaudeAgentAdapter`** (`backend="claude"`) — Wraps Claude Agent SDK / Claude Code CLI with streaming, retry, and session resumption. Module: `src/ouroboros/orchestrator/adapter.py`
-- **`CodexCliRuntime`** (`backend="codex"`) — Drives the OpenAI Codex CLI as a session-oriented runtime with NDJSON event parsing. Module: `src/ouroboros/orchestrator/codex_cli_runtime.py`
+The canonical backend names, registered aliases, concrete adapters, and source
+modules are listed below. The two `_mcp` entries are internal leader-driven
+worker transports; the remaining entries are user-selectable runtimes.
 
-> Claude Code and Codex CLI have different tool sets, permission models, and streaming semantics. Ouroboros normalizes these differences at the adapter boundary, but feature parity is not guaranteed across runtimes.
+| Backend | Adapter / transport | Registered aliases | Module |
+|---------|---------------------|--------------------|--------|
+| `claude` | `ClaudeAgentAdapter` | `claude_code` | `src/ouroboros/orchestrator/adapter.py` |
+| `codex` | `CodexCliRuntime` | `codex_cli` | `src/ouroboros/orchestrator/codex_cli_runtime.py` |
+| `codex_mcp` | `LeaderDrivenWorkerRuntime` over `codex mcp-server` | `codex_mcp_server` | `src/ouroboros/orchestrator/codex_mcp_runtime.py` |
+| `claude_mcp` | `LeaderDrivenWorkerRuntime` over `claude -p --resume` | `claude_worker` | `src/ouroboros/orchestrator/claude_worker_runtime.py` |
+| `copilot` | `CopilotCliRuntime` | `copilot_cli` | `src/ouroboros/orchestrator/copilot_cli_runtime.py` |
+| `gemini` | `GeminiCLIRuntime` | `gemini_cli` | `src/ouroboros/orchestrator/gemini_cli_runtime.py` |
+| `megacode` | `MegacodeRuntime` | `megacode_cli` | `src/ouroboros/orchestrator/megacode_runtime.py` |
+| `zcode` | `ZcodeCLIRuntime` | `zcode_cli` | `src/ouroboros/orchestrator/zcode_cli_runtime.py` |
+| `hermes` | `HermesCliRuntime` | `hermes_cli` | `src/ouroboros/orchestrator/hermes_runtime.py` |
+| `kiro` | `KiroAgentAdapter` | `kiro_cli` | `src/ouroboros/orchestrator/kiro_adapter.py` |
+| `opencode` | `OpenCodeRuntime` | `opencode_cli` | `src/ouroboros/orchestrator/opencode_runtime.py` |
+| `goose` | `GooseCliRuntime` | `goose_cli` | `src/ouroboros/orchestrator/goose_runtime.py` |
+| `pi` | `PiRuntime` | `pi_cli` | `src/ouroboros/orchestrator/pi_runtime.py` |
+| `omp` | `OmpRuntime` | `omp_cli` | `src/ouroboros/orchestrator/omp_runtime.py` |
+| `gjc` | `GjcRuntime` | `gajae-code`, `gajae_code` | `src/ouroboros/orchestrator/gjc_runtime.py` |
+| `antigravity` | `AntigravityCLIRuntime` | `agy` | `src/ouroboros/orchestrator/antigravity_cli_runtime.py` |
+| `grok` | `GrokCliRuntime` | `grok_cli`, `grok_build` | `src/ouroboros/orchestrator/grok_cli_runtime.py` |
+| `host` | Host-dispatch runtime bridge | `host_dispatch` | `src/ouroboros/orchestrator/host_dispatch.py` |
+
+`PiRuntime` and `OmpRuntime` drive their CLIs in JSON mode with skill dispatch,
+session resumption, and JSONL event normalization. For LLM-only flows such as
+interview and seed extraction, `PiLLMAdapter`
+(`src/ouroboros/providers/pi_llm_adapter.py`) and `OmpLLMAdapter`
+(`src/ouroboros/providers/omp_llm_adapter.py`) provide structured responses
+through prompt instructions and adapter-side extraction/validation; these
+CLIs have no native `--output-schema` flag. `CopilotCliLLMAdapter`
+(`src/ouroboros/providers/copilot_cli_adapter.py`) provides the Copilot LLM
+surface, including live model discovery and model-name normalization.
+
+> Each runtime has different tool sets, permission models, and streaming
+> semantics. Ouroboros normalizes these differences at the adapter boundary,
+> but feature parity is not guaranteed across runtimes.
 
 ### Runtime factory
 
-`create_agent_runtime()` in `src/ouroboros/orchestrator/runtime_factory.py` resolves the backend name and returns the appropriate adapter. The backend can be set via:
+`create_agent_runtime()` in `src/ouroboros/orchestrator/runtime_factory.py`
+resolves canonical names and aliases from
+`src/ouroboros/backends/capabilities.py`, then dispatches through
+`src/ouroboros/backends/factory_registry.py`. Runtime selection uses this order:
 
-1. `OUROBOROS_AGENT_RUNTIME` environment variable
-2. `orchestrator.runtime_backend` in `~/.ouroboros/config.yaml`
-3. Explicit `backend=` parameter
+1. Explicit `backend=` parameter
+2. `OUROBOROS_AGENT_RUNTIME` environment variable
+3. Legacy `OUROBOROS_RUNTIME` environment variable
+4. `orchestrator.runtime_backend` in `~/.ouroboros/config.yaml`
+5. Default `claude` runtime
 
-Accepted aliases: `claude` / `claude_code`, `codex` / `codex_cli`.
+The public CLI additionally maps `claude-sdk` and `claude_sdk` to `claude`, and
+`claude-cli` to the internal `claude_mcp` transport. Those package-profile
+spellings are defined in `src/ouroboros/package_profiles.py`; all other aliases
+are the registered aliases in the table above.
+
+### Copilot ACP transport
+
+The existing `copilot` factory selects `CopilotCliRuntime` by default or
+`CopilotAcpRuntime` when `orchestrator.copilot_transport=acp`. This is not another
+backend enum or an LLM adapter: LLM-only flows keep `CopilotCliLLMAdapter`.
+
+```text
+CopilotAcpRuntime → CopilotAcpClient → copilot --acp --stdio
+  → CopilotAcpEventTranslator → AgentMessage
+  → project_runtime_message → ExecutionEventEmitter → existing EventStore
+  → live consumers, task history, replay
+```
+
+ACP-specific process/RPC, permission, and translation code lives under
+`src/ouroboros/copilot/acp_*.py`. Each invocation owns a fresh process/session.
+The sequential runner and parallel executor share a progress-emission policy
+that preserves every text delta and tool progress event rather than sampling
+deltas every tenth message. Projection keeps exact delta whitespace, tool IDs,
+available parent/agent correlation, command exit codes, and transport metadata.
+Private thought chunks never enter the normalized event stream.
+
+Cancellation sends ACP cancel before process cleanup. Native session resume is
+not supported; persisted history remains replayable. Pre-prompt fallback is
+limited to read-only/tool-less envelopes and never hides authentication failures
+or replays a submitted prompt. See the [ACP runtime guide](runtime-guides/copilot-acp.md)
+for the wire contract, permissions, diagnostics, and supported boundaries.
 
 For API details, see the source in `src/ouroboros/orchestrator/adapter.py`. For contributing a new runtime adapter, see [Contributing](contributing/).
 
@@ -527,4 +738,4 @@ For environment variables, `config.yaml` schema, and all configuration options, 
 ---
 
 > For install instructions and first-run onboarding, see **[Getting Started](getting-started.md)**.
-> For backend-specific configuration, see the [Claude Code](runtime-guides/claude-code.md) and [Codex CLI](runtime-guides/codex.md) runtime guides.
+> For backend-specific configuration, see the [Claude Code](runtime-guides/claude-code.md), [Codex CLI](runtime-guides/codex.md), [OpenCode](runtime-guides/opencode.md), [Hermes](runtime-guides/hermes.md), [Gemini](runtime-guides/gemini.md), [Kiro CLI](runtime-guides/kiro.md), [GitHub Copilot CLI](runtime-guides/copilot.md), [Pi CLI](runtime-guides/pi.md), and [OMP CLI](runtime-guides/omp.md) references.

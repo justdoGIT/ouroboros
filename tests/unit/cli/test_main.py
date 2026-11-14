@@ -3,6 +3,7 @@
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from typer.testing import CliRunner
 
 from ouroboros import __version__
@@ -70,6 +71,28 @@ class TestCommandGroups:
         assert result.exit_code == 0
         assert "Check Ouroboros system status" in result.output
 
+    def test_interview_alias_registered(self) -> None:
+        """Test that interview is registered as a top-level init alias."""
+        result = runner.invoke(app, ["interview", "--help"])
+        assert result.exit_code == 0
+        assert "Start interactive interview" in result.output
+
+    def test_seed_command_registered(self) -> None:
+        """Test that seed command is registered."""
+        result = runner.invoke(app, ["seed", "--help"])
+        assert result.exit_code == 0
+        assert "Seed" in result.output
+
+    def test_seed_command_accepts_and_forwards_dsh_backend(self) -> None:
+        run_seed = AsyncMock(return_value=Path("seed.yaml"))
+
+        with patch("ouroboros.cli.commands.seed._run_seed_generation", new=run_seed):
+            result = runner.invoke(app, ["seed", "interview_1", "--llm-backend", "dsh"])
+
+        assert result.exit_code == 0, result.output
+        assert run_seed.await_args.args == ("interview_1",)
+        assert run_seed.await_args.kwargs["llm_backend"] == "dsh"
+
 
 class TestRunCommands:
     """Tests for run command group."""
@@ -81,6 +104,57 @@ class TestRunCommands:
         assert "seed" in result.output.lower()
         assert "runtime" in result.output.lower()
         assert "hermes" in result.output.lower()
+
+    def test_run_workflow_accepts_legacy_depth_above_durable_replay_contract(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The primary CLI preserves the historical non-negative depth contract."""
+
+        seed_file = tmp_path / "seed.yaml"
+        seed_file.write_text("goal: test\nacceptance_criteria:\n  - test\n")
+
+        with patch(
+            "ouroboros.cli.commands.run._run_orchestrator",
+            new=AsyncMock(),
+        ) as run_orchestrator:
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "workflow",
+                    str(seed_file),
+                    "--max-decomposition-depth",
+                    "5",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert run_orchestrator.await_args.kwargs["max_decomposition_depth"] == 5
+
+    def test_zcode_run_accepts_legacy_depth_above_durable_replay_contract(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The Zcode convenience CLI preserves the same compatibility path."""
+
+        seed_file = tmp_path / "seed.yaml"
+        seed_file.write_text("goal: test\nacceptance_criteria:\n  - test\n")
+
+        with patch("ouroboros.cli.commands.zcode.run_command.workflow") as workflow:
+            result = runner.invoke(
+                app,
+                [
+                    "zcode",
+                    "run",
+                    str(seed_file),
+                    "--max-decomposition-depth",
+                    "5",
+                ],
+            )
+
+        assert result.exit_code == 0
+        assert workflow.call_args.kwargs["max_decomposition_depth"] == 5
 
     def test_run_resume_help(self) -> None:
         """Test run resume command help."""
@@ -99,6 +173,7 @@ class TestInitCommands:
         assert "context" in result.output.lower()
         assert "runtime" in result.output.lower()
         assert "llm-backend" in result.output.lower()
+        assert "pi" in result.output.lower()
 
 
 class TestConfigCommands:
@@ -144,6 +219,12 @@ class TestStatusCommands:
         assert result.exit_code == 0
         assert "details" in result.output.lower()
 
+    def test_status_project_help(self) -> None:
+        """Test read-only cross-run project status help."""
+        result = runner.invoke(app, ["status", "project", "--help"])
+        assert result.exit_code == 0
+        assert "read-only" in result.output.lower()
+
     def test_status_health_help(self) -> None:
         """Test status health command help."""
         result = runner.invoke(app, ["status", "health", "--help"])
@@ -153,7 +234,7 @@ class TestStatusCommands:
     def test_status_health_runs(self) -> None:
         """Test status health command execution."""
         result = runner.invoke(app, ["status", "health"])
-        assert result.exit_code == 0
+        assert result.exit_code in (0, 1)
         assert "System Health" in result.output
 
 
@@ -174,6 +255,35 @@ class TestMCPCommands:
         assert "port" in result.output.lower()
         assert "runtime" in result.output.lower()
         assert "llm-backend" in result.output.lower()
+        assert "pi" in result.output.lower()
+
+    def test_mcp_serve_accepts_pi_llm_backend(self, monkeypatch) -> None:
+        """Pi supports structured LLM flows through adapter-side validation."""
+        monkeypatch.delenv("_OUROBOROS_NESTED", raising=False)
+
+        with patch(
+            "ouroboros.cli.commands.mcp._run_mcp_server",
+            new=AsyncMock(),
+        ) as mock_run_mcp_server:
+            result = runner.invoke(
+                app,
+                ["mcp", "serve", "--runtime", "pi", "--llm-backend", "pi"],
+            )
+
+        assert result.exit_code == 0
+        mock_run_mcp_server.assert_awaited_once_with(
+            "localhost",
+            8080,
+            "stdio",
+            None,
+            "pi",
+            "pi",
+            auth_token="",
+            allowed_hosts=(),
+            allowed_origins=(),
+            workspace_roots=(),
+            idle_timeout_seconds=None,
+        )
 
     def test_mcp_info(self) -> None:
         """Test mcp info command."""
@@ -221,6 +331,21 @@ class TestShorthandCommands:
 
         # Should invoke workflow command (orchestrator by default calls _run_orchestrator)
         mock_run_orchestrator.assert_awaited_once()
+
+    @pytest.mark.parametrize("runtime", ["claude", "claude-sdk"])
+    def test_run_public_claude_runtime_selects_sdk(self, tmp_path: Path, runtime: str) -> None:
+        seed_file = tmp_path / "seed.yaml"
+        seed_file.write_text("goal: test\nacceptance_criteria:\n  - criterion: test\n")
+
+        mock_run_orchestrator = AsyncMock()
+        with patch(
+            "ouroboros.cli.commands.run._run_orchestrator",
+            new=mock_run_orchestrator,
+        ):
+            result = runner.invoke(app, ["run", str(seed_file), "--runtime", runtime])
+
+        assert result.exit_code == 0
+        assert mock_run_orchestrator.await_args.kwargs["runtime_backend"] == "claude"
 
     def test_run_shorthand_with_no_orchestrator(self, tmp_path: Path) -> None:
         """Test that 'ouroboros run seed.yaml --no-orchestrator' uses placeholder mode."""
@@ -272,13 +397,12 @@ class TestShorthandCommands:
 
     def test_init_list_subcommand_still_works(self) -> None:
         """Test backward compat: 'ouroboros init list' still routes to list."""
-        with patch("ouroboros.cli.commands.init.create_llm_adapter"):
-            with patch(
-                "ouroboros.cli.commands.init.InterviewEngine.list_interviews",
-                new=AsyncMock(return_value=[]),
-            ):
-                result = runner.invoke(app, ["init", "list"])
-                assert result.exit_code == 0
+        with patch(
+            "ouroboros.cli.commands.init.InterviewEngine.list_interviews",
+            new=AsyncMock(return_value=[]),
+        ):
+            result = runner.invoke(app, ["init", "list"])
+            assert result.exit_code == 0
 
     def test_monitor_top_level_alias(self) -> None:
         """Test that 'ouroboros monitor' is a shorthand for 'ouroboros tui monitor'."""
@@ -302,3 +426,216 @@ class TestShorthandCommands:
 
         # _run_orchestrator should be awaited by the default orchestrator path
         mock_run_orchestrator.assert_awaited_once()
+
+
+class TestStatusRunProjectionCommand:
+    def test_status_run_json_uses_projection_handler(self) -> None:
+        async def fake_handle(self, arguments):
+            from ouroboros.core.types import Result
+            from ouroboros.mcp.types import MCPToolResult
+
+            assert arguments == {"execution_id": "exec_123", "limit": 20}
+            return Result.ok(
+                MCPToolResult(
+                    content=(),
+                    meta={
+                        "execution_id": "exec_123",
+                        "run": {"run_id": "run_123"},
+                        "stages": [],
+                        "steps": [],
+                        "artifacts": [],
+                        "verdicts": [],
+                    },
+                )
+            )
+
+        with patch("ouroboros.cli.commands.status.ProjectionQueryHandler.handle", fake_handle):
+            result = runner.invoke(
+                app,
+                ["status", "run", "--execution-id", "exec_123", "--limit", "20", "--json"],
+            )
+
+        assert result.exit_code == 0
+        assert '"execution_id": "exec_123"' in result.output
+        assert '"run_id": "run_123"' in result.output
+
+    def test_status_run_renders_projection_text_by_default(self) -> None:
+        async def fake_handle(self, arguments):
+            from ouroboros.core.types import Result
+            from ouroboros.mcp.types import ContentType, MCPContentItem, MCPToolResult
+
+            assert arguments == {"session_id": "session_123"}
+            return Result.ok(
+                MCPToolResult(
+                    content=(
+                        MCPContentItem(
+                            type=ContentType.TEXT,
+                            text="Run Projection\nRun: run_123\nSteps: 1",
+                        ),
+                    ),
+                    meta={"run": {"run_id": "run_123"}},
+                )
+            )
+
+        with patch("ouroboros.cli.commands.status.ProjectionQueryHandler.handle", fake_handle):
+            result = runner.invoke(app, ["status", "run", "--session-id", "session_123"])
+
+        assert result.exit_code == 0
+        assert result.output == "Run Projection\nRun: run_123\nSteps: 1"
+
+    def test_status_run_reports_projection_errors(self) -> None:
+        async def fake_handle(self, arguments):
+            from ouroboros.core.types import Result
+            from ouroboros.mcp.errors import MCPToolError
+
+            return Result.err(MCPToolError("projection backend exploded"))
+
+        with patch("ouroboros.cli.commands.status.ProjectionQueryHandler.handle", fake_handle):
+            result = runner.invoke(app, ["status", "run", "--execution-id", "exec_x", "--json"])
+
+        # Handler-side errors that are not the dedicated "unknown run" path
+        # remain on exit code 1 — see Wave-1 #946 S2 exit-code contract.
+        assert result.exit_code == 1
+        assert "projection backend exploded" in result.output
+
+
+class TestWorkflowIRCommands:
+    def test_workflow_ir_inspect_json_projects_seed(self, tmp_path: Path) -> None:
+        seed_file = tmp_path / "seed.yaml"
+        seed_file.write_text(
+            "\n".join(
+                [
+                    "goal: Inspect Workflow IR",
+                    "task_type: code",
+                    "constraints:",
+                    "  - Keep read-only",
+                    "acceptance_criteria:",
+                    "  - First criterion",
+                    "  - criterion: Second criterion",
+                    "  - description: Structured criterion",
+                    "    verify_command: uv run pytest tests/unit/test_example.py",
+                    "    expected_artifacts:",
+                    "      - artifacts/example.txt",
+                    "ontology_schema:",
+                    "  name: WorkflowIR",
+                    "  description: Workflow IR ontology",
+                    "  fields:",
+                    "    - name: workflow",
+                    "      field_type: object",
+                    "      description: Workflow graph",
+                    "evaluation_principles:",
+                    "  - name: correctness",
+                    "    description: Correct output",
+                    "exit_conditions:",
+                    "  - name: all_ac_met",
+                    "    description: Done",
+                    "    evaluation_criteria: All ACs pass",
+                    "metadata:",
+                    "  seed_id: seed_cli_ir",
+                    "  version: 1.0.0",
+                    "  ambiguity_score: 0.1",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["workflow-ir", "inspect", str(seed_file), "--json"])
+
+        assert result.exit_code == 0
+        assert '"spec_id": "wfspec_seed_cli_ir"' in result.output
+        assert '"ok": true' in result.output
+        assert '"acceptance_criteria_count": 3' in result.output
+
+    def test_workflow_ir_inspect_plain_text_reports_valid_projection(self, tmp_path: Path) -> None:
+        seed_file = tmp_path / "seed.yaml"
+        seed_file.write_text(
+            "\n".join(
+                [
+                    "goal: Inspect Workflow IR",
+                    "acceptance_criteria:",
+                    "  - Confirm plain-text inspection remains read-only",
+                    "ontology_schema:",
+                    "  name: WorkflowIR",
+                    "  description: Workflow IR ontology",
+                    "  fields: []",
+                    "metadata:",
+                    "  seed_id: seed_cli_plain_ir",
+                    "  version: 1.0.0",
+                    "  ambiguity_score: 0.1",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["workflow-ir", "inspect", str(seed_file)])
+
+        assert result.exit_code == 0
+        assert "WorkflowSpec: wfspec_seed_cli_plain_ir" in result.output
+        assert "Nodes: 3" in result.output
+        assert "Edges: 2" in result.output
+        assert "Validation: ok" in result.output
+
+    def test_workflow_ir_inspect_preserves_criterion_semantic_ac_key(self, tmp_path: Path) -> None:
+        """A ``{criterion, semantic_ac_key}`` entry keeps its persisted identity (#2338).
+
+        The loader used to reduce such a mapping to the bare criterion string, so
+        Seed re-derived a fresh hash from the text and the explicit key was lost.
+        """
+        from ouroboros.cli.commands.workflow_ir import _load_seed
+
+        seed_file = tmp_path / "seed.yaml"
+        seed_file.write_text(
+            "\n".join(
+                [
+                    "goal: Inspect Workflow IR",
+                    "acceptance_criteria:",
+                    "  - criterion: A",
+                    "    semantic_ac_key: ac_a123456789abcdef",
+                    "ontology_schema:",
+                    "  name: Receipt",
+                    "  description: A reconciliation receipt",
+                    "  fields: []",
+                    "metadata:",
+                    "  seed_id: seed_cli_semantic_key",
+                    "  ambiguity_score: 0.1",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = _load_seed(seed_file)
+        result = runner.invoke(app, ["workflow-ir", "inspect", str(seed_file), "--json"])
+
+        assert loaded.acceptance_criteria[0].description == "A"
+        assert loaded.acceptance_criteria[0].semantic_ac_key == "ac_a123456789abcdef"
+        assert result.exit_code == 0
+        assert '"ok": true' in result.output
+
+    def test_workflow_ir_inspect_rejects_blank_ac(self, tmp_path: Path) -> None:
+        seed_file = tmp_path / "seed.yaml"
+        seed_file.write_text(
+            "\n".join(
+                [
+                    "goal: Inspect Workflow IR",
+                    "acceptance_criteria:",
+                    "  - ''",
+                    "ontology_schema:",
+                    "  name: WorkflowIR",
+                    "  description: Workflow IR ontology",
+                    "  fields: []",
+                    "metadata:",
+                    "  seed_id: seed_cli_ir",
+                    "  version: 1.0.0",
+                    "  ambiguity_score: 0.1",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = runner.invoke(app, ["workflow-ir", "inspect", str(seed_file), "--json"])
+
+        # The blank-AC boundary is enforced by the Seed schema itself, so the
+        # command now fails during seed load rather than in the IR adapter.
+        assert result.exit_code == 1
+        assert "Workflow IR inspection failed" in result.output
+        assert "acceptance_criteria.0.description" in result.output

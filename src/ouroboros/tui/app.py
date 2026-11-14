@@ -4,7 +4,14 @@ OuroborosTUI is the main application class that:
 - Manages screens (session selector, dashboard, execution, logs, debug)
 - Handles global keybindings
 - Subscribes to EventStore for live updates
-- Provides pause/resume execution control
+- Optionally forwards pause/resume requests to an execution owner
+
+Pause/resume are only offered when an embedding caller connects an execution
+owner via :meth:`OuroborosTUI.set_pause_callback` /
+:meth:`OuroborosTUI.set_resume_callback`. Without one the bindings are hidden.
+Even with an owner connected, the displayed lifecycle status changes only when
+an acknowledged lifecycle event arrives — the TUI never optimistically reports
+a transition the execution never made.
 """
 
 from __future__ import annotations
@@ -16,13 +23,21 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 from textual.app import App
 from textual.binding import Binding
+from textual.notifications import SeverityLevel
 
+from ouroboros.core.ac_runtime_projection import ACRuntimeProjection, fold_ac_runtime
+from ouroboros.dashboard.board import ProviderLedger, fold_provider_event
+from ouroboros.persistence.runtime_history import read_runtime_history
 from ouroboros.tui.events import (
+    ACModelRouted,
+    ACTokenAttribution,
     ACUpdated,
     AgentThinkingUpdated,
     CostUpdated,
     DriftUpdated,
     ExecutionUpdated,
+    FrugalityProofEvaluated,
+    FrugalityRetrospectiveReported,
     LogMessage,
     PauseRequested,
     PhaseChanged,
@@ -33,6 +48,8 @@ from ouroboros.tui.events import (
     TUIState,
     WorkflowProgressUpdated,
     create_message_from_event,
+    format_frugality_retrospective_summary,
+    format_frugality_summary,
 )
 from ouroboros.tui.screens import (
     DashboardScreenV3,
@@ -65,6 +82,43 @@ def _coerce_non_empty_string(value: object) -> str | None:
         if stripped:
             return stripped
     return None
+
+
+def _progress_acknowledges_running(data: object) -> bool:
+    """Whether a progress payload acknowledges the run is executing again.
+
+    Deliberately narrow: only ``running`` is honoured, because that is the one
+    transition no other event can supply — there is no
+    ``orchestrator.session.resumed``. ``runtime_status`` is per-runtime-turn
+    metadata, and ``derive_runtime_signal`` maps messages such as
+    ``result.completed`` / ``turn.completed`` to ``"completed"``. Those describe
+    the latest agent turn, not the orchestration, so treating them as global
+    lifecycle would let an unfinished run advertise a terminal state. Global
+    paused/terminal status stays with ``orchestrator.session.*`` and
+    ``execution.terminal``.
+
+    The two producers nest the value differently:
+
+    - ``orchestrator.progress.updated`` (``SessionRepository.track_progress``)
+      wraps the payload in ``progress``, matching
+      ``SessionRepository._status_from_event`` and the
+      ``$.progress.runtime_status`` / ``$.runtime_status`` snapshot query.
+    - ``workflow.progress.updated`` (``create_workflow_progress_event``) carries
+      it in ``last_update``, where ``WorkflowState`` writes it.
+    """
+    if not isinstance(data, dict):
+        return False
+    candidates = []
+    for container_key in ("progress", "last_update"):
+        container = data.get(container_key)
+        if isinstance(container, dict):
+            candidates.append(container.get("runtime_status"))
+    candidates.append(data.get("runtime_status"))
+    for candidate in candidates:
+        status = _coerce_non_empty_string(candidate)
+        if status is not None:
+            return status.lower() == "running"
+    return False
 
 
 def _coerce_int(value: object, default: int) -> int:
@@ -272,12 +326,17 @@ class OuroborosTUI(App[None]):
         self._event_store = event_store
         self._execution_id: str | None = execution_id
         self._state = TUIState()
+        # Provider identity ledger — the SAME derivation reduce_board uses for the
+        # web Kanban, folded incrementally (O(1) per event). It wraps the state's
+        # ``provider_by_node`` dict so folds merge in place, never replace it.
+        self._provider_ledger = ProviderLedger(provider_by_node=self._state.provider_by_node)
         self._subscription_task: asyncio.Task[None] | None = None
         self._subscription_generation = 0
         self._poll_interval_seconds = 0.5
         self._is_paused = False
         self._pause_callback: Any | None = None
         self._resume_callback: Any | None = None
+        self._control_requests: dict[tuple[str, str], asyncio.Task[None]] = {}
 
     @property
     def state(self) -> TUIState:
@@ -335,15 +394,6 @@ class OuroborosTUI(App[None]):
             return False
         return not (context.session_id and self._state.session_id != context.session_id)
 
-    def _iter_subscription_sources(
-        self, context: _EventSubscriptionContext
-    ) -> tuple[tuple[str, str], ...]:
-        """Return the active aggregates that should feed the HUD."""
-        sources: list[tuple[str, str]] = [("execution", context.execution_id)]
-        if context.session_id:
-            sources.insert(0, ("session", context.session_id))
-        return tuple(sources)
-
     def _process_subscription_event(self, event: BaseEvent) -> None:
         """Forward a subscribed event into TUI state and installed screens."""
         self._state.add_log(
@@ -365,10 +415,20 @@ class OuroborosTUI(App[None]):
         except Exception:
             pass
 
+        # State projection must not depend on whether a Textual message exists
+        # for the event type. `orchestrator.progress.updated` has no message
+        # mapping, and it is the acknowledgement that clears a paused display —
+        # gating the projection on `message is not None` made it unreachable.
+        self._update_state_from_event(event)
+
         message = create_message_from_event(event)
         if message is not None:
             self.post_message(message)
-            self._update_state_from_event(event)
+
+        # Fold provider identity through the SHARED board derivation (the exact
+        # rules the web Kanban's reduce_board applies). Additive: it only annotates
+        # provider tags and never touches pause/resume/log/debug flows above.
+        self._ingest_board_event(event)
 
         # Forward raw event to debug screen
         try:
@@ -386,32 +446,74 @@ class OuroborosTUI(App[None]):
         except Exception:
             pass  # Screen might not be installed yet
 
+    def _ingest_board_event(self, event: BaseEvent) -> None:
+        """Fold one event's provider identity through the shared board derivation.
+
+        The TUI keeps its own hierarchical ``ac_tree`` for layout, but derives
+        per-node PROVIDER (runtime_backend) via the exact same rules the web
+        Kanban's ``reduce_board`` applies (``fold_provider_event`` is called by
+        both) — so the two surfaces can never drift on who ran what. The fold is
+        O(1) per event and mutates the ledger in place; no event list is kept.
+        Rendering is refreshed ONLY when provider identity actually changed — a
+        handful of times per run — never on node/status/tool chatter.
+        """
+        data = event.data if isinstance(event.data, dict) else {}
+        previous_runtime = getattr(
+            self,
+            "_ac_runtime",
+            ACRuntimeProjection(
+                execution_id=self._state.execution_id, session_id=self._state.session_id
+            ),
+        )
+        self._ac_runtime = fold_ac_runtime(
+            previous_runtime, event.type, data, aggregate_id=event.aggregate_id
+        )
+        if (
+            not fold_provider_event(event.type, data, ledger=self._provider_ledger)
+            and previous_runtime == self._ac_runtime
+        ):
+            return
+
+        self._state.board_providers[:] = self._provider_ledger.providers()
+        # Stamp providers onto any tree nodes that already exist. Nodes created
+        # later (by queued Textual messages) get stamped at their own
+        # ``_notify_ac_tree_updated`` via ``_apply_provider_tags``.
+        self._notify_ac_tree_updated()
+
     async def _subscribe_to_events(self, context: _EventSubscriptionContext) -> None:
         """Subscribe to EventStore for live updates.
 
-        Uses incremental fetching via get_events_after() to avoid replaying
-        the full event history on every poll cycle. This keeps each poll at
-        O(new_events) instead of O(total_events).
+        Uses bounded delivery-order fetching via read_runtime_history() to
+        avoid replaying the full event history on every poll cycle, keeping each
+        poll at O(new_events) instead of O(total_events).
+
+        The related-events query matches the session/execution aggregates AND any
+        worker-scoped aggregate whose payload references this run's session_id /
+        execution_id (the exact predicates the web Kanban reader applies). This is
+        what lets per-AC telemetry — model_routed / token_attribution and per-worker
+        provider identity, all persisted under ``exec_<id>_node_<NODEID>`` scopes
+        with the run id only in the payload — reach the HUD. A single rowid cursor
+        advances across all matched scopes, so each event is delivered exactly once.
         """
         if self._event_store is None or not context.execution_id:
             return
 
-        last_row_ids = dict.fromkeys(self._iter_subscription_sources(context), 0)
+        last_row_id = 0
 
         while self._is_subscription_active(context):
             try:
-                new_events: list[BaseEvent] = []
-                for source in self._iter_subscription_sources(context):
-                    aggregate_type, aggregate_id = source
-                    events, last_row_ids[source] = await self._event_store.get_events_after(
-                        aggregate_type,
-                        aggregate_id,
-                        last_row_ids[source],
-                    )
-                    new_events.extend(events)
+                (
+                    new_events,
+                    last_row_id,
+                ) = await read_runtime_history(
+                    self._event_store,
+                    session_id=context.session_id,
+                    execution_id=context.execution_id,
+                    after_cursor=last_row_id,
+                )
 
                 if new_events:
-                    for event in sorted(new_events, key=lambda item: (item.timestamp, item.id)):
+                    for event in new_events:
                         if not self._is_subscription_active(context):
                             break
                         self._process_subscription_event(event)
@@ -443,19 +545,41 @@ class OuroborosTUI(App[None]):
             self._state.status = "running"
         elif event_type == "orchestrator.session.completed":
             self._state.status = "completed"
+            self._state.is_paused = False
+            self._acknowledge_all_controls(self._state.execution_id)
         elif event_type == "orchestrator.session.failed":
             self._state.status = "failed"
+            self._state.is_paused = False
+            self._acknowledge_all_controls(self._state.execution_id)
         elif event_type == "orchestrator.session.cancelled":
             self._state.status = "cancelled"
+            self._state.is_paused = False
+            self._acknowledge_all_controls(self._state.execution_id)
         elif event_type == "execution.terminal":
             # Mirror event from the execution stream — ensures TUI sees
             # terminal transitions even when only polling "execution".
             terminal_status = data.get("status", "completed")
-            if terminal_status in {"completed", "failed", "cancelled"}:
+            if terminal_status in {"completed", "failed", "cancelled", "paused"}:
                 self._state.status = terminal_status
+                self._state.is_paused = terminal_status == "paused"
+                self._acknowledge_all_controls(self._state.execution_id)
         elif event_type == "orchestrator.session.paused":
             self._state.status = "paused"
             self._state.is_paused = True
+            self._acknowledge_control("pause", self._state.execution_id)
+        elif event_type in {"orchestrator.progress.updated", "workflow.progress.updated"}:
+            # There is no `orchestrator.session.resumed` event, so progress
+            # reporting the runtime is executing again is the only signal that
+            # can clear a paused display. Scope is exactly that: it never sets
+            # a status, only lifts `paused`. Progress is per-turn runtime
+            # metadata and must not advertise global paused/terminal state.
+            # Gate on the status, not just the flag: a terminal event clears
+            # `is_paused`, so keying off the status keeps late or out-of-order
+            # progress from resurrecting a run that already ended.
+            if self._state.status == "paused" and _progress_acknowledges_running(data):
+                self._state.status = "running"
+                self._state.is_paused = False
+                self._acknowledge_control("resume", self._state.execution_id)
         elif event_type == "execution.phase.completed":
             self._state.current_phase = data.get("phase", "")
             self._state.iteration = data.get("iteration", 0)
@@ -511,6 +635,7 @@ class OuroborosTUI(App[None]):
 
     def set_execution(self, execution_id: str, session_id: str = "") -> None:
         """Set the execution to monitor."""
+        self._cancel_control_requests()
         self._execution_id = execution_id
         self._state.execution_id = execution_id
         self._state.session_id = session_id
@@ -529,6 +654,19 @@ class OuroborosTUI(App[None]):
         self._state.active_tools.clear()
         self._state.tool_history.clear()
         self._state.thinking.clear()
+        # Wipe folded provider identity for the next run. The ledger wraps the
+        # state's provider_by_node dict, so resetting it clears both.
+        self._provider_ledger.reset()
+        self._ac_runtime = ACRuntimeProjection(execution_id=execution_id, session_id=session_id)
+        self._state.board_providers.clear()
+        # Wipe frugality telemetry so the next run starts from zero.
+        self._state.tier_by_node.clear()
+        self._state.model_by_node.clear()
+        self._state.tokens_by_node.clear()
+        self._state.run_total_tokens = 0.0
+        self._state.frugality_summary = None
+        self._state.frugality_retrospective = None
+        self._state.frugality_retrospective_summary = None
         self._state.add_log("info", "tui.main", f"Monitoring execution: {execution_id}")
         # Forward to logs screen
         try:
@@ -549,6 +687,12 @@ class OuroborosTUI(App[None]):
         self._state.session_id = message.session_id
         self._state.status = message.status
         self._state.is_paused = message.status == "paused"
+        if message.status == "paused":
+            self._acknowledge_control("pause", message.execution_id)
+        elif message.status == "running":
+            self._acknowledge_control("resume", message.execution_id)
+        elif message.status in {"completed", "failed", "cancelled"}:
+            self._acknowledge_all_controls(message.execution_id)
         self._forward_to_dashboard("on_execution_updated", message)
 
     def on_phase_changed(self, message: PhaseChanged) -> None:
@@ -676,6 +820,63 @@ class OuroborosTUI(App[None]):
         """Handle agent thinking update."""
         self._state.thinking[message.ac_id] = message.thinking_text
         self._forward_to_dashboard("on_agent_thinking_updated", message)
+
+    @staticmethod
+    def _telemetry_node_key(node_id: str | None, ac_index: int) -> str | None:
+        """Resolve the tree-node key a frugality event should stamp.
+
+        Mirrors the tree's own node-key resolution: the stable ``node_id`` when
+        present, otherwise the ``ac_<index>`` fallback the tree uses for a bare AC.
+        Returns None when neither is usable so we never stamp the wrong node.
+        """
+        if node_id:
+            return node_id
+        if ac_index >= 0:
+            return f"ac_{ac_index}"
+        return None
+
+    def on_acmodel_routed(self, message: ACModelRouted) -> None:
+        """Fold per-AC model-tier routing (latest-wins per node) into state."""
+        key = self._telemetry_node_key(message.node_id, message.ac_index)
+        if key is None:
+            return
+        if message.model_tier:
+            self._state.tier_by_node[key] = message.model_tier
+        if message.model:
+            self._state.model_by_node[key] = message.model
+        self._notify_ac_tree_updated()
+
+    def on_actoken_attribution(self, message: ACTokenAttribution) -> None:
+        """Fold per-AC token spend into state: per-node accumulate + run total."""
+        if message.token_spend < 0:
+            return
+        self._state.run_total_tokens += message.token_spend
+        key = self._telemetry_node_key(message.node_id, message.ac_index)
+        if key is not None:
+            self._state.tokens_by_node[key] = (
+                self._state.tokens_by_node.get(key, 0.0) + message.token_spend
+            )
+        self._notify_ac_tree_updated()
+
+    def on_frugality_proof_evaluated(self, message: FrugalityProofEvaluated) -> None:
+        """Fold the run-end frugality verdict once, then hand it to the dashboard."""
+        if self._state.frugality_summary is None:
+            self._state.frugality_summary = format_frugality_summary(
+                message.status, message.token_reduction_pct
+            )
+        self._forward_to_dashboard("on_frugality_proof_evaluated", message)
+
+    def on_frugality_retrospective_reported(
+        self,
+        message: FrugalityRetrospectiveReported,
+    ) -> None:
+        """Fold the execution-finalized evidence report once for live display."""
+        if self._state.frugality_retrospective is None:
+            self._state.frugality_retrospective = dict(message.summary)
+            self._state.frugality_retrospective_summary = format_frugality_retrospective_summary(
+                message.summary
+            )
+        self._forward_to_dashboard("on_frugality_retrospective_reported", message)
 
     def on_workflow_progress_updated(self, message: WorkflowProgressUpdated) -> None:
         # Update state with AC tree from workflow progress (smart merge)
@@ -893,22 +1094,63 @@ class OuroborosTUI(App[None]):
             pass  # Screen might not be ready
 
     def on_pause_requested(self, message: PauseRequested) -> None:
-        self._state.is_paused = True
-        self._state.status = "paused"
-        if self._pause_callback is not None:
-            asyncio.create_task(self._call_pause_callback(message.execution_id))
+        """Forward a pause request to the execution owner.
+
+        Lifecycle display state is never changed here. ``paused`` is only
+        rendered once the authoritative execution control path acknowledges
+        the transition via ``orchestrator.session.paused`` (or a terminal
+        ``execution.terminal`` mirror), so the monitor cannot claim a
+        transition the execution never reached.
+        """
+        if self._pause_callback is None:
+            self._report_control_unavailable("Pause", message.execution_id)
+            return
+        if not self._begin_control_request(
+            "pause", message.execution_id, self._call_pause_callback(message.execution_id)
+        ):
+            return
         self._state.add_log(
             "info", "tui.control", f"Pause requested for execution {message.execution_id}"
         )
 
     def on_resume_requested(self, message: ResumeRequested) -> None:
-        self._state.is_paused = False
-        self._state.status = "running"
-        if self._resume_callback is not None:
-            asyncio.create_task(self._call_resume_callback(message.execution_id))
+        """Forward a resume request to the execution owner.
+
+        As with :meth:`on_pause_requested`, the displayed lifecycle status is
+        left untouched until an acknowledged lifecycle event arrives.
+        """
+        if self._resume_callback is None:
+            self._report_control_unavailable("Resume", message.execution_id)
+            return
+        if not self._begin_control_request(
+            "resume", message.execution_id, self._call_resume_callback(message.execution_id)
+        ):
+            return
         self._state.add_log(
             "info", "tui.control", f"Resume requested for execution {message.execution_id}"
         )
+
+    def _report_control_unavailable(self, action: str, execution_id: str) -> None:
+        """Log and surface that a lifecycle control is not wired up."""
+        detail = (
+            f"{action} is unavailable in this monitor: no execution control is "
+            f"connected for execution {execution_id}."
+        )
+        self._state.add_log("warning", "tui.control", detail)
+        self._notify(detail, severity="warning")
+
+    def _report_control_failure(self, action: str, error: Exception) -> None:
+        """Log and surface that a lifecycle control request failed."""
+        detail = f"{action} callback failed: {error}"
+        self._state.add_log("error", "tui.control", detail)
+        self._notify(detail, severity="error")
+
+    def _notify(self, message: str, *, severity: SeverityLevel) -> None:
+        """Best-effort user notification that tolerates a not-yet-running app."""
+        try:
+            self.notify(message, severity=severity, markup=False)
+        except Exception:
+            pass  # App may not be running (offline/embedded construction)
 
     async def _call_pause_callback(self, execution_id: str) -> None:
         if self._pause_callback is not None:
@@ -917,7 +1159,8 @@ class OuroborosTUI(App[None]):
                 if asyncio.iscoroutine(result):
                     await result
             except Exception as e:
-                self._state.add_log("error", "tui.control", f"Pause callback failed: {e}")
+                self._acknowledge_control("pause", execution_id)
+                self._report_control_failure("Pause", e)
 
     async def _call_resume_callback(self, execution_id: str) -> None:
         if self._resume_callback is not None:
@@ -926,14 +1169,88 @@ class OuroborosTUI(App[None]):
                 if asyncio.iscoroutine(result):
                     await result
             except Exception as e:
-                self._state.add_log("error", "tui.control", f"Resume callback failed: {e}")
+                self._acknowledge_control("resume", execution_id)
+                self._report_control_failure("Resume", e)
+
+    def _begin_control_request(self, action: str, execution_id: str, request: Any) -> bool:
+        """Start one lifecycle request per action/execution until acknowledged."""
+        key = (action, execution_id)
+        if execution_id != self._state.execution_id or key in self._control_requests:
+            request.close()
+            return False
+        self._control_requests[key] = asyncio.create_task(request)
+        return True
+
+    def _acknowledge_control(self, action: str, execution_id: str) -> None:
+        """Release an in-flight gate after failure or authoritative state."""
+        self._control_requests.pop((action, execution_id), None)
+
+    def _acknowledge_all_controls(self, execution_id: str) -> None:
+        for action in ("pause", "resume"):
+            self._acknowledge_control(action, execution_id)
+
+    def _cancel_control_requests(self) -> None:
+        """Cancel callbacks owned by the previous monitored execution."""
+        requests = tuple(self._control_requests.values())
+        self._control_requests.clear()
+        for request in requests:
+            if not request.done():
+                request.cancel()
+
+    @property
+    def pause_control_available(self) -> bool:
+        """Whether a pause owner is connected to this monitor."""
+        return self._pause_callback is not None
+
+    @property
+    def resume_control_available(self) -> bool:
+        """Whether a resume owner is connected to this monitor."""
+        return self._resume_callback is not None
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide the pause/resume bindings when no execution owner is connected.
+
+        ``ouroboros tui monitor`` attaches to the event store as an observer and
+        owns no execution, so advertising `p`/`r` there would promise control it
+        cannot exercise. ``False`` is deliberate: Textual treats ``False`` as
+        disabled *and* hidden, while ``None`` would leave the key greyed out in
+        the footer — still advertised.
+        """
+        execution_id = self._state.execution_id
+        if action == "pause":
+            if (
+                not self.pause_control_available
+                or ("pause", execution_id) in self._control_requests
+            ):
+                return False
+        if action == "resume":
+            if (
+                not self.resume_control_available
+                or (
+                    "resume",
+                    execution_id,
+                )
+                in self._control_requests
+            ):
+                return False
+        return super().check_action(action, parameters)
 
     def action_pause(self) -> None:
-        if self._state.execution_id and not self._state.is_paused:
+        # `check_action` already makes the key inert without a connected owner;
+        # a request that still gets here is refused by `on_pause_requested`.
+        if (
+            self._state.execution_id
+            and not self._state.is_paused
+            and ("pause", self._state.execution_id) not in self._control_requests
+        ):
             self.post_message(PauseRequested(self._state.execution_id))
 
     def action_resume(self) -> None:
-        if self._state.execution_id and self._state.is_paused:
+        if (
+            self._state.execution_id
+            and self._state.is_paused
+            and ("resume", self._state.execution_id) not in self._control_requests
+        ):
             self.post_message(ResumeRequested(self._state.execution_id))
 
     def action_show_dashboard(self) -> None:
@@ -959,13 +1276,36 @@ class OuroborosTUI(App[None]):
         self, message: LineageSelectorScreen.LineageSelected
     ) -> None:
         """Handle lineage selection and push the detail screen."""
-        self.push_screen(LineageDetailScreen(message.lineage, event_store=self._event_store))
+        assert self._event_store is not None
+        from ouroboros.evolution.loop import EvolutionaryLoop
+        from ouroboros.plugin.rewind import build_lockfile_rewind_observer
+
+        rewind_committer = EvolutionaryLoop(
+            self._event_store,
+            rewind_observer=build_lockfile_rewind_observer(self._event_store),
+        )
+        self.push_screen(
+            LineageDetailScreen(
+                message.lineage,
+                event_store=self._event_store,
+                rewind_committer=rewind_committer,
+            )
+        )
 
     def set_pause_callback(self, callback: Any) -> None:
         self._pause_callback = callback
+        self._refresh_control_bindings()
 
     def set_resume_callback(self, callback: Any) -> None:
         self._resume_callback = callback
+        self._refresh_control_bindings()
+
+    def _refresh_control_bindings(self) -> None:
+        """Re-evaluate `check_action` so the footer reflects a late-connected owner."""
+        try:
+            self.refresh_bindings()
+        except Exception:
+            pass  # App may not be mounted yet; check_action runs fresh on mount
 
     def update_ac_tree(self, tree_data: dict[str, Any]) -> None:
         self._state.ac_tree = tree_data
@@ -987,11 +1327,78 @@ class OuroborosTUI(App[None]):
         if dashboard is not None and hasattr(dashboard, method_name):
             getattr(dashboard, method_name)(message)
 
+    def _apply_provider_tags(self) -> None:
+        """Stamp per-node provider onto ac_tree nodes from the shared derivation.
+
+        Single choke point: whatever built/mutated the tree, the provider tag is
+        applied here right before the widget renders, keyed by node_id — so a
+        provider learned before OR after its node was created still lands.
+        Resolution matches reduce_board's per-card rule exactly (per-worker
+        provider wins, run-level backend is the fallback); the structural root is
+        not a board card and is never tagged.
+        """
+        ledger = self._provider_ledger
+        state = self._state
+        if (
+            not ledger.provider_by_node
+            and not ledger.run_provider
+            and not state.tier_by_node
+            and not state.model_by_node
+            and not state.tokens_by_node
+        ):
+            return
+        nodes = self._state.ac_tree.get("nodes")
+        if not isinstance(nodes, dict):
+            return
+        root_id = self._state.ac_tree.get("root_id", "root")
+        for node_id, node in nodes.items():
+            if node_id == root_id or not isinstance(node, dict):
+                continue
+            embedded_id = str(node.get("node_id") or "")
+            provider = (
+                ledger.provider_by_node.get(node_id)
+                or ledger.provider_by_node.get(embedded_id)
+                or ledger.run_provider
+            )
+            if provider:
+                node["provider"] = provider
+            # Frugality telemetry — identical resolution to provider (node_id key,
+            # then the embedded node_id), so a tier/model/token learned before OR
+            # after the node was created still lands on it.
+            tier = state.tier_by_node.get(node_id) or state.tier_by_node.get(embedded_id)
+            if tier:
+                node["model_tier"] = tier
+            model = state.model_by_node.get(node_id) or state.model_by_node.get(embedded_id)
+            if model:
+                node["model"] = model
+            tokens = state.tokens_by_node.get(node_id)
+            if tokens is None:
+                tokens = state.tokens_by_node.get(embedded_id)
+            if tokens is not None:
+                node["tokens"] = tokens
+
     def _notify_ac_tree_updated(self) -> None:
         """Notify dashboard that AC tree has been updated."""
+        self._apply_provider_tags()
+        projection = getattr(self, "_ac_runtime", ACRuntimeProjection())
+        root_id = self._state.ac_tree.get("root_id", "root")
+        for node_id, node in self._state.ac_tree.get("nodes", {}).items():
+            if node_id == root_id:
+                continue
+            index = node.get("index")
+            root_index = index - 1 if isinstance(index, int) and index > 0 else None
+            runtime = projection.for_node(
+                node_id, root_index, child=node.get("parent_id") not in {None, root_id}
+            )
+            node["runtime"] = runtime.to_data()
+            node["status"] = runtime.display_status(node.get("status", "pending"))
         dashboard = self._get_dashboard_screen()
         if dashboard is not None and hasattr(dashboard, "_tree") and dashboard._tree is not None:
             dashboard._tree.update_tree(self._state.ac_tree)
+            panel = getattr(dashboard, "_detail_panel", None)
+            if panel is not None and panel.selected_node is not None:
+                selected_id = panel.selected_node.get("id")
+                panel.selected_node = self._state.ac_tree.get("nodes", {}).get(selected_id)
 
     async def on_unmount(self) -> None:
         if self._subscription_task is not None:

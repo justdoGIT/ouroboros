@@ -1,11 +1,10 @@
 """Brownfield repository registry — DB-backed business logic.
 
-Manages the global brownfield registry in ``~/.ouroboros/ouroboros.db``
+Manages the global brownfield registry in the configured runtime database
 via :class:`~ouroboros.persistence.brownfield.BrownfieldStore`.
 
 Business-level operations:
-- Scan-root discovery for valid seed git repos/worktrees
-- Linked worktree discovery from normal repo roots via Git metadata
+- Scan-root discovery for valid seed git repos/worktrees (depth-bounded walk)
 - README/CLAUDE.md parsing for one-line description generation (Frugal model)
 - Async CRUD delegated to BrownfieldStore
 
@@ -15,6 +14,7 @@ All brownfield data is stored in the SQLite database.
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import subprocess
@@ -22,6 +22,9 @@ from urllib.parse import urlparse
 
 import structlog
 
+from ouroboros.bigbang.brownfield_index import index_repo
+from ouroboros.config.loader import get_llm_backend_for_role
+from ouroboros.config.model_selection import resolve_role_model
 from ouroboros.core.errors import ProviderError
 from ouroboros.persistence.brownfield import BrownfieldRepo, BrownfieldStore
 from ouroboros.providers.base import (
@@ -38,7 +41,10 @@ BrownfieldEntry = BrownfieldRepo
 
 # ── Constants ──────────────────────────────────────────────────────
 
-_FRUGAL_MODEL = "anthropic/claude-3-5-haiku-20241022"
+# Maximum directory depth, relative to the scan root, to search for repos.
+# Repos commonly live at ``~/repo`` (depth 1) or ``~/group/repo`` (depth 2);
+# deeper nesting is rare and not worth the extra filesystem traversal.
+_MAX_SCAN_DEPTH = 2
 
 _SKIP_DIRS: frozenset[str] = frozenset(
     {
@@ -143,29 +149,6 @@ def _is_git_worktree(repo_path: Path) -> bool:
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
-def _list_git_worktrees(repo_path: Path) -> list[Path]:
-    """Return linked worktree paths reported by Git for a normal repo root."""
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(repo_path), "worktree", "list", "--porcelain"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode != 0:
-            return []
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return []
-
-    worktrees: list[Path] = []
-    for line in result.stdout.splitlines():
-        if line.startswith("worktree "):
-            worktree_path = line.removeprefix("worktree ").strip()
-            if worktree_path:
-                worktrees.append(Path(worktree_path))
-    return worktrees
-
-
 def _repo_entry(repo_path: Path) -> dict[str, str] | None:
     """Build a scan result entry for an existing repository directory."""
     try:
@@ -179,54 +162,48 @@ def _repo_entry(repo_path: Path) -> dict[str, str] | None:
     return {"path": str(resolved), "name": resolved.name}
 
 
-def _add_repo_and_worktrees(
-    repo_path: Path,
-    repos_by_path: dict[str, dict[str, str]],
-    *,
-    include_linked_worktrees: bool,
-) -> None:
-    """Add a seed repo and optionally any Git-reported linked worktrees.
+def _scan_repo_entry(repo_path: Path) -> dict[str, str] | None:
+    """Validate a walk-discovered ``.git`` location and build its scan entry.
 
-    The seed path must be found by the filesystem walk. For normal repository
-    roots, linked worktrees come from ``git worktree list`` and may be outside
-    the walk root.
+    Runs the ``git`` work-tree check exactly once and returns None for anything
+    that is not a real working tree. Safe to call from worker threads — it only
+    spawns a subprocess (which releases the GIL).
     """
     if not _is_git_worktree(repo_path):
-        return
-
-    candidates = [repo_path]
-    if include_linked_worktrees:
-        candidates.extend(_list_git_worktrees(repo_path))
-
-    for candidate in candidates:
-        if not _is_git_worktree(candidate):
-            continue
-        entry = _repo_entry(candidate)
-        if entry is None:
-            continue
-        repos_by_path.setdefault(entry["path"], entry)
+        return None
+    return _repo_entry(repo_path)
 
 
 def scan_home_for_repos(
     root: Path | None = None,
+    *,
+    max_depth: int = _MAX_SCAN_DEPTH,
+    known_paths: frozenset[str] = frozenset(),
 ) -> list[dict[str, str]]:
     """Walk a root directory to find valid git repos/worktrees.
 
     Scanning rules:
     - Repositories are discovered by filesystem walking under ``root`` only.
     - A seed repo/worktree is any walked directory with a ``.git`` directory or file.
+    - The walk descends at most ``max_depth`` levels below ``root`` — repos at
+      ``~/repo`` (depth 1) or ``~/group/repo`` (depth 2) are found; deeper ones
+      are not.
     - Prune subdirectories once a seed is found (no nested repo walk).
     - Skip hardcoded noise directories (node_modules, .venv, etc.).
     - Skip dot-prefixed directories during filesystem walking.
-    - Normal repo roots are expanded via ``git worktree list --porcelain``.
-    - Linked worktrees reported by normal repo roots may be included outside ``root``.
-    - Linked worktree seeds are registered self-only and do not pull main/sibling
-      worktrees outside ``root``.
+    - Each candidate is registered self-only; Git worktree families are NOT
+      expanded. Any worktree that lives within the depth-bounded walk is found
+      directly; worktrees outside it (e.g. under ``.ouroboros/worktrees``) are
+      intentionally left out.
     - Local repos and repos with any remote name are included.
 
     Args:
         root: Directory to start the seed filesystem walk. Defaults to the
             current user's home directory.
+        max_depth: Maximum directory depth below ``root`` to search.
+        known_paths: Resolved paths already in the registry. Their ``.git``
+            entry was validated when they were first registered, so the
+            per-candidate ``git`` subprocess is skipped for them.
 
     Returns:
         Sorted list of ``{path, name}`` dicts for each discovered repo/worktree.
@@ -234,36 +211,51 @@ def scan_home_for_repos(
     if root is None:
         root = Path.home()
 
-    repos_by_path: dict[str, dict[str, str]] = {}
-
-    # os.walk with topdown=True so we can modify dirs in-place to prune
+    # Phase 1 — cheap filesystem walk (no subprocess) collects candidate repo
+    # roots: directories carrying a ``.git`` dir or file. Bounded to max_depth
+    # levels below root and pruned at skip/dot dirs and at any repo found.
+    candidates: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root, topdown=True):
         current = Path(dirpath)
 
-        has_git_dir = ".git" in dirnames
-        has_git_file = ".git" in filenames
-        if has_git_dir or has_git_file:
-            # A .git directory is a normal repo root, so it can safely expand to
-            # its Git-reported worktree family. A .git file is a linked worktree
-            # seed; register it, but do not use it as a portal to pull in the
-            # main repo or siblings. Users may scan/pass a specific worktree to
-            # keep the rest of the repository out of AI context.
-            _add_repo_and_worktrees(
-                current,
-                repos_by_path,
-                include_linked_worktrees=has_git_dir,
-            )
+        if ".git" in dirnames or ".git" in filenames:
+            candidates.append(current)
             log.debug("brownfield.scan.found", path=str(current))
-
-            # Prune: don't descend into this repo's subdirectories
+            # Prune: a repo's subtree holds its own files, not more seed repos.
             dirnames.clear()
             continue
 
-        # Prune skip directories
+        if len(current.relative_to(root).parts) >= max_depth:
+            # At the depth cap: this dir was already checked above; go no deeper.
+            dirnames.clear()
+            continue
+
+        # Prune skip and dot-prefixed directories.
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
 
-    repos = list(repos_by_path.values())
-    repos.sort(key=lambda r: r["path"])
+    if not candidates:
+        log.info("brownfield.scan.complete", root=str(root), found=0)
+        return []
+
+    # Phase 2 — validate candidates in parallel. Each check spawns a ``git``
+    # subprocess (releases the GIL), so threads overlap the process-spawn cost.
+    repos_by_path: dict[str, dict[str, str]] = {}
+    unknown: list[Path] = []
+    for candidate in candidates:
+        entry = _repo_entry(candidate) if known_paths else None
+        if entry is not None and entry["path"] in known_paths:
+            repos_by_path.setdefault(entry["path"], entry)
+        else:
+            unknown.append(candidate)
+
+    if unknown:
+        max_workers = min(16, (os.cpu_count() or 4) * 4, len(unknown))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for entry in pool.map(_scan_repo_entry, unknown):
+                if entry is not None:
+                    repos_by_path.setdefault(entry["path"], entry)
+
+    repos = sorted(repos_by_path.values(), key=lambda r: r["path"])
     log.info("brownfield.scan.complete", root=str(root), found=len(repos))
     return repos
 
@@ -301,10 +293,16 @@ def _read_readme_content(repo_path: Path, max_chars: int = 3000) -> str | None:
     return None
 
 
+def _frugal_model() -> str:
+    """The frugal-tier model for the backend serving brownfield LLM calls."""
+    backend = get_llm_backend_for_role("brownfield")
+    return resolve_role_model("brownfield_scan", backend=backend).model
+
+
 async def generate_desc(
     repo_path: Path,
     llm_adapter: LLMAdapter,
-    model: str = _FRUGAL_MODEL,
+    model: str | None = None,
 ) -> str:
     """Generate a one-line description for a repo using a Frugal-tier LLM.
 
@@ -323,6 +321,9 @@ async def generate_desc(
     if not content:
         return ""
 
+    model_is_explicit = model is not None
+    resolved_model = model or _frugal_model()
+
     messages = [
         Message(role=MessageRole.SYSTEM, content=_DESC_SYSTEM_PROMPT),
         Message(
@@ -331,7 +332,9 @@ async def generate_desc(
         ),
     ]
     config = CompletionConfig(
-        model=model,
+        model=resolved_model,
+        role="brownfield",
+        model_is_explicit=model_is_explicit,
         temperature=0.0,
         max_tokens=60,
     )
@@ -356,21 +359,51 @@ async def generate_desc(
 # ── High-level orchestration ───────────────────────────────────────
 
 
+async def _refresh_index(store: BrownfieldStore, paths: list[str]) -> int:
+    """Rebuild stored search documents for ``paths`` whose inputs changed.
+
+    Unchanged repos (same stat fingerprint) are skipped without reading any
+    file. Index failures are logged and never fail the scan or register that
+    triggered them: ranking falls back to name, description, and path.
+    """
+    if not paths:
+        return 0
+    try:
+        known = await store.get_index_entries()
+
+        def _build() -> dict[str, tuple[str, str]]:
+            updates: dict[str, tuple[str, str]] = {}
+            for path in paths:
+                stored = known.get(path)
+                built = index_repo(Path(path), stored[1] if stored else None)
+                if built is not None:
+                    updates[path] = built
+            return updates
+
+        updates = await asyncio.to_thread(_build)
+        written = await store.upsert_index_entries(updates)
+    except Exception as exc:  # noqa: BLE001 - the index is best-effort, never fails a scan
+        log.warning("brownfield.index_refresh_failed", error=str(exc), count=len(paths))
+        return 0
+    log.info("brownfield.index_refreshed", checked=len(paths), rebuilt=written)
+    return written
+
+
 async def scan_and_register(
     store: BrownfieldStore,
     llm_adapter: LLMAdapter | None = None,  # noqa: ARG001
     root: Path | None = None,
     *,
-    model: str = _FRUGAL_MODEL,  # noqa: ARG001
+    model: str | None = None,  # noqa: ARG001
 ) -> list[BrownfieldRepo]:
     """Scan a root directory for repos/worktrees and bulk-register them in the DB.
 
     This is the main entry point for brownfield scanning.
 
     1. Walk ``root`` (the current user's home directory when omitted) to find
-       valid seed git repos/worktrees.
-    2. For each normal repo root, include Git-reported linked worktrees even
-       when they live outside ``root``. Linked worktree seeds are self-only.
+       valid seed git repos/worktrees, bounded to a shallow depth.
+    2. Each discovered repo/worktree is registered self-only; Git worktree
+       families are not expanded.
     3. Upsert all found repos while preserving existing names, descriptions,
        and default flags. Default selection is handled by setup/MCP flows.
 
@@ -391,7 +424,10 @@ async def scan_and_register(
         re-discovered by this scan are not included; callers that need the
         full registry should call :py:meth:`BrownfieldStore.list` directly.
     """
-    scanned = scan_home_for_repos(root)
+    existing_repos = {r.path: r for r in await store.list()}
+    scanned = await asyncio.to_thread(
+        scan_home_for_repos, root, known_paths=frozenset(existing_repos)
+    )
 
     if not scanned:
         log.info("brownfield.scan_and_register.no_repos")
@@ -401,7 +437,6 @@ async def scan_and_register(
     # existing paths, preserving is_default and desc for repos already
     # in the DB.  Manual entries outside the scan root are NOT deleted.
     # Preserve user-curated names for existing repos by checking first.
-    existing_repos = {r.path: r for r in await store.list()}
     scanned_paths: set[str] = set()
     for repo_dict in scanned:
         path = repo_dict["path"]
@@ -413,6 +448,8 @@ async def scan_and_register(
         await store.register(path=path, name=name)
 
     log.info("brownfield.upsert_registered", count=len(scanned_paths))
+
+    await _refresh_index(store, sorted(scanned_paths))
 
     # Return only the repos that were just discovered/upserted. The full
     # registry can include manually-registered or previously-scanned repos
@@ -447,7 +484,7 @@ async def register_repo(
     desc: str | None = None,
     *,
     llm_adapter: LLMAdapter | None = None,
-    model: str = _FRUGAL_MODEL,
+    model: str | None = None,
 ) -> BrownfieldRepo:
     """Register a single repository in the brownfield DB.
 
@@ -492,6 +529,8 @@ async def register_repo(
         name=resolved_name,
         desc=desc or None,
     )
+    if Path(canonical_path).is_dir():
+        await _refresh_index(store, [canonical_path])
 
     log.info(
         "brownfield.register_repo",
@@ -508,7 +547,7 @@ async def set_default_repo(
     path: str,
     *,
     llm_adapter: LLMAdapter | None = None,
-    model: str = _FRUGAL_MODEL,
+    model: str | None = None,
 ) -> BrownfieldRepo | None:
     """Set a registered repository as a default brownfield context.
 

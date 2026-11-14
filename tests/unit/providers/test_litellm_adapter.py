@@ -3,10 +3,12 @@
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import litellm
+import pytest
+
+litellm = pytest.importorskip("litellm", reason="LiteLLM adapter tests require litellm")
 
 from ouroboros.config.models import CredentialsConfig, ProviderCredentials
-from ouroboros.core.errors import ProviderError
+from ouroboros.core.errors import ConfigError, ProviderError
 from ouroboros.providers.base import (
     CompletionConfig,
     Message,
@@ -38,6 +40,18 @@ def create_mock_response(
 
 class TestLiteLLMAdapterInit:
     """Test LiteLLMAdapter initialization."""
+
+    def test_registers_minimax_m27_model_metadata(self) -> None:
+        """The pinned LiteLLM registry includes the current MiniMax model."""
+        model_info = litellm.model_cost["minimax/MiniMax-M2.7"]
+
+        assert model_info["litellm_provider"] == "minimax"
+        assert model_info["max_input_tokens"] == 204800
+        assert model_info["input_cost_per_token"] == 3e-7
+        assert model_info["output_cost_per_token"] == 1.2e-6
+        assert model_info["cache_read_input_token_cost"] == 6e-8
+        assert model_info["cache_creation_input_token_cost"] == 3.75e-7
+        assert model_info["supports_reasoning"] is True
 
     def test_init_defaults(self) -> None:
         """LiteLLMAdapter initializes with sensible defaults."""
@@ -239,6 +253,58 @@ class TestLiteLLMAdapterBuildCompletionKwargs:
             kwargs = adapter._build_completion_kwargs(messages, config)
 
         assert kwargs["response_format"] == {"type": "json_object"}
+
+    def test_wraps_bare_json_schema_response_format(self) -> None:
+        """A bare json_schema is sent in the name/schema wrapper LiteLLM expects."""
+        adapter = LiteLLMAdapter()
+        messages = [Message(role=MessageRole.USER, content="Hello")]
+        schema = {"type": "object", "properties": {"approved": {"type": "boolean"}}}
+        response_format = {"type": "json_schema", "json_schema": schema}
+        config = CompletionConfig(model="gpt-4", response_format=response_format)
+
+        with patch.dict("os.environ", {}, clear=True):
+            kwargs = adapter._build_completion_kwargs(messages, config)
+
+        assert kwargs["response_format"] == {
+            "type": "json_schema",
+            "json_schema": {"name": "response", "schema": schema},
+        }
+        # The caller's dict is left as it was.
+        assert response_format == {"type": "json_schema", "json_schema": schema}
+
+    def test_keeps_wrapped_json_schema_response_format(self) -> None:
+        """An already wrapped json_schema, with its name and strict flag, is unchanged."""
+        adapter = LiteLLMAdapter()
+        messages = [Message(role=MessageRole.USER, content="Hello")]
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "vote",
+                "strict": True,
+                "schema": {"type": "object", "properties": {}},
+            },
+        }
+        config = CompletionConfig(model="gpt-4", response_format=response_format)
+
+        with patch.dict("os.environ", {}, clear=True):
+            kwargs = adapter._build_completion_kwargs(messages, config)
+
+        assert kwargs["response_format"] == response_format
+
+    def test_claude_5_5_json_schema_uses_instruction_not_response_format(self) -> None:
+        """The Claude 5.5 instruction path is not affected by the wrapper."""
+        adapter = LiteLLMAdapter()
+        messages = [Message(role=MessageRole.USER, content="Hello")]
+        config = CompletionConfig(
+            model="anthropic/claude-sonnet-5-5",
+            response_format={"type": "json_schema", "json_schema": {"type": "object"}},
+        )
+
+        with patch.dict("os.environ", {}, clear=True):
+            kwargs = adapter._build_completion_kwargs(messages, config)
+
+        assert "response_format" not in kwargs
+        assert kwargs["messages"][-1]["role"] == "system"
 
     def test_omits_response_format_when_none(self) -> None:
         """Does not include response_format when not set."""
@@ -452,6 +518,26 @@ class TestLiteLLMAdapterComplete:
 
         assert result.is_ok
         assert result.value.content == "Hi there!"
+
+    async def test_profile_config_error_returns_result_err(self) -> None:
+        """Bad profile config should not escape adapter.complete as ConfigError."""
+        adapter = LiteLLMAdapter()
+        messages = [Message(role=MessageRole.USER, content="Hello")]
+        config = CompletionConfig(model="gpt-4", profile="missing-profile")
+
+        with (
+            patch(
+                "ouroboros.providers.profiles.load_config", side_effect=ConfigError("bad config")
+            ),
+            patch("litellm.acompletion", new_callable=AsyncMock) as mock_acompletion,
+        ):
+            result = await adapter.complete(messages, config)
+
+        assert result.is_err
+        assert isinstance(result.error, ProviderError)
+        assert result.error.provider == "litellm"
+        assert "Invalid LLM profile configuration" in result.error.message
+        mock_acompletion.assert_not_called()
 
     async def test_rate_limit_error_returns_result_err(self) -> None:
         """Returns Result.err on rate limit error after retries."""
@@ -731,3 +817,46 @@ class TestLiteLLMAdapterProtocolCompliance:
 
         # Type check - can be assigned to protocol type
         _: LLMAdapter = adapter  # This should not raise type errors
+
+
+class TestReasoningEffortPassthrough:
+    """LiteLLM forwards the effort-first dial as a provider-agnostic kwarg."""
+
+    def test_reasoning_effort_forwarded_when_set(self) -> None:
+        adapter = LiteLLMAdapter()
+        kwargs = adapter._build_completion_kwargs(
+            [Message(role=MessageRole.USER, content="hi")],
+            CompletionConfig(model="claude-sonnet-4-6", reasoning_effort="high"),
+        )
+        assert kwargs["reasoning_effort"] == "high"
+
+    def test_reasoning_effort_omitted_when_unset(self) -> None:
+        adapter = LiteLLMAdapter()
+        kwargs = adapter._build_completion_kwargs(
+            [Message(role=MessageRole.USER, content="hi")],
+            CompletionConfig(model="claude-sonnet-4-6"),
+        )
+        assert "reasoning_effort" not in kwargs
+
+
+@pytest.mark.parametrize(
+    ("model", "effort", "omit"),
+    [
+        ("openai/o3", None, True),
+        ("o4-mini", None, True),
+        ("openai/gpt-5-mini", None, True),
+        ("openai/gpt-5.4", "high", True),
+        ("openai/gpt-5.4", None, False),
+        ("openai/gpt-5.4", "none", False),
+        ("openai/gpt-4o", "high", False),
+        ("openai/gpt-5-chat-latest", "high", False),
+        ("openai/gpt-5.2-chat-latest", "high", False),
+        ("openrouter/openai/o3", "high", False),
+    ],
+)
+def test_openai_reasoning_sampling_kwargs(model: str, effort: str | None, omit: bool) -> None:
+    config = CompletionConfig(model=model, reasoning_effort=effort)
+    kwargs = LiteLLMAdapter()._build_completion_kwargs([], config)
+    assert ("temperature" not in kwargs) is omit
+    assert ("top_p" not in kwargs) is omit
+    assert kwargs.get("reasoning_effort") == effort

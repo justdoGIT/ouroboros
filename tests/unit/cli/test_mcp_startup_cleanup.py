@@ -15,12 +15,23 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import typer
 
 from ouroboros.orchestrator.session import (
     SessionRepository,
     SessionStatus,
     SessionTracker,
 )
+from ouroboros.persistence.event_store import sqlite_database_url
+
+
+@pytest.fixture(autouse=True)
+def _stub_mcp_dependency_preflight(monkeypatch):
+    """Keep lifecycle tests independent of the optional MCP SDK install."""
+    monkeypatch.setattr(
+        "ouroboros.cli.commands.mcp._require_mcp_dependency",
+        lambda: None,
+    )
 
 
 def _make_tracker(
@@ -91,6 +102,7 @@ class TestMCPStartupAutoCleanup:
         mock_server = MagicMock()
         mock_server.info.tools = []
         mock_server.serve = AsyncMock()
+        mock_server.shutdown = AsyncMock()
 
         return mock_event_store, mock_repo, mock_server
 
@@ -125,6 +137,39 @@ class TestMCPStartupAutoCleanup:
         mock_repo.cancel_orphaned_sessions.assert_called_once()
         mock_es.initialize.assert_awaited_once()
         mock_server.serve.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_shutdown_routes_through_server_shutdown(self) -> None:
+        """Teardown must drain adapter-owned resources via ``server.shutdown()``
+        (ControlBus → stores → bridge), not close the stores directly — so
+        control-bus subscriber tasks are drained and the bridge is closed in
+        the documented order."""
+        mock_es, mock_repo, mock_server = self._create_patches(cancelled_sessions=[])
+
+        async def serve_side_effect(*args, **kwargs) -> None:
+            await asyncio.sleep(0)
+
+        mock_server.serve.side_effect = serve_side_effect
+
+        with (
+            patch(
+                "ouroboros.persistence.event_store.EventStore",
+                return_value=mock_es,
+            ),
+            patch(
+                "ouroboros.orchestrator.session.SessionRepository",
+                return_value=mock_repo,
+            ),
+            patch(
+                "ouroboros.mcp.server.adapter.create_ouroboros_server",
+                return_value=mock_server,
+            ),
+        ):
+            from ouroboros.cli.commands.mcp import _run_mcp_server
+
+            await _run_mcp_server("localhost", 8080, "stdio")
+
+        mock_server.shutdown.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_startup_does_not_wait_for_background_cleanup(self) -> None:
@@ -276,6 +321,8 @@ class TestMCPStartupAutoCleanup:
             transport="streamable-http",
             host="127.0.0.1",
             port=9100,
+            allowed_hosts=(),
+            allowed_origins=(),
         )
 
     @pytest.mark.asyncio
@@ -295,6 +342,7 @@ class TestMCPStartupAutoCleanup:
             except asyncio.CancelledError:
                 cleanup_cancelled.set()
                 raise
+            raise AssertionError("cleanup wait returned unexpectedly")
 
         mock_repo.cancel_orphaned_sessions = AsyncMock(side_effect=slow_cleanup)
 
@@ -321,6 +369,71 @@ class TestMCPStartupAutoCleanup:
         assert cleanup_started.is_set()
         assert cleanup_cancelled.is_set()
         mock_server.serve.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_serve_failure_propagates_after_cleanup(self) -> None:
+        """A serve-loop failure (e.g. bind/listen error) must surface to the CLI
+        instead of being swallowed as a clean shutdown, while persistent stores
+        are still released. Regression for the lifecycle wrapper that awaited the
+        serve task under ``contextlib.suppress(Exception)``."""
+        mock_es, mock_repo, mock_server = self._create_patches(cancelled_sessions=[])
+        mock_server.serve = AsyncMock(side_effect=OSError("address already in use"))
+
+        with (
+            patch(
+                "ouroboros.persistence.event_store.EventStore",
+                return_value=mock_es,
+            ),
+            patch(
+                "ouroboros.orchestrator.session.SessionRepository",
+                return_value=mock_repo,
+            ),
+            patch(
+                "ouroboros.mcp.server.adapter.create_ouroboros_server",
+                return_value=mock_server,
+            ),
+            patch("ouroboros.telemetry.capture_service_active") as capture_service,
+            patch("ouroboros.telemetry.capture_mcp_serve_started") as capture_attach,
+        ):
+            from ouroboros.cli.commands.mcp import _run_mcp_server
+
+            with pytest.raises(OSError, match="address already in use"):
+                await _run_mcp_server("localhost", 8080, "stdio")
+
+        # Cleanup still ran despite the failure: adapter shutdown owns store
+        # closure, so the WAL checkpoint path is reached even when serve fails.
+        mock_server.shutdown.assert_awaited_once()
+        capture_service.assert_not_called()
+        # A bind/listen failure is not an attachment: the daily funnel
+        # denominator must only count servers that reached their serve loop.
+        capture_attach.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_successful_serve_records_one_attachment_row(self) -> None:
+        """A serve loop that actually runs (here: completes cleanly, the
+        short-session case) records exactly one daily attachment row."""
+        mock_es, mock_repo, mock_server = self._create_patches(cancelled_sessions=[])
+
+        with (
+            patch(
+                "ouroboros.persistence.event_store.EventStore",
+                return_value=mock_es,
+            ),
+            patch(
+                "ouroboros.orchestrator.session.SessionRepository",
+                return_value=mock_repo,
+            ),
+            patch(
+                "ouroboros.mcp.server.adapter.create_ouroboros_server",
+                return_value=mock_server,
+            ),
+            patch("ouroboros.telemetry.capture_mcp_serve_started") as capture_attach,
+        ):
+            from ouroboros.cli.commands.mcp import _run_mcp_server
+
+            await _run_mcp_server("localhost", 8080, "stdio")
+
+        capture_attach.assert_called_once_with("stdio")
 
     @pytest.mark.asyncio
     async def test_event_store_init_failure_aborts_startup(self) -> None:
@@ -546,7 +659,120 @@ class TestMCPStartupAutoCleanup:
 
             await _run_mcp_server("localhost", 8080, "stdio", db_path="/tmp/test.db")
 
-        MockEventStore.assert_called_once_with("sqlite+aiosqlite:////tmp/test.db")
+        MockEventStore.assert_called_once_with(sqlite_database_url("/tmp/test.db"))
+
+    @pytest.mark.asyncio
+    async def test_custom_db_path_expansion_failure_is_redacted(self, capsys) -> None:
+        from ouroboros.cli.commands.mcp import _run_mcp_server
+
+        private_user = "ouroboros_user_that_does_not_exist_1817"
+
+        with pytest.raises(typer.Exit) as exc_info:
+            await _run_mcp_server(
+                "localhost",
+                8080,
+                "stdio",
+                db_path=f"~{private_user}/db.sqlite",
+            )
+
+        output = capsys.readouterr().err
+        assert exc_info.value.exit_code == 1
+        assert "Invalid EventStore configuration" in output
+        assert private_user not in output
+        assert "Traceback" not in output
+
+    @pytest.mark.asyncio
+    async def test_custom_db_directory_target_is_rejected(self, tmp_path, capsys) -> None:
+        from ouroboros.cli.commands.mcp import _run_mcp_server
+
+        directory = tmp_path / "event-store-directory"
+        directory.mkdir()
+
+        with pytest.raises(typer.Exit) as exc_info:
+            await _run_mcp_server(
+                "localhost",
+                8080,
+                "stdio",
+                db_path=str(directory),
+            )
+
+        output = capsys.readouterr().err
+        assert exc_info.value.exit_code == 1
+        assert "Invalid EventStore configuration" in output
+        assert str(tmp_path) not in output
+        assert "Traceback" not in output
+
+    @pytest.mark.asyncio
+    async def test_default_db_path_uses_runtime_resolver(self, tmp_path) -> None:
+        resolved_db = tmp_path / "configured" / "events.db"
+        mock_es, mock_repo, mock_server = self._create_patches(cancelled_sessions=[])
+        mock_brownfield = AsyncMock()
+
+        with (
+            patch(
+                "ouroboros.persistence.event_store.EventStore",
+                return_value=mock_es,
+            ) as mock_event_store,
+            patch(
+                "ouroboros.orchestrator.session.SessionRepository",
+                return_value=mock_repo,
+            ),
+            patch(
+                "ouroboros.mcp.server.adapter.create_ouroboros_server",
+                return_value=mock_server,
+            ),
+            patch(
+                "ouroboros.persistence.brownfield.BrownfieldStore",
+                return_value=mock_brownfield,
+            ) as mock_brownfield_store,
+            patch(
+                "ouroboros.config.models.resolve_event_store_path",
+                return_value=resolved_db,
+            ),
+        ):
+            from ouroboros.cli.commands.mcp import _run_mcp_server
+
+            await _run_mcp_server("localhost", 8080, "stdio")
+
+        expected_url = sqlite_database_url(resolved_db)
+        assert mock_event_store.call_args_list[-1].args == (expected_url,)
+        assert mock_brownfield_store.call_args_list[-1].args == (expected_url,)
+
+    @pytest.mark.asyncio
+    async def test_configured_db_creates_missing_parent_with_real_stores(self, tmp_path) -> None:
+        from ouroboros.cli.commands.mcp import _run_mcp_server
+        from ouroboros.persistence.brownfield import BrownfieldStore
+
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "config.yaml").write_text(
+            "persistence:\n  database_path: new/nested/events.db\n",
+            encoding="utf-8",
+        )
+        resolved_db = config_dir / "new" / "nested" / "events.db"
+        mock_server = MagicMock()
+        mock_server.info.tools = []
+        mock_server.serve = AsyncMock()
+        mock_server.shutdown = AsyncMock()
+
+        with (
+            patch(
+                "ouroboros.config.models.get_config_dir",
+                return_value=config_dir,
+            ),
+            patch(
+                "ouroboros.persistence.brownfield.BrownfieldStore",
+                BrownfieldStore,
+            ),
+            patch(
+                "ouroboros.mcp.server.adapter.create_ouroboros_server",
+                return_value=mock_server,
+            ),
+        ):
+            await _run_mcp_server("localhost", 8080, "stdio")
+
+        assert resolved_db.parent.is_dir()
+        assert resolved_db.is_file()
 
     @pytest.mark.asyncio
     async def test_single_orphan_reports_correct_count(self) -> None:
@@ -618,6 +844,7 @@ class TestFindOrphanedSessionsEdgeCases:
         store = AsyncMock()
         store.append = AsyncMock()
         store.replay = AsyncMock(return_value=[])
+        store.query_events = AsyncMock(return_value=[])
         store.get_all_sessions = AsyncMock(return_value=[])
         return store
 
@@ -847,6 +1074,7 @@ class TestCancelOrphanedSessionsEdgeCases:
         store = AsyncMock()
         store.append = AsyncMock()
         store.replay = AsyncMock(return_value=[])
+        store.query_events = AsyncMock(return_value=[])
         store.get_all_sessions = AsyncMock(return_value=[])
         return store
 
@@ -877,7 +1105,12 @@ class TestCancelOrphanedSessionsEdgeCases:
         ):
             call_count = 0
 
-            async def mock_mark_cancelled(session_id: str, reason: str, cancelled_by: str):
+            async def mock_mark_cancelled(
+                session_id: str,
+                reason: str,
+                cancelled_by: str,
+                **kwargs: object,
+            ):
                 nonlocal call_count
                 call_count += 1
                 from ouroboros.core.errors import PersistenceError
@@ -907,7 +1140,12 @@ class TestCancelOrphanedSessionsEdgeCases:
 
         cancel_calls: list[dict] = []
 
-        async def capture_cancel(session_id: str, reason: str, cancelled_by: str):
+        async def capture_cancel(
+            session_id: str,
+            reason: str,
+            cancelled_by: str,
+            **kwargs: object,
+        ):
             from ouroboros.core.types import Result
 
             cancel_calls.append(
@@ -952,7 +1190,12 @@ class TestCancelOrphanedSessionsEdgeCases:
 
         cancel_calls: list[dict] = []
 
-        async def capture_cancel(session_id: str, reason: str, cancelled_by: str):
+        async def capture_cancel(
+            session_id: str,
+            reason: str,
+            cancelled_by: str,
+            **kwargs: object,
+        ):
             from ouroboros.core.types import Result
 
             cancel_calls.append({"reason": reason})

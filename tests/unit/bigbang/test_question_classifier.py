@@ -5,11 +5,12 @@ and QuestionClassifier pass-through, reframe, and defer paths.
 """
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from ouroboros.bigbang.question_classifier import (
+    _CLASSIFICATION_SYSTEM_PROMPT,
     _DEFAULT_PLACEHOLDER,
     ClassificationResult,
     ClassifierOutputType,
@@ -31,6 +32,52 @@ def _mock_completion(content: str) -> CompletionResponse:
         usage=UsageInfo(prompt_tokens=50, completion_tokens=30, total_tokens=80),
         finish_reason="stop",
     )
+
+
+# ──────────────────────────────────────────────────────────────
+# Classification prompt contract
+# ──────────────────────────────────────────────────────────────
+
+
+def _prompt_section(start: str, end: str) -> str:
+    """Extract the classification-prompt text between two markers."""
+    return _CLASSIFICATION_SYSTEM_PROMPT.split(start)[1].split(end)[0]
+
+
+class TestClassificationPromptPostLaunchBoundary:
+    """Regression coverage for the post-launch measurement boundary (#1663).
+
+    PLANNING must ask for delivered-behavior acceptance criteria, and
+    post-launch outcome measurement must be routed to DECIDE_LATER instead
+    of passing through as a PM planning question.
+    """
+
+    def test_planning_lists_acceptance_criteria_not_kpis(self) -> None:
+        planning = _prompt_section("**PLANNING**", "**DEVELOPMENT**")
+        assert "Acceptance criteria" in planning
+        assert "delivered behavior" in planning
+        assert "KPI" not in planning
+        assert "Success metrics" not in planning
+
+    def test_decide_later_covers_post_launch_outcome_measurement(self) -> None:
+        decide_later = _prompt_section("**DECIDE_LATER**", "## Rules")
+        assert "Post-launch outcome measurement" in decide_later
+        assert "conversion uplift" in decide_later
+        assert "KPI targets" in decide_later
+        assert "adoption goals" in decide_later
+        assert "observation windows" in decide_later
+        # The rationale generalizes beyond the enumerated examples (#1664).
+        assert "real-world usage data" in decide_later
+
+    def test_classifier_prompt_states_the_prd_contract_philosophy(self) -> None:
+        """The classifier gets the "why" above its category list, not just
+        reworded bullets (idea ported from #1664)."""
+        flat = " ".join(_CLASSIFICATION_SYSTEM_PROMPT.split())
+        assert "contract between the PM and the developers" in flat
+        assert "not part of this contract" in flat
+        assert flat.index("contract between the PM and the developers") < flat.index(
+            "## Categories"
+        )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -244,6 +291,21 @@ class TestQuestionClassifierPassthrough:
         assert classification.original_question == planning_q
 
     @pytest.mark.asyncio
+    async def test_classify_fenced_array_falls_back_to_passthrough(self) -> None:
+        """A fenced top-level array is malformed shape, not a crash (#1838)."""
+        adapter = MagicMock()
+        question = "What is the target market?"
+        adapter.complete = AsyncMock(return_value=Result.ok(_mock_completion("```json\n[]\n```")))
+
+        classifier = QuestionClassifier(llm_adapter=adapter)
+        result = await classifier.classify(question)
+
+        assert result.is_ok
+        classification = result.value
+        assert classification.output_type == ClassifierOutputType.PASSTHROUGH
+        assert classification.question_for_pm == question
+
+    @pytest.mark.asyncio
     async def test_classify_parse_failure_defaults_to_passthrough(self) -> None:
         """When LLM response cannot be parsed, default is PASSTHROUGH."""
         adapter = MagicMock()
@@ -290,6 +352,72 @@ class TestQuestionClassifierPassthrough:
         assert result.is_ok
         # The original question must be preserved exactly
         assert result.value.question_for_pm == planning_q
+
+
+class TestQuestionClassifierModelRouting:
+    """Regression coverage for implicit vs explicit classifier model routing."""
+
+    @pytest.mark.asyncio
+    async def test_default_model_path_keeps_model_implicit_for_role_profiles(self) -> None:
+        """Implicit default classifier model should not block question_classification profiles."""
+        adapter = MagicMock()
+        question = "What problem does this solve for users?"
+        adapter.complete = AsyncMock(
+            return_value=Result.ok(
+                _mock_completion(
+                    json.dumps(
+                        {
+                            "category": "planning",
+                            "reframed_question": question,
+                            "reasoning": "PM-facing planning question",
+                            "defer_to_dev": False,
+                        }
+                    )
+                )
+            )
+        )
+
+        with patch(
+            "ouroboros.bigbang.question_classifier.get_llm_model_for_role",
+            return_value="default",
+        ):
+            classifier = QuestionClassifier(llm_adapter=adapter)
+            result = await classifier.classify(question)
+
+        assert result.is_ok
+        config = adapter.complete.call_args.args[1]
+        assert config.role == "question_classification"
+        assert config.model == "default"
+        assert config.model_is_explicit is False
+
+    @pytest.mark.asyncio
+    async def test_explicit_model_path_marks_model_as_explicit(self) -> None:
+        """Explicit classifier models should preserve request-model override behavior."""
+        adapter = MagicMock()
+        question = "What success metrics matter most?"
+        adapter.complete = AsyncMock(
+            return_value=Result.ok(
+                _mock_completion(
+                    json.dumps(
+                        {
+                            "category": "planning",
+                            "reframed_question": question,
+                            "reasoning": "PM-facing planning question",
+                            "defer_to_dev": False,
+                        }
+                    )
+                )
+            )
+        )
+
+        classifier = QuestionClassifier(llm_adapter=adapter, model="custom-model")
+        result = await classifier.classify(question)
+
+        assert result.is_ok
+        config = adapter.complete.call_args.args[1]
+        assert config.role == "question_classification"
+        assert config.model == "custom-model"
+        assert config.model_is_explicit is True
 
 
 # ──────────────────────────────────────────────────────────────
@@ -420,3 +548,38 @@ class TestQuestionClassifierDecideLater:
         assert cr.output_type == ClassifierOutputType.DECIDE_LATER
         assert cr.question_for_pm == question  # returned to user for decision
         assert "initial deployment" in cr.placeholder_response
+
+
+def test_shared_classification_policy_omits_standalone_response_schema() -> None:
+    from ouroboros.bigbang.question_classifier import classification_policy_prompt
+
+    policy = classification_policy_prompt()
+
+    assert "**PLANNING**" in policy
+    assert "**DEVELOPMENT**" in policy
+    assert "**DECIDE_LATER**" in policy
+    assert "## Response Format" not in policy
+    assert "Respond ONLY with valid JSON" not in policy
+
+
+@pytest.mark.parametrize("category", [None, 7, []])
+def test_parse_rejects_non_string_category(category) -> None:
+    classifier = QuestionClassifier(llm_adapter=MagicMock())
+
+    with pytest.raises(ValueError, match="category must be a string"):
+        classifier._parse_response(
+            json.dumps({"category": category, "reframed_question": "Question?"}),
+            "Question?",
+        )
+
+
+@pytest.mark.parametrize("field", ["decide_later", "defer_to_dev"])
+@pytest.mark.parametrize("value", ["false", 0, None])
+def test_parse_rejects_non_boolean_routing_flags(field, value) -> None:
+    classifier = QuestionClassifier(llm_adapter=MagicMock())
+
+    with pytest.raises(ValueError, match=rf"{field} must be a boolean"):
+        classifier._parse_response(
+            json.dumps({"category": "planning", field: value}),
+            "Question?",
+        )

@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from ouroboros.router import (
+    InvalidInputReason,
+    InvalidSkill,
     MCPDispatchTarget,
     NormalizedMCPFrontmatter,
     ParsedOooCommand,
@@ -21,7 +23,7 @@ def _write_dispatchable_skill(skills_dir: Path, skill_name: str) -> Path:
     skill_md_path = skill_dir / "SKILL.md"
     skill_md_path.write_text(
         """---
-name: run
+name: ouroboros-run
 mcp_tool: " ouroboros_execute_seed "
 mcp_args:
   seed_path: "$1"
@@ -68,6 +70,47 @@ mcp_args:
     return skill_md_path
 
 
+def _write_auto_dispatchable_skill(skills_dir: Path) -> Path:
+    skill_dir = skills_dir / "auto"
+    skill_dir.mkdir(parents=True)
+    skill_md_path = skill_dir / "SKILL.md"
+    skill_md_path.write_text(
+        """---
+name: auto
+mcp_tool: ouroboros_auto
+mcp_args:
+  goal: "$goal"
+  resume: "$resume"
+  cwd: "$CWD"
+  max_interview_rounds: "$max_interview_rounds"
+  max_repair_rounds: "$max_repair_rounds"
+  skip_run: "$skip_run"
+---
+# Auto
+""",
+        encoding="utf-8",
+    )
+    return skill_md_path
+
+
+def _write_ralph_dispatchable_skill(skills_dir: Path) -> Path:
+    skill_dir = skills_dir / "ralph"
+    skill_dir.mkdir(parents=True)
+    skill_md_path = skill_dir / "SKILL.md"
+    skill_md_path.write_text(
+        """---
+name: ralph
+mcp_tool: ouroboros_ralph
+mcp_args:
+  lineage_id: "$lineage_id"
+---
+# Ralph
+""",
+        encoding="utf-8",
+    )
+    return skill_md_path
+
+
 def _assert_resolved_payload(result: object, expected: Resolved) -> None:
     """Assert every canonical Resolved field, including compare=False fields."""
     assert type(result) is Resolved
@@ -90,8 +133,8 @@ def _assert_resolved_payload(result: object, expected: Resolved) -> None:
             id="ooo-prefix-normalized",
         ),
         pytest.param(
-            ' \t/OUROBOROS:Run   "seed file.yaml" --max-iterations 2',
-            "/ouroboros:run",
+            ' \t/OUROBOROS:Ouroboros-Run   "seed file.yaml" --max-iterations 2',
+            "/ouroboros:ouroboros-run",
             id="slash-prefix-normalized",
         ),
     ],
@@ -147,6 +190,381 @@ def test_valid_dispatch_inputs_normalize_to_canonical_runtime_metadata(
         mcp_args=expected_args,
     )
     assert result.outcome is ResolveOutcome.MATCH
+
+
+def test_valid_dispatch_resolves_named_option_templates_without_polluting_goal(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_auto_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt=(
+                'ooo auto "Build a local-first habit tracker CLI" --skip-run '
+                "--max-interview-rounds 3 --max-repair-rounds=2"
+            ),
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.first_argument == (
+        "Build a local-first habit tracker CLI --skip-run "
+        "--max-interview-rounds 3 --max-repair-rounds=2"
+    )
+    assert result.mcp_args == {
+        "goal": "Build a local-first habit tracker CLI",
+        "resume": "",
+        "cwd": str(tmp_path),
+        "max_interview_rounds": 3,
+        "max_repair_rounds": 2,
+        "skip_run": True,
+    }
+
+
+def test_valid_dispatch_resolves_lineage_id_option_without_using_plain_request(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_ralph_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt='ooo ralph "build a CLI" --lineage-id lin_123',
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.mcp_tool == "ouroboros_ralph"
+    assert result.mcp_args == {"lineage_id": "lin_123"}
+    assert result.first_argument == "build a CLI --lineage-id lin_123"
+
+
+def test_valid_dispatch_routes_plain_ralph_request_to_input_guidance(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_ralph_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt='ooo ralph "build a CLI"',
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.mcp_tool == "ouroboros_ralph"
+    assert result.mcp_args == {"lineage_id": ""}
+
+
+def test_valid_dispatch_routes_empty_lineage_option_to_input_guidance(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_ralph_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt="ooo ralph --lineage-id",
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.mcp_tool == "ouroboros_ralph"
+    assert result.mcp_args == {"lineage_id": ""}
+
+
+def test_valid_dispatch_keeps_lineage_id_mentions_in_plain_ralph_text(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_ralph_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt="ooo ralph document the --lineage-id flag",
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.mcp_tool == "ouroboros_ralph"
+    assert result.mcp_args == {"lineage_id": ""}
+    assert result.first_argument == "document the --lineage-id flag"
+
+
+def test_valid_dispatch_preserves_lineage_id_option_for_skills_that_do_not_use_it(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_auto_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt='ooo auto "Build docs" --lineage-id lin_123',
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.mcp_args["goal"] == "Build docs --lineage-id lin_123"
+    assert "lineage_id" not in result.mcp_args
+
+
+def test_valid_dispatch_preserves_goal_after_boolean_option(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_auto_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt='ooo auto --skip-run "Build a local-first habit tracker CLI"',
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.mcp_args == {
+        "goal": "Build a local-first habit tracker CLI",
+        "resume": "",
+        "cwd": str(tmp_path),
+        "max_interview_rounds": "",
+        "max_repair_rounds": "",
+        "skip_run": True,
+    }
+
+
+def test_valid_dispatch_preserves_multiline_auto_goal(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_auto_dispatchable_skill(skills_dir)
+    goal = "Build a CLI tool\nConstraints:\n  - supports --json output"
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt=f"/ouroboros:auto\n{goal}",
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.first_argument == goal
+    assert result.mcp_args == {
+        "goal": goal,
+        "resume": "",
+        "cwd": str(tmp_path),
+        "max_interview_rounds": "",
+        "max_repair_rounds": "",
+        "skip_run": "",
+    }
+
+
+def test_valid_dispatch_preserves_unknown_double_dash_tokens_in_goal(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_auto_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt="ooo auto Build a CLI that supports --json output",
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.mcp_args == {
+        "goal": "Build a CLI that supports --json output",
+        "resume": "",
+        "cwd": str(tmp_path),
+        "max_interview_rounds": "",
+        "max_repair_rounds": "",
+        "skip_run": "",
+    }
+
+
+def test_valid_dispatch_preserves_control_like_tokens_after_unquoted_goal(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_auto_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt="ooo auto build a CLI that supports --skip-run",
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.mcp_args == {
+        "goal": "build a CLI that supports --skip-run",
+        "resume": "",
+        "cwd": str(tmp_path),
+        "max_interview_rounds": "",
+        "max_repair_rounds": "",
+        "skip_run": "",
+    }
+
+
+def test_valid_dispatch_resolves_trailing_control_after_unquoted_goal(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_auto_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt="/ouroboros:auto build a local-first habit tracker CLI --skip-run",
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.mcp_args == {
+        "goal": "build a local-first habit tracker CLI",
+        "resume": "",
+        "cwd": str(tmp_path),
+        "max_interview_rounds": "",
+        "max_repair_rounds": "",
+        "skip_run": True,
+    }
+
+
+def test_valid_dispatch_preserves_resume_like_tokens_after_unquoted_goal(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_auto_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt="ooo auto build resume support with --resume auto_abc123",
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.mcp_args == {
+        "goal": "build resume support with --resume auto_abc123",
+        "resume": "",
+        "cwd": str(tmp_path),
+        "max_interview_rounds": "",
+        "max_repair_rounds": "",
+        "skip_run": "",
+    }
+
+
+def test_valid_dispatch_preserves_literal_control_flag_after_preposition(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_auto_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt="ooo auto Build docs for --skip-run",
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.mcp_args == {
+        "goal": "Build docs for --skip-run",
+        "resume": "",
+        "cwd": str(tmp_path),
+        "max_interview_rounds": "",
+        "max_repair_rounds": "",
+        "skip_run": "",
+    }
+
+
+def test_valid_dispatch_preserves_control_like_tokens_after_quoted_goal_extension(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_auto_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt='ooo auto "Build a CLI" that documents --skip-run',
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.mcp_args == {
+        "goal": "Build a CLI that documents --skip-run",
+        "resume": "",
+        "cwd": str(tmp_path),
+        "max_interview_rounds": "",
+        "max_repair_rounds": "",
+        "skip_run": "",
+    }
+
+
+def test_valid_dispatch_rejects_missing_value_for_control_option(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_auto_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt="ooo auto --resume",
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, InvalidSkill)
+    assert result.category is InvalidInputReason.TEMPLATE_RESOLUTION_ERROR
+    assert "--resume requires a value" in result.reason
+
+
+def test_valid_dispatch_resolves_resume_option_template_without_goal(
+    tmp_path: Path,
+) -> None:
+    skills_dir = tmp_path / "skills"
+    _write_auto_dispatchable_skill(skills_dir)
+
+    result = resolve_skill_dispatch(
+        ResolveRequest(
+            prompt="ooo auto --resume auto_abc123",
+            cwd=tmp_path,
+            skills_dir=skills_dir,
+        )
+    )
+
+    assert isinstance(result, Resolved)
+    assert result.mcp_args == {
+        "goal": "",
+        "resume": "auto_abc123",
+        "cwd": str(tmp_path),
+        "max_interview_rounds": "",
+        "max_repair_rounds": "",
+        "skip_run": "",
+    }
 
 
 def test_valid_dispatch_normalizes_trailing_line_ending_on_single_line_argument(
@@ -276,7 +694,7 @@ def test_valid_dispatch_preserves_multiline_inline_seed_payload(
     skill_md_path = _write_dispatchable_skill(skills_dir, "run")
     runtime_cwd = tmp_path / "workspace"
     seed_content = "goal: test\nconstraints:\n  - keep it simple\nacceptance_criteria:\n  - works"
-    prompt = f"/ouroboros:run\n{seed_content}"
+    prompt = f"/ouroboros:ouroboros-run\n{seed_content}"
 
     result = resolve_skill_dispatch(
         ResolveRequest(
@@ -302,7 +720,7 @@ def test_valid_dispatch_preserves_multiline_inline_seed_payload(
         result,
         Resolved(
             skill_name="run",
-            command_prefix="/ouroboros:run",
+            command_prefix="/ouroboros:ouroboros-run",
             prompt=prompt,
             skill_path=skill_md_path,
             mcp_tool="ouroboros_execute_seed",
@@ -319,7 +737,7 @@ def test_valid_dispatch_preserves_multiline_inline_seed_leading_whitespace(
     skills_dir = tmp_path / "skills"
     _write_dispatchable_skill(skills_dir, "run")
     seed_content = "  goal: test\n  constraints:\n    - keep it simple"
-    prompt = f"/ouroboros:run\n{seed_content}"
+    prompt = f"/ouroboros:ouroboros-run\n{seed_content}"
 
     result = resolve_skill_dispatch(
         ResolveRequest(
@@ -341,15 +759,15 @@ def test_valid_parsed_dispatch_reconstructs_multiline_prompt_with_newline_separa
     _write_dispatchable_skill(skills_dir, "run")
     seed_content = "goal: test\nconstraints:\n  - keep it simple"
     parsed = ParsedOooCommand(
-        skill_name="run",
-        command_prefix="/ouroboros:run",
+        skill_name="ouroboros-run",
+        command_prefix="/ouroboros:ouroboros-run",
         remainder=seed_content,
     )
 
     result = resolve_skill_dispatch(parsed, cwd=tmp_path, skills_dir=skills_dir)
 
     assert isinstance(result, Resolved)
-    assert result.prompt == f"/ouroboros:run\n{seed_content}"
+    assert result.prompt == f"/ouroboros:ouroboros-run\n{seed_content}"
     assert result.first_argument == seed_content
     assert result.mcp_args["seed_path"] == seed_content
 

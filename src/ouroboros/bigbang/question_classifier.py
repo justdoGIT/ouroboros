@@ -8,19 +8,20 @@ the user with the option to defer to the development interview phase.
 Decide-later questions are returned to the user with the option to defer
 rather than being automatically skipped.
 
-Uses a Sonnet-grade model for accurate judgment and reframing.
+Uses the configured clarification model for accurate judgment and reframing.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 import json
-import re
 
 import structlog
 
+from ouroboros.config import get_llm_model_for_role
 from ouroboros.core.errors import ProviderError
+from ouroboros.core.json_utils import extract_json_payload
 from ouroboros.core.types import Result
 from ouroboros.providers.base import (
     CompletionConfig,
@@ -30,9 +31,6 @@ from ouroboros.providers.base import (
 )
 
 log = structlog.get_logger()
-
-# Sonnet-grade model for classification judgment
-_CLASSIFIER_MODEL = "claude-sonnet-4-20250514"
 _CLASSIFIER_TEMPERATURE = 0.2
 
 # Default placeholder when LLM doesn't provide one for decide-later
@@ -137,11 +135,16 @@ Your job is to determine whether a question generated during a requirements inte
 is answerable by a Product Manager (PM), requires deep technical/development expertise,
 or is premature and should be deferred to a later stage.
 
+A PRD is a contract between the PM and the developers: success criteria are the
+behavior and policy the PM must observe in the delivered feature to accept it as
+built. Measuring adoption, conversion, KPI movement, or other post-launch outcomes
+is follow-up product work informed by real-world usage — not part of this contract.
+
 ## Categories
 
 **PLANNING** — PM can answer directly:
 - Business goals, user needs, market context
-- Success metrics, KPIs, acceptance criteria
+- Acceptance criteria — what the delivered behavior and policy must satisfy
 - Priority, timeline, budget constraints
 - User stories, personas, workflows
 - Scope decisions (in/out), feature prioritization
@@ -158,6 +161,9 @@ or is premature and should be deferred to a later stage.
 **DECIDE_LATER** — Premature or unknowable at this stage:
 - Questions whose answer depends on decisions not yet made
 - Future-phase concerns (post-MVP optimization, scaling details)
+- Post-launch outcome measurement (conversion uplift, KPI targets, adoption \
+goals, observation windows) — these depend on real-world usage data that will \
+not exist until after release
 - Questions requiring user research or data that doesn't exist yet
 - Speculative trade-offs that can't be resolved without prototyping
 - Cross-cutting concerns that will become clearer as other requirements solidify
@@ -186,26 +192,39 @@ Marking as a decision point for later."
 """
 
 
+def classification_policy_prompt() -> str:
+    """Return routing policy text without the standalone classifier schema."""
+    return _CLASSIFICATION_SYSTEM_PROMPT.split("## Response Format", 1)[0].rstrip()
+
+
 @dataclass
 class QuestionClassifier:
     """Classifies interview questions as PM-answerable, DEV-only, or decide-later.
 
-    Uses a Sonnet-grade LLM to judge whether questions are appropriate
-    for a PM audience, reframes technical questions when possible, and
-    identifies premature questions that should be returned to the user
+    Uses the configured clarification model to judge whether questions are
+    appropriate for a PM audience, reframes technical questions when possible,
+    and identifies premature questions that should be returned to the user
     with the option to defer.
 
     Attributes:
         llm_adapter: LLM adapter for classification calls.
-        model: Model to use (Sonnet-grade for judgment quality).
+        model: Explicit model override for classification calls.
         temperature: Low temperature for consistent classification.
         codebase_context: Shared codebase exploration context for informed classification.
     """
 
     llm_adapter: LLMAdapter
-    model: str = _CLASSIFIER_MODEL
+    model: str | None = None
+    implicit_model: str | None = None
+    model_is_explicit: bool = field(default=False, init=False)
     temperature: float = _CLASSIFIER_TEMPERATURE
     codebase_context: str = ""
+
+    def __post_init__(self) -> None:
+        """Resolve implicit default model while preserving explicit caller pins."""
+        self.model_is_explicit = self.model is not None
+        if self.model is None:
+            self.model = self.implicit_model or get_llm_model_for_role("question_classification")
 
     async def classify(
         self,
@@ -236,8 +255,11 @@ class QuestionClassifier:
             Message(role=MessageRole.USER, content="\n".join(user_content_parts)),
         ]
 
+        assert self.model is not None
         config = CompletionConfig(
             model=self.model,
+            role="question_classification",
+            model_is_explicit=self.model_is_explicit,
             temperature=self.temperature,
             max_tokens=512,
         )
@@ -294,20 +316,19 @@ class QuestionClassifier:
         Raises:
             ValueError: If response cannot be parsed.
         """
-        text = response.strip()
-
-        # Extract JSON from markdown code blocks if present
-        json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if json_match:
-            text = json_match.group(1)
-        else:
-            json_match = re.search(r"\{.*\}", text, re.DOTALL)
-            if json_match:
-                text = json_match.group(0)
+        # One authoritative payload or nothing (#1838).
+        text = extract_json_payload(response.strip())
+        if text is None:
+            raise ValueError("no unambiguous JSON payload in classification response")
 
         data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError("classification payload must be a JSON object")
 
-        category_str = data.get("category", "planning").lower()
+        raw_category = data.get("category", "planning")
+        if not isinstance(raw_category, str):
+            raise ValueError("classification category must be a string")
+        category_str = raw_category.lower()
         if category_str == "decide_later":
             category = QuestionCategory.DECIDE_LATER
         elif category_str == "development":
@@ -316,10 +337,13 @@ class QuestionClassifier:
             category = QuestionCategory.PLANNING
 
         reframed = data.get("reframed_question", original_question)
-        if not reframed or not reframed.strip():
+        if not isinstance(reframed, str) or not reframed.strip():
             reframed = original_question
 
-        is_decide_later = bool(data.get("decide_later", False))
+        raw_decide_later = data.get("decide_later", False)
+        if not isinstance(raw_decide_later, bool):
+            raise ValueError("classification decide_later must be a boolean")
+        is_decide_later = raw_decide_later
         placeholder = data.get("placeholder_response", "")
 
         # Ensure decide-later always has a placeholder
@@ -332,12 +356,15 @@ class QuestionClassifier:
             if not placeholder:
                 placeholder = _DEFAULT_PLACEHOLDER
 
+        raw_defer_to_dev = data.get("defer_to_dev", False)
+        if not isinstance(raw_defer_to_dev, bool):
+            raise ValueError("classification defer_to_dev must be a boolean")
         return ClassificationResult(
             original_question=original_question,
             category=category,
             reframed_question=reframed,
             reasoning=data.get("reasoning", ""),
-            defer_to_dev=bool(data.get("defer_to_dev", False)),
+            defer_to_dev=raw_defer_to_dev,
             decide_later=is_decide_later,
             placeholder_response=placeholder,
         )

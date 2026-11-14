@@ -1,0 +1,324 @@
+"""Assertion-safe retry hints derived from harness and worker traces."""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any
+
+from ouroboros.core.seed import AcceptanceCriterionSpec
+from ouroboros.harness.deliver_gate import load_ac_evidence_manifest
+from ouroboros.harness.journal import EvidenceKind, EvidenceManifest
+from ouroboros.observability.logging import get_logger
+from ouroboros.orchestrator.contract_redaction import (
+    contains_transformed_hidden_contract_value,
+    contains_unsupported_terminal_control,
+    redact_hidden_contract_values,
+)
+from ouroboros.orchestrator.decomposition_policy import redact_and_truncate_text
+from ouroboros.orchestrator.evidence.runtime_metadata import _STALL_SENTINEL
+from ouroboros.orchestrator.execution_runtime_scope import build_ac_runtime_identity
+from ouroboros.orchestrator.failure_taxonomy import FailureClass, classify_hard_precondition
+from ouroboros.orchestrator.parallel_executor_models import (
+    ACExecutionOutcome,
+    ACExecutionResult,
+    package_failure_class,
+    package_repair,
+)
+from ouroboros.resilience.lateral import build_lateral_change_of_approach_directive
+
+if TYPE_CHECKING:
+    from ouroboros.orchestrator.parallel_executor import _VerifyGateOutcome
+
+
+_MAX_HINT_CHARS = 4_000
+_MAX_TRACE_FACTS = 12
+log = get_logger(__name__)
+
+
+def _sanitize_fragment(text: str, spec: AcceptanceCriterionSpec | None) -> str:
+    """Redact exact values and drop fragments carrying transformed variants."""
+
+    if spec is None:
+        return redact_and_truncate_text(text, max_chars=_MAX_HINT_CHARS)
+    if contains_unsupported_terminal_control(text):
+        return ""
+    hidden_values = (spec.verify_command, spec.output_assertion)
+    if contains_transformed_hidden_contract_value(text, hidden_values):
+        return ""
+    sanitized = redact_hidden_contract_values(text, hidden_values)
+    return redact_and_truncate_text(sanitized, max_chars=_MAX_HINT_CHARS)
+
+
+def _entry_fact(entry: Any) -> str | None:
+    payload = entry.payload
+    if not isinstance(payload, Mapping):
+        return None
+    status = "succeeded" if entry.ok is True else "failed" if entry.ok is False else "pending"
+    preview = payload.get("args_preview")
+    if not isinstance(preview, str) or not preview.strip():
+        preview = payload.get("tool_name")
+    if not isinstance(preview, str) or not preview.strip():
+        return None
+    if entry.kind is EvidenceKind.COMMAND_EXECUTED:
+        return f"Command observed ({status}): {preview.strip()}"
+    if entry.kind is EvidenceKind.FILE_MODIFIED:
+        return f"File operation observed ({status}): {preview.strip()}"
+    return None
+
+
+def _manifest_facts(
+    manifest: EvidenceManifest | None,
+    spec: AcceptanceCriterionSpec | None,
+) -> tuple[str, ...]:
+    if manifest is None:
+        return ()
+    facts: list[str] = []
+    for entry in manifest.entries:
+        fact = _entry_fact(entry)
+        if fact is None:
+            continue
+        sanitized = _sanitize_fragment(fact, spec)
+        if sanitized:
+            facts.append(sanitized)
+        if len(facts) >= _MAX_TRACE_FACTS:
+            break
+    return tuple(facts)
+
+
+def build_assertion_safe_retry_hint(
+    *,
+    outcome: _VerifyGateOutcome | None,
+    result: ACExecutionResult,
+    manifest: EvidenceManifest | None,
+    spec: AcceptanceCriterionSpec | None,
+) -> str:
+    """Build a deterministic hint without exposing harness grading inputs."""
+
+    sections: list[str] = []
+    if outcome is not None:
+        observations: list[str] = []
+        if outcome.missing_artifacts:
+            observations.append(
+                "Missing required artifacts: " + ", ".join(outcome.missing_artifacts)
+            )
+        if outcome.reason:
+            observations.append("Harness verification failed: " + outcome.reason)
+        if outcome.workspace_mutated:
+            observations.append(
+                "verify_command itself created, modified, or deleted workspace files. "
+                "Verification must only observe. If your tests or the program under "
+                "test write state (fixtures, JSON stores, logs, generated data), make "
+                "them write to a temporary directory instead of the workspace. "
+                "Bytecode caches and Git-ignored outputs are already exempt, so "
+                "disabling them changes nothing."
+            )
+        if observations:
+            sections.append(
+                "### Harness observations\n"
+                + "\n".join(f"- {_sanitize_fragment(item, spec)}" for item in observations)
+            )
+        if outcome.output_tail:
+            output_tail = _sanitize_fragment(outcome.output_tail, spec)
+            if output_tail:
+                sections.append("### Harness verification output (tail)\n" + output_tail)
+
+    facts = _manifest_facts(manifest, spec)
+    if facts:
+        sections.append("### Observed work trace\n" + "\n".join(f"- {fact}" for fact in facts))
+
+    if outcome is None:
+        fallback = result.error or result.final_message or ""
+        if fallback:
+            sanitized = _sanitize_fragment(fallback, spec)
+            if sanitized:
+                sections.append("### Last error (tail)\n" + sanitized[-500:])
+
+    return redact_and_truncate_text("\n\n".join(sections), max_chars=_MAX_HINT_CHARS)
+
+
+def build_ac_retry_prompt(
+    *,
+    failure_class: str | None,
+    outcome: _VerifyGateOutcome | None,
+    result: ACExecutionResult,
+    ac_content: str,
+    is_final_attempt: bool,
+    manifest: EvidenceManifest | None = None,
+    spec: AcceptanceCriterionSpec | None = None,
+) -> str:
+    """Build assertion-safe retry coaching for one re-dispatched AC."""
+
+    parts: list[str] = []
+    if failure_class:
+        parts.append(f"### Prior failure classification\n{failure_class}")
+    if repair := package_repair(result):
+        # The frozen check package failed this criterion; its counterexample is
+        # the repair signal (held-out inputs are already withheld upstream).
+        parts.append("### Check package counterexample\n" + _sanitize_fragment(repair, spec))
+    elif result.error != _STALL_SENTINEL:
+        hint = build_assertion_safe_retry_hint(
+            outcome=outcome,
+            result=result,
+            manifest=manifest,
+            spec=spec,
+        )
+        if hint:
+            parts.append(hint)
+    if is_final_attempt:
+        parts.append(
+            build_lateral_change_of_approach_directive(
+                problem_context=ac_content,
+                current_approach=(
+                    "The previous attempts failed as described above; the same "
+                    "approach is not working."
+                ),
+                failed_attempts=(failure_class,) if failure_class else (),
+            )
+        )
+    return "\n\n".join(parts)
+
+
+def failure_class_for_result(result: ACExecutionResult) -> str | None:
+    """Return the best available failure taxonomy label for an AC result."""
+
+    if result.outcome is ACExecutionOutcome.BLOCKED:
+        return FailureClass.BLOCKED.value
+    if (package_class := package_failure_class(result)) is not None:
+        # A package-owned failure; a legacy-owned one keeps the legacy class below.
+        return package_class
+    for message in reversed(result.messages):
+        if not (message.is_final and message.is_error):
+            continue
+        hard_precondition = classify_hard_precondition(message.content, message.data)
+        if hard_precondition is not None:
+            return hard_precondition.value
+    hard_precondition = classify_hard_precondition(
+        " ".join(part for part in (result.error, result.final_message) if part)
+    )
+    if hard_precondition is not None:
+        return hard_precondition.value
+    verdict = result.atomic_verifier_verdict
+    if verdict is not None and verdict.failure_class:
+        return verdict.failure_class
+    if result.error == _STALL_SENTINEL:
+        return FailureClass.STALL.value
+    return None
+
+
+def _has_terminal_hermes_configuration_error(result: ACExecutionResult) -> bool:
+    for message in reversed(result.messages):
+        if message.is_final:
+            return message.is_error and message.data.get("error_type") == "HermesConfigurationError"
+    return False
+
+
+def is_retryable_failure(result: ACExecutionResult | BaseException) -> bool:
+    """Return whether a batch result is a runnable non-stall AC failure."""
+
+    return (
+        isinstance(result, ACExecutionResult)
+        and not result.success
+        and not result.is_blocked
+        and not result.is_invalid
+        and result.error != _STALL_SENTINEL
+        and not _has_terminal_hermes_configuration_error(result)
+    )
+
+
+async def load_ac_retry_manifest(
+    event_store: Any,
+    *,
+    ac_index: int,
+    execution_id: str,
+) -> EvidenceManifest | None:
+    """Best-effort read-only evidence load for retry coaching."""
+
+    try:
+        identity = build_ac_runtime_identity(
+            ac_index,
+            execution_context_id=execution_id,
+            retry_attempt=0,
+        )
+        return await load_ac_evidence_manifest(
+            event_store,
+            ac_id=identity.ac_id,
+            execution_id=execution_id,
+        )
+    except Exception as exc:
+        log.warning(
+            "parallel_executor.ac.retry_hint_manifest_unavailable",
+            ac_index=ac_index,
+            execution_id=execution_id,
+            error=str(exc),
+        )
+        return None
+
+
+# A throttled attempt (HTTP 429 or rate-limit pressure) is retried only after a
+# wait, so the re-dispatch does not land in the same throttle window. The wait
+# doubles with each retry of the AC and is capped; a provider retry-after is
+# honored up to the same ceiling.
+THROTTLE_BACKOFF_BASE_SECONDS = 60.0
+THROTTLE_BACKOFF_MAX_SECONDS = 300.0
+THROTTLE_RETRY_AFTER_CEILING_SECONDS = 600.0
+# Seam for tests; the wait in ``throttle_wait``.
+_throttle_sleep = asyncio.sleep
+
+
+def throttle_retry_delay(result: ACExecutionResult | BaseException, retry_attempt: int) -> float:
+    """Seconds to wait before re-dispatching ``result``'s AC, or 0 when not throttled.
+
+    Throttling is read from the attempt's provider messages by the shared
+    capacity classifier (``adaptive_concurrency.classify_backend_pressure``):
+    a structured ``http_status`` of 429 first, then the classifier's existing
+    fallback for runtimes that report no status.
+    """
+    if not isinstance(result, ACExecutionResult) or result.success:
+        return 0.0
+    from ouroboros.orchestrator.adaptive_concurrency import (
+        BackendPressureKind,
+        capacity_feedback_messages,
+        classify_backend_pressure,
+    )
+
+    observation = classify_backend_pressure(
+        capacity_feedback_messages(result), provider_completed=False
+    )
+    if observation.kind is not BackendPressureKind.CONCURRENCY_REJECTION:
+        return 0.0
+    scheduled = min(
+        THROTTLE_BACKOFF_MAX_SECONDS,
+        THROTTLE_BACKOFF_BASE_SECONDS * 2 ** max(0, retry_attempt - 1),
+    )
+    retry_after = float(observation.retry_after_seconds or 0)
+    return min(THROTTLE_RETRY_AFTER_CEILING_SECONDS, max(scheduled, retry_after))
+
+
+async def throttle_wait(
+    results: list[ACExecutionResult | BaseException],
+    position_by_idx: Mapping[int, int],
+    retry_idxs: list[int],
+    retry_attempts: Mapping[int, int],
+    *,
+    sleep: Any = None,
+) -> float:
+    """Wait once before a retry batch for the longest throttle delay among its ACs.
+
+    Returns the seconds waited (0 when no AC in the batch was throttled).
+    """
+    delay = max(
+        (
+            throttle_retry_delay(results[position_by_idx[ac_idx]], retry_attempts[ac_idx])
+            for ac_idx in retry_idxs
+        ),
+        default=0.0,
+    )
+    if delay > 0:
+        log.info(
+            "parallel_executor.ac.throttle_backoff",
+            ac_indices=list(retry_idxs),
+            wait_seconds=delay,
+        )
+        await (sleep or _throttle_sleep)(delay)
+    return delay

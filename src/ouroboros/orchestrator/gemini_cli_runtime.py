@@ -17,26 +17,110 @@ Custom CLI Path:
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
 import structlog
 
 from ouroboros.core.security import MAX_LLM_RESPONSE_LENGTH, InputValidator
-from ouroboros.orchestrator.adapter import AgentMessage, RuntimeHandle
-from ouroboros.orchestrator.codex_cli_runtime import CodexCliRuntime, SkillDispatchHandler
+from ouroboros.orchestrator.adapter import (
+    AgentMessage,
+    ParamSupport,
+    ResolvedWorkerCwd,
+    RuntimeCapabilities,
+    RuntimeHandle,
+)
+from ouroboros.orchestrator.codex_cli_runtime import (
+    CodexCliRuntime,
+    SkillDispatchHandler,
+    _CodexItemCorrelationScope,
+)
+from ouroboros.orchestrator.mcp_tools import (
+    normalize_runtime_tool_definition,
+    normalize_runtime_tool_result,
+    serialize_tool_result,
+)
 from ouroboros.providers.gemini_event_normalizer import GeminiEventNormalizer
+from ouroboros.runtime.child_env import DEFAULT_OUROBOROS_STRIP_KEYS, build_child_env
 
 log = structlog.get_logger(__name__)
 
-# Gemini CLI has no Codex-style permission mode flags.
-# The mode names are kept for interface compatibility.
-_GEMINI_PERMISSION_MODES = frozenset({"default", "acceptEdits", "bypassPermissions"})
-_GEMINI_DEFAULT_PERMISSION_MODE = "default"
+# Gemini CLI exposes ``--approval-mode {default|auto_edit|yolo}`` (see
+# google-gemini/gemini-cli ``docs/reference/configuration.md``). Map the
+# Ouroboros permission vocabulary to the *non-blocking* native modes only.
+#
+# Ouroboros' ``"default"`` mode (interactive, prompt-driven) is intentionally
+# absent: this runtime always launches Gemini with ``--non-interactive`` so a
+# subprocess that surfaces an approval prompt would wedge indefinitely. Callers
+# that pass ``"default"`` are rejected at ``_resolve_permission_mode`` with a
+# message pointing them at ``acceptEdits`` (conservative, non-blocking) or
+# ``bypassPermissions`` (full bypass).
+_GEMINI_PERMISSION_MODE_TO_FLAG = {
+    "acceptEdits": "auto_edit",
+    "bypassPermissions": "yolo",
+}
+_GEMINI_PERMISSION_MODES = frozenset(_GEMINI_PERMISSION_MODE_TO_FLAG)
+# Match the orchestrator-wide ``acceptEdits`` default. Gemini's ``auto_edit``
+# is non-blocking under ``--non-interactive`` (no approval prompts), so
+# headless safety does not require silently jumping to ``yolo`` (full bypass)
+# when ``permission_mode`` is omitted — operators must opt in to
+# ``bypassPermissions`` explicitly.
+_GEMINI_DEFAULT_PERMISSION_MODE = "acceptEdits"
 
 #: Maximum Ouroboros nesting depth to prevent fork bombs
 _MAX_OUROBOROS_DEPTH = 5
+# Child-env strip set for Gemini.  Gemini does NOT strip CLAUDECODE (unlike
+# codex/copilot/kiro) — preserve that divergence; only the Ouroboros markers
+# are removed.
+_CHILD_ENV_STRIP_KEYS = DEFAULT_OUROBOROS_STRIP_KEYS
+
+_GEMINI_TOOL_NAME_ALIASES = {
+    "runshell": "Bash",
+    "runshellcommand": "Bash",
+}
+
+
+def _normalize_gemini_tool_name(value: object) -> str:
+    """Map Gemini built-ins into the shared runtime tool vocabulary."""
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    raw_name = value.strip()
+    alias_key = "".join(character for character in raw_name if character.isalnum()).lower()
+    if alias_key in _GEMINI_TOOL_NAME_ALIASES:
+        return _GEMINI_TOOL_NAME_ALIASES[alias_key]
+    return normalize_runtime_tool_definition(raw_name).name
+
+
+def _gemini_tool_result_error_state(event: dict[str, Any]) -> tuple[bool, bool]:
+    """Return normalized error state and whether raw status is untrustworthy."""
+    normalized = event.get("is_error")
+    if not isinstance(normalized, bool):
+        return False, True
+
+    observed: list[bool] = []
+    invalid = False
+    for payload in (event.get("raw"), event.get("metadata")):
+        if not isinstance(payload, dict):
+            continue
+        if "is_error" in payload:
+            raw_is_error = payload["is_error"]
+            if isinstance(raw_is_error, bool):
+                observed.append(raw_is_error)
+            else:
+                invalid = True
+        if "status" in payload:
+            raw_status = payload["status"]
+            if not isinstance(raw_status, str):
+                invalid = True
+            else:
+                status = raw_status.strip().lower()
+                if status in {"error", "failed"}:
+                    observed.append(True)
+                elif status in {"completed", "success", "succeeded"}:
+                    observed.append(False)
+    if any(value != normalized for value in observed):
+        invalid = True
+    return normalized, invalid
 
 
 class GeminiCLIRuntime(CodexCliRuntime):
@@ -69,7 +153,7 @@ class GeminiCLIRuntime(CodexCliRuntime):
         cli_path: str | Path | None = None,
         permission_mode: str | None = None,
         model: str | None = None,
-        cwd: str | Path | None = None,
+        cwd: str | Path | ResolvedWorkerCwd | None = None,
         skills_dir: str | Path | None = None,
         skill_dispatcher: SkillDispatchHandler | None = None,
         llm_backend: str | None = None,
@@ -78,7 +162,17 @@ class GeminiCLIRuntime(CodexCliRuntime):
 
         Args:
             cli_path: Optional path to the gemini binary.
-            permission_mode: Optional permission mode (ignored by Gemini).
+            permission_mode: Ouroboros permission level. Recognized
+                non-blocking modes (``acceptEdits`` → ``auto_edit``,
+                ``bypassPermissions`` → ``yolo``) pass through.
+                ``"default"`` is the orchestrator-wide setting that
+                represents an interactive prompt; the headless Gemini
+                runtime cannot honour it, so it is normalized to
+                ``acceptEdits`` with an audit log instead of failing
+                — that keeps a globally valid config working while
+                avoiding the deadlock under ``--non-interactive``.
+                Falls back to ``acceptEdits`` when omitted; operators
+                must opt in to ``bypassPermissions`` explicitly.
             model: Optional model identifier.
             cwd: Optional working directory for the subprocess.
             skills_dir: Optional directory for skill definitions.
@@ -100,14 +194,47 @@ class GeminiCLIRuntime(CodexCliRuntime):
     # -- Permission mode overrides -----------------------------------------
 
     def _resolve_permission_mode(self, permission_mode: str | None) -> str:
-        """Normalize the permission mode for Gemini CLI.
+        """Validate and normalize the Gemini CLI permission mode.
 
-        Gemini CLI has its own internal permission model.  Ouroboros modes
-        are stored for metadata purposes but no permission flags are emitted.
+        ``None`` and the orchestrator-wide ``"default"`` setting both
+        resolve to :data:`_GEMINI_DEFAULT_PERMISSION_MODE`
+        (``acceptEdits`` → ``auto_edit``, non-blocking under
+        ``--non-interactive``). ``config.orchestrator.permission_mode``
+        accepts ``"default"`` as a valid global setting, so the
+        backend-specific contract narrows it at the boundary rather
+        than turning a previously valid config into a hard error: a
+        prompt-driven ``--approval-mode default`` would wedge a headless
+        subprocess.
+
+        Other recognized Ouroboros modes (``acceptEdits``,
+        ``bypassPermissions``) pass through. Anything else raises
+        ``ValueError`` instead of silently falling back — fail-open on
+        a permission boundary would let a typo (or unchecked
+        ``OUROBOROS_AGENT_PERMISSION_MODE`` value) escalate the runtime.
+        Matches the Codex permission parser contract.
         """
-        if permission_mode and permission_mode in _GEMINI_PERMISSION_MODES:
-            return permission_mode
-        return _GEMINI_DEFAULT_PERMISSION_MODE
+        if permission_mode is None:
+            return _GEMINI_DEFAULT_PERMISSION_MODE
+        candidate = permission_mode.strip()
+        if candidate in _GEMINI_PERMISSION_MODES:
+            return candidate
+        if candidate == "default":
+            log.warning(
+                "gemini_cli_runtime.permission_mode_coerced",
+                requested="default",
+                resolved=_GEMINI_DEFAULT_PERMISSION_MODE,
+                reason=(
+                    "Gemini runtime is headless (--non-interactive); the "
+                    "interactive 'default' approval mode would block, so it "
+                    "is normalized to the safe non-blocking equivalent."
+                ),
+            )
+            return _GEMINI_DEFAULT_PERMISSION_MODE
+        msg = (
+            f"Unsupported Gemini permission mode: {permission_mode!r} "
+            f"(expected one of {sorted(_GEMINI_PERMISSION_MODES)})"
+        )
+        raise ValueError(msg)
 
     def _build_permission_args(self) -> list[str]:
         """Return empty list — Gemini CLI has no Codex-style permission flags."""
@@ -117,23 +244,13 @@ class GeminiCLIRuntime(CodexCliRuntime):
 
     def _build_child_env(self) -> dict[str, str]:
         """Build child env with the recursion guard (matches #315 adapter pattern)."""
-        env = os.environ.copy()
-
-        # Prevent child from re-entering Ouroboros MCP
-        for key in ("OUROBOROS_AGENT_RUNTIME", "OUROBOROS_LLM_BACKEND"):
-            env.pop(key, None)
-
-        try:
-            depth = int(env.get("_OUROBOROS_DEPTH", "0")) + 1
-        except (ValueError, TypeError):
-            depth = 1
-
-        if depth > _MAX_OUROBOROS_DEPTH:
-            msg = f"Maximum Ouroboros nesting depth ({_MAX_OUROBOROS_DEPTH}) exceeded"
-            raise RuntimeError(msg)
-
-        env["_OUROBOROS_DEPTH"] = str(depth)
-        return env
+        return build_child_env(
+            strip_keys=_CHILD_ENV_STRIP_KEYS,
+            max_depth=_MAX_OUROBOROS_DEPTH,
+            depth_error_factory=lambda _depth, max_depth: RuntimeError(
+                f"Maximum Ouroboros nesting depth ({max_depth}) exceeded"
+            ),
+        )
 
     # -- CLI path resolution -----------------------------------------------
 
@@ -155,6 +272,12 @@ class GeminiCLIRuntime(CodexCliRuntime):
         *,
         resume_session_id: str | None = None,
         prompt: str | None = None,
+        runtime_handle: RuntimeHandle | None = None,
+        # Accepted to honor the shared CodexCliRuntime contract, but ignored:
+        # the Gemini CLI exposes no per-invocation effort flag (capabilities
+        # declares reasoning_effort_support=IGNORED, so it is surfaced as advised).
+        reasoning_effort: str | None = None,
+        model: str | None = None,
     ) -> list[str]:
         """Build the Gemini CLI command arguments for non-interactive execution.
 
@@ -162,10 +285,21 @@ class GeminiCLIRuntime(CodexCliRuntime):
         - ``--prompt`` carries the request (Gemini's documented headless trigger).
         - ``--non-interactive`` disables TTY prompts so the subprocess never blocks.
         - ``--output-format stream-json`` emits NDJSON events on stdout.
-        - ``--approval-mode yolo`` skips interactive approvals (required for headless).
+        - ``--approval-mode`` is mapped from ``self._permission_mode``:
+          ``acceptEdits`` → ``auto_edit`` (default; non-blocking) and
+          ``bypassPermissions`` → ``yolo`` (full bypass). Gemini's native
+          ``default`` mode is intentionally unreachable through this runtime
+          — :meth:`_resolve_permission_mode` rejects it because a
+          prompt-driven mode under ``--non-interactive`` would deadlock the
+          subprocess. The fallback to ``auto_edit`` below is defensive only.
         """
-        del output_last_message_path, resume_session_id
+        self._reconcile_cli_executable_identity()
+        del output_last_message_path, resume_session_id, runtime_handle
 
+        approval_flag = _GEMINI_PERMISSION_MODE_TO_FLAG.get(
+            self._permission_mode,
+            "auto_edit",
+        )
         command = [
             self._cli_path,
             "--prompt",
@@ -174,9 +308,14 @@ class GeminiCLIRuntime(CodexCliRuntime):
             "--output-format",
             "stream-json",
             "--approval-mode",
-            "yolo",
+            approval_flag,
         ]
-        normalized_model = self._normalize_model(self._model)
+        if approval_flag == "yolo":
+            # Gemini downgrades yolo in untrusted directories unless trust
+            # checks are explicitly skipped. Ouroboros task worktrees are often
+            # freshly created and therefore absent from Gemini's trust registry.
+            command.append("--skip-trust")
+        normalized_model = self._normalize_model(model if model is not None else self._model)
         if normalized_model:
             command.extend(["--model", normalized_model])
         return command
@@ -188,6 +327,32 @@ class GeminiCLIRuntime(CodexCliRuntime):
     def _requires_process_stdin(self) -> bool:
         """Return False — Gemini CLI doesn't need an interactive stdin pipe."""
         return False
+
+    @property
+    def capabilities(self) -> RuntimeCapabilities:
+        """Declare Gemini CLI's runtime feature contract.
+
+        Gemini emits structured ``stream-json`` events and can use the shared
+        skill dispatcher, but the native CLI does not expose targeted session
+        resume. Recovery happens at the Ouroboros checkpoint/lineage layer.
+        """
+        return RuntimeCapabilities(
+            skill_dispatch=True,
+            targeted_resume=False,
+            structured_output=True,
+            # System prompt is composed into the user message (inherited Codex
+            # prompt builder), not passed as a native system directive. The
+            # inherited builder also renders requested tool lists as prompt
+            # guidance rather than enforcing a Gemini-native allow-list.
+            system_prompt_support=ParamSupport.TRANSLATED,
+            tool_restriction_support=ParamSupport.TRANSLATED,
+            empty_tool_restriction_support=ParamSupport.IGNORED,
+            # Reasoning effort is advised, not enforced: the Gemini API has a
+            # thinkingBudget, but no per-invocation effort flag on the Gemini CLI
+            # has been verified. Declared IGNORED (also the default) until a real
+            # per-call mechanism is confirmed — revisit if the CLI exposes one.
+            reasoning_effort_support=ParamSupport.IGNORED,
+        )
 
     # -- Event parsing and normalization -----------------------------------
 
@@ -226,6 +391,8 @@ class GeminiCLIRuntime(CodexCliRuntime):
         self,
         event: dict[str, Any],
         current_handle: RuntimeHandle | None,
+        *,
+        item_scope: _CodexItemCorrelationScope | None = None,
     ) -> list[AgentMessage]:
         """Convert a Gemini CLI event into normalized AgentMessage values.
 
@@ -246,7 +413,6 @@ class GeminiCLIRuntime(CodexCliRuntime):
         event_type = event.get("type")
         content = event.get("content", "")
         metadata = event.get("metadata", {})
-        is_error = event.get("is_error", False)
 
         # Truncate content using InputValidator for text-bearing events
         # (including the terminal `result` payload, since `response` may be long).
@@ -262,12 +428,13 @@ class GeminiCLIRuntime(CodexCliRuntime):
                 content = content[:MAX_LLM_RESPONSE_LENGTH]
 
         if event_type in ("text", "message"):
-            if not content:
+            if not content or metadata.get("role") == "user":
                 return []
             return [
                 AgentMessage(
                     type="assistant",
                     content=content,
+                    data={"text_delta": True} if metadata.get("delta") is True else {},
                     resume_handle=current_handle,
                 )
             ]
@@ -285,7 +452,7 @@ class GeminiCLIRuntime(CodexCliRuntime):
             ]
 
         if event_type == "tool_use":
-            tool_name = metadata.get("name", "")
+            tool_name = _normalize_gemini_tool_name(metadata.get("name"))
             tool_args = metadata.get("input", {})
             return [
                 AgentMessage(
@@ -298,13 +465,28 @@ class GeminiCLIRuntime(CodexCliRuntime):
             ]
 
         if event_type == "tool_result":
-            tool_name = metadata.get("name", "")
+            tool_name = _normalize_gemini_tool_name(metadata.get("name"))
+            result_is_error, invalid_error_state = _gemini_tool_result_error_state(event)
+            serialized_result = serialize_tool_result(
+                normalize_runtime_tool_result(
+                    content,
+                    is_error=result_is_error,
+                )
+            )
+            message_error_state: bool | str = result_is_error
+            if invalid_error_state:
+                message_error_state = "invalid"
+                serialized_result["is_error"] = "invalid"
             return [
                 AgentMessage(
-                    type="tool",
+                    type="tool_result",
                     content=content,
                     tool_name=tool_name,
-                    data={"is_error": is_error},
+                    data={
+                        "subtype": "tool_result",
+                        "is_error": message_error_state,
+                        "tool_result": serialized_result,
+                    },
                     resume_handle=current_handle,
                 )
             ]
@@ -344,6 +526,12 @@ class GeminiCLIRuntime(CodexCliRuntime):
         # Ignore other auxiliary events (init/done/etc.) that don't map
         # to messages; init's session_id is captured separately above.
         return []
+
+    def _update_last_content(self, last_content: str, message: AgentMessage) -> str:
+        """Concatenate native assistant chunks without altering their whitespace."""
+        if message.type == "assistant" and message.data.get("text_delta"):
+            return last_content + message.content
+        return super()._update_last_content(last_content, message)
 
     # -- Session resumption ------------------------------------------------
 

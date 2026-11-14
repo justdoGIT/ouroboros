@@ -55,13 +55,14 @@ Similarity = 0.5 * name_overlap + 0.3 * type_match + 0.2 * exact_match
 
 ### Termination Signals
 
-The `ConvergenceCriteria` checks four signals (any one triggers termination):
+The `ConvergenceCriteria` checks five signals (any one triggers termination):
 
 | Signal | Condition | Default |
 |--------|-----------|---------|
 | **Ontology stability** | `similarity(Oₙ, Oₙ₋₁) >= threshold` | >= 0.95 |
 | **Stagnation** | Similarity >= threshold for N consecutive gens | 3 gens |
 | **Oscillation** | Gen N ≈ Gen N-2 (period-2 cycle) | Enabled |
+| **Repetitive feedback** | At least 70% of the latest Wonder questions repeat in 2 of the last 3 completed generations | Checked from 3 completed gens |
 | **Hard cap** | Max generations reached | 30 |
 
 A minimum of 2 generations must complete before convergence signals 1-3 are checked.
@@ -76,7 +77,7 @@ Gen 3: {Task, Priority, Status, DueDate}     → similarity 1.00 → CONVERGED
 
 ## Ralph: The Persistent Loop
 
-`ooo ralph` (Claude Code skill) runs the evolutionary loop persistently -- across session boundaries -- until convergence. Each step is **stateless**: the EventStore reconstructs the full lineage, so even if your machine restarts, the serpent picks up where it left off.
+`ooo ralph` is an **MCP-owned loop surface**. In job-backed runtimes, the client starts one `ouroboros_ralph` job and the server runs repeated `evolve_step` generations inside that job until QA passes, convergence is reached, a terminal evolution action occurs, cancellation is requested, or `max_generations` is reached. In OpenCode plugin mode, the same MCP call returns `status=delegated_to_plugin` with `job_id=None`, and the bridge child Task session is the terminal surface. Each generation is still recorded in the EventStore, so lineage history can be inspected and continued, but the client no longer reimplements the multi-generation loop itself.
 
 ```
 Ralph Cycle 1: evolve_step(lineage, seed) → Gen 1 → action=CONTINUE
@@ -91,8 +92,8 @@ Ralph Cycle 3: evolve_step(lineage)       → Gen 3 → action=CONVERGED
 | | `ooo evolve` | `ooo ralph` |
 |---|---|---|
 | **Scope** | Single evolution step | Loop until convergence |
-| **Session** | Within current session | Survives session restarts |
-| **Control** | Manual -- you decide when to stop | Automatic -- convergence decides |
+| **Session** | Within current session | Job-backed runtimes return one Ralph job; OpenCode plugin mode delegates one child Task; both record lineage state in EventStore |
+| **Control** | Manual -- you decide when to stop | MCP-owned automation -- job-backed server loop or plugin child Task starts each next generation until convergence/limit |
 | **Use case** | Incremental refinement | Full autonomous evolution |
 
 ---
@@ -137,4 +138,4 @@ The first gate prevents premature execution. The second prevents premature termi
 
 ---
 
-> See [Architecture](../architecture.md) for the full system design, and the [README philosophy sections](../../README.md#from-wonder-to-ontology) for the Socratic and ontological foundations.
+> See [Architecture](../architecture.md) for the full system design, and [From wonder to ontology](../how-ouroboros-works.md#from-wonder-to-ontology) for the Socratic and ontological foundations.

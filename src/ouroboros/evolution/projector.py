@@ -78,6 +78,7 @@ class LineageProjector:
                         ontology_snapshot=_PENDING_ONTOLOGY,
                         phase=phase,
                         created_at=event.timestamp,
+                        seed_json=data.get("seed_json"),
                     )
 
             elif event.type == "lineage.generation.completed":
@@ -102,6 +103,13 @@ class LineageProjector:
                     created_at=event.timestamp,
                     seed_json=data.get("seed_json"),
                     execution_output=data.get("execution_output"),
+                    active_ac_indices=tuple(data.get("active_ac_indices", [])),
+                    frozen_ac_indices=tuple(data.get("frozen_ac_indices", [])),
+                    verification_handoff_pending=(
+                        data.get("verification_handoff_pending", False)
+                        if isinstance(data.get("verification_handoff_pending", False), bool)
+                        else False
+                    ),
                 )
                 generations[gen_num] = record
 
@@ -114,7 +122,21 @@ class LineageProjector:
                     except ValueError:
                         continue  # Skip events with invalid/legacy phase values
                     old = generations[gen_num]
-                    generations[gen_num] = old.model_copy(update={"phase": phase})
+                    update: dict = {"phase": phase}
+                    for field_name in (
+                        "last_completed_phase",
+                        "seed_json",
+                        "partial_state",
+                    ):
+                        if field_name in data:
+                            update[field_name] = data[field_name]
+                    if "seed_id" in data:
+                        update["seed_id"] = data["seed_id"] or old.seed_id
+                    if "active_ac_indices" in data:
+                        update["active_ac_indices"] = tuple(data["active_ac_indices"])
+                    if "frozen_ac_indices" in data:
+                        update["frozen_ac_indices"] = tuple(data["frozen_ac_indices"])
+                    generations[gen_num] = old.model_copy(update=update)
 
             elif event.type == "lineage.generation.failed":
                 data = event.data
@@ -176,8 +198,11 @@ class LineageProjector:
                     lineage = lineage.with_status(LineageStatus.EXHAUSTED)
 
             elif event.type == "lineage.stagnated":
-                if lineage is not None:
-                    lineage = lineage.with_status(LineageStatus.CONVERGED)
+                # Stagnation is a non-terminal recovery signal. The control
+                # directive stream maps it to UNSTUCK, so replay must leave the
+                # lineage ACTIVE and resumable rather than treating it as
+                # terminal success.
+                pass
 
             elif event.type == "lineage.rewound":
                 data = event.data
@@ -214,6 +239,21 @@ class LineageProjector:
                     # corrupt the projection; the raw row is still queryable
                     # via event_store directly for postmortem.
                     continue
+                schema_version = data.get("schema_version")
+                if schema_version is not None and (
+                    not isinstance(schema_version, int) or schema_version < 1
+                ):
+                    continue
+                target_type = data.get("target_type")
+                if target_type is not None and (
+                    not isinstance(target_type, str) or not target_type.strip()
+                ):
+                    continue
+                target_id = data.get("target_id")
+                if target_id is not None and (
+                    not isinstance(target_id, str) or not target_id.strip()
+                ):
+                    continue
                 generation_number = data.get("generation_number")
                 if generation_number is not None and not isinstance(generation_number, int):
                     continue
@@ -223,15 +263,37 @@ class LineageProjector:
                 is_terminal = data.get("is_terminal", False)
                 if not isinstance(is_terminal, bool):
                     continue
+                extra = data.get("extra")
+                step_action = None
+                if isinstance(extra, dict):
+                    raw_step_action = extra.get("step_action")
+                    if isinstance(raw_step_action, str) and raw_step_action.strip():
+                        step_action = raw_step_action
+                parent_directive_id = data.get("parent_directive_id")
+                if parent_directive_id is not None and (
+                    not isinstance(parent_directive_id, str) or not parent_directive_id.strip()
+                ):
+                    continue
+                idempotency_key = data.get("idempotency_key")
+                if idempotency_key is not None and (
+                    not isinstance(idempotency_key, str) or not idempotency_key.strip()
+                ):
+                    continue
                 directive_emissions.append(
                     ControlDirectiveEmission(
                         directive=directive_value,
                         reason=str(data.get("reason", "")),
                         emitted_by=str(data.get("emitted_by", "")),
                         timestamp=event.timestamp,
+                        schema_version=schema_version,
+                        target_type=target_type,
+                        target_id=target_id,
                         generation_number=generation_number,
                         phase=phase,
                         is_terminal=is_terminal,
+                        step_action=step_action,
+                        parent_directive_id=parent_directive_id,
+                        idempotency_key=idempotency_key,
                     )
                 )
 

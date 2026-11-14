@@ -8,13 +8,15 @@ without requiring an API key.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Awaitable, Callable, Mapping
 import contextlib
 import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import tempfile
+import tomllib
 from typing import Any
 
 import structlog
@@ -25,42 +27,119 @@ from ouroboros.codex.cli_policy import (
     build_codex_child_env,
     resolve_codex_cli_path,
 )
+from ouroboros.codex.home import resolve_codex_home
+from ouroboros.codex.runtime_profile import codex_uses_profile_v2, resolve_codex_profile
 from ouroboros.codex_permissions import (
     build_codex_exec_permission_args,
     resolve_codex_permission_mode,
 )
 from ouroboros.config import get_codex_cli_path
 from ouroboros.core.errors import ProviderError
-from ouroboros.core.security import MAX_LLM_RESPONSE_LENGTH, InputValidator
+from ouroboros.core.retry import BASE_TRANSIENT_PATTERNS, is_transient_error
 from ouroboros.core.types import Result
 from ouroboros.providers.base import (
     CompletionConfig,
     CompletionResponse,
     Message,
     MessageRole,
-    UsageInfo,
 )
-from ouroboros.providers.codex_cli_stream import (
-    collect_stream_lines,
-    iter_stream_lines,
-    terminate_process,
-)
+from ouroboros.providers.codex_cli_stream import RuntimeStreamMixin, collect_stream_lines
+from ouroboros.providers.llm_response import truncate_llm_response_if_oversized
+from ouroboros.providers.native_cli_usage import native_cli_usage
+from ouroboros.providers.profiles import resolve_completion_profile_result
 
 log = structlog.get_logger()
 
+# Codex CLI retries a failed request itself and, once it gives up, reports the
+# last HTTP status only inside the error text ("exceeded retry limit, last
+# status: 429 Too Many Requests, request id: ..."). It emits no structured
+# status field, so this is the one parser that reads it.
+_CODEX_LAST_STATUS = re.compile(r"\blast status:\s*(?P<status>[1-5]\d\d)\b", re.IGNORECASE)
+
+
+def codex_last_http_status(text: str | None) -> int | None:
+    """Return the HTTP status Codex CLI reports after exhausting its retries."""
+    match = _CODEX_LAST_STATUS.search(text or "")
+    return int(match.group("status")) if match else None
+
+
 _SAFE_MODEL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_./:@-]+$")
-_RETRYABLE_ERROR_PATTERNS = (
-    "rate limit",
-    "temporarily unavailable",
-    "timeout",
-    "overloaded",
-    "try again",
-    "connection reset",
+_CODEX_REASONING_EFFORT_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
+
+
+# Codex shares the canonical transient core verbatim — its previous local copy
+# (rate/temporarily/timeout/overloaded/try-again/connection) was a strict subset,
+# so adopting the shared tuple only *adds* the missing common signals
+# (concurrency, 429, 5xx, bare "connection") without dropping any prior match.
+_RETRYABLE_ERROR_PATTERNS = BASE_TRANSIENT_PATTERNS
+
+_CODEX_AUTH_FAILURE_PATTERNS = (
+    "missing bearer or basic authentication",
+    "401 unauthorized",
+    "unauthorized",
+    "invalid api key",
+    "no api key",
+    "missing api key",
+    "invalid bearer token",
 )
 
+# A bare auth phrase ("401 unauthorized", "unauthorized") is ambiguous —
+# nested tools or MCP services routed through the same ``error`` /
+# ``turn.failed`` channel can surface their own 401s without involving Codex
+# auth at all. To avoid sending operators to inspect ``CODEX_HOME/auth.json``
+# for an unrelated failure, classification additionally requires that the
+# error mention a Codex/OpenAI-specific marker below.
+_CODEX_PROVIDER_MARKERS = (
+    "api.openai.com",
+    "openai.com",
+    "codex",
+)
+_OPENAI_RESPONSES_ENDPOINT = "api.openai.com/v1/responses"
 
-class CodexCliLLMAdapter:
-    """LLM adapter backed by local Codex CLI execution."""
+
+def _deep_merge_config_mappings(
+    base: Mapping[str, object] | None,
+    overlay: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Merge one Codex config layer onto another without mutating either.
+
+    Codex profile-v2 files layer nested tables recursively over ``config.toml``.
+    Reproducing that behavior here is necessary because MCP transport fields can
+    be split across the base and selected profile files.
+    """
+    merged = dict(base or {})
+    if overlay is None:
+        return merged
+
+    for key, overlay_value in overlay.items():
+        base_value = merged.get(key)
+        if isinstance(base_value, dict) and isinstance(overlay_value, dict):
+            merged[key] = _deep_merge_config_mappings(base_value, overlay_value)
+        else:
+            merged[key] = overlay_value
+    return merged
+
+
+class CodexCliLLMAdapter(RuntimeStreamMixin):
+    """LLM adapter backed by local Codex CLI execution.
+
+    Streaming progress callback contract (``on_message``):
+
+    The callable receives ``(message_type, content)`` tuples derived from the
+    Codex JSONL stream. ``message_type`` is one of:
+
+    - ``"thinking"`` — agent reasoning, summaries, or to-do lists. Emitted
+      only on completion (started reasoning is suppressed to reduce noise).
+    - ``"tool_started"`` — a tool/MCP/file-change/web-search call has begun
+      executing. Useful for chat or terminal renderers that want to show
+      in-flight progress before completion. New in 0.34+.
+    - ``"tool"`` — a tool call has finished and the adapter has the
+      completed item information. Always emitted for tool-like items
+      regardless of whether ``"tool_started"`` was seen.
+
+    Consumers that switch on ``message_type`` should ignore unknown kinds to
+    stay forward-compatible with future categories.
+    """
 
     _provider_name = "codex_cli"
     _display_name = "Codex CLI"
@@ -71,6 +150,13 @@ class CodexCliLLMAdapter:
     _log_namespace = "codex_cli_adapter"
     _max_ouroboros_depth = DEFAULT_MAX_OUROBOROS_DEPTH
     _child_session_env_keys = DEFAULT_CODEX_CHILD_SESSION_ENV_KEYS
+    _completion_profile_backend = "codex"
+
+    def _stream_provider_name(self) -> str:
+        return "codex_cli"
+
+    def _stream_line_collector(self) -> Callable[..., Awaitable[list[str]]]:
+        return collect_stream_lines
 
     def __init__(
         self,
@@ -84,6 +170,8 @@ class CodexCliLLMAdapter:
         max_retries: int = 3,
         ephemeral: bool = True,
         timeout: float | None = None,
+        runtime_profile: str | None = None,
+        strict_mcp_config: bool = False,
     ) -> None:
         self._cli_path = self._resolve_cli_path(cli_path)
         self._cwd = str(Path(cwd).expanduser()) if cwd is not None else os.getcwd()
@@ -94,6 +182,13 @@ class CodexCliLLMAdapter:
         self._max_retries = max_retries
         self._ephemeral = ephemeral
         self._timeout = timeout if timeout and timeout > 0 else None
+        self._runtime_profile = runtime_profile
+        self._strict_mcp_config = bool(strict_mcp_config)
+        self._codex_profile = resolve_codex_profile(
+            runtime_profile,
+            logger=log,
+            log_namespace=self._log_namespace,
+        )
 
     def _resolve_permission_mode(self, permission_mode: str | None) -> str:
         """Validate and normalize the adapter permission mode."""
@@ -104,7 +199,80 @@ class CodexCliLLMAdapter:
         return build_codex_exec_permission_args(
             self._permission_mode,
             default_mode="default",
+            source=f"{self._log_namespace}.llm_adapter",
         )
+
+    @staticmethod
+    def _mapping_has_effective_ouroboros_mcp(config: object) -> bool:
+        """Return whether parsed Codex config declares a usable enabled transport."""
+        if not isinstance(config, dict):
+            return False
+        mcp_servers = config.get("mcp_servers")
+        if not isinstance(mcp_servers, dict):
+            return False
+        ouroboros = mcp_servers.get("ouroboros")
+        if not isinstance(ouroboros, dict):
+            return False
+
+        enabled = ouroboros.get("enabled", True)
+        if not isinstance(enabled, bool) or not enabled:
+            return False
+        return any(
+            isinstance(ouroboros.get(key), str) and bool(ouroboros[key].strip())
+            for key in ("command", "url")
+        )
+
+    @staticmethod
+    def _read_config_mapping(path: Path) -> dict[str, object] | None:
+        """Read one Codex config layer without treating malformed state as effective."""
+        try:
+            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            return None
+        return parsed
+
+    def _has_effective_ouroboros_mcp(self, *, active_profile: str | None) -> bool:
+        """Inspect only config layers reachable by this exact Codex child command."""
+        codex_home = resolve_codex_home()
+        base_config = self._read_config_mapping(codex_home / "config.toml")
+        base_has_mcp = self._mapping_has_effective_ouroboros_mcp(base_config)
+
+        if not active_profile:
+            return base_has_mcp
+        uses_profile_v2 = codex_uses_profile_v2(self._cli_path)
+        if uses_profile_v2 is False:
+            # Split-mode Codex selects [profiles.<name>] for profile options,
+            # but it does not promote a nested mcp_servers table into the
+            # effective top-level MCP namespace. Only the base transport,
+            # checked above, is reachable in this mode.
+            return base_has_mcp
+
+        profile_filename = f"{active_profile}.config.toml"
+        if Path(profile_filename).name != profile_filename:
+            return base_has_mcp
+        profile_config = self._read_config_mapping(codex_home / profile_filename)
+        effective_profile_config = _deep_merge_config_mappings(base_config, profile_config)
+        profile_v2_has_mcp = self._mapping_has_effective_ouroboros_mcp(effective_profile_config)
+        if uses_profile_v2 is None and profile_v2_has_mcp and not base_has_mcp:
+            raise ProviderError(
+                message=(
+                    "Cannot guarantee strict MCP isolation because the Codex "
+                    "--profile contract could not be detected"
+                ),
+                provider=self._provider_name,
+                details={
+                    "cli_path": self._cli_path,
+                    "profile": active_profile,
+                    "profile_config": str(codex_home / profile_filename),
+                },
+            )
+        if uses_profile_v2 is None:
+            # If the base transport is already effective, the transient
+            # ``enabled=false`` override is safe in either selector mode. A
+            # profile-v2 layer may disable it, but the redundant override does
+            # not synthesize a new transport or mutate user configuration.
+            return base_has_mcp
+        return profile_v2_has_mcp
 
     def _get_configured_cli_path(self) -> str | None:
         """Resolve an explicit CLI path from config helpers when available."""
@@ -135,9 +303,10 @@ class CodexCliLLMAdapter:
             raise ValueError(msg)
         return candidate
 
-    def _build_prompt(self, messages: list[Message]) -> str:
+    def _build_prompt(self, messages: list[Message], *, max_turns: int | None = None) -> str:
         """Build a plain-text prompt from conversation messages."""
         parts: list[str] = []
+        effective_max_turns = max_turns if max_turns is not None else self._max_turns
 
         system_messages = [
             message.content for message in messages if message.role == MessageRole.SYSTEM
@@ -157,7 +326,7 @@ class CodexCliLLMAdapter:
             parts.append("## Tool Constraints")
             parts.append("Do NOT use any tools or MCP calls. Respond with plain text only.")
 
-        if self._max_turns > 0:
+        if effective_max_turns > 0:
             parts.append("## Execution Budget")
             if self._allowed_tools == []:
                 parts.append(
@@ -166,7 +335,7 @@ class CodexCliLLMAdapter:
                 )
             else:
                 parts.append(
-                    f"Keep the work within at most {self._max_turns} tool-assisted turns if possible."
+                    f"Keep the work within at most {effective_max_turns} tool-assisted turns if possible."
                 )
 
         for message in messages:
@@ -350,23 +519,38 @@ class CodexCliLLMAdapter:
         output_last_message_path: str,
         output_schema_path: str | None,
         model: str | None,
+        profile: str | None = None,
+        reasoning_effort: str | None = None,
+        prompt: str | None = None,
     ) -> list[str]:
         """Build the `codex exec` command for a one-shot completion.
 
         The prompt is always fed via stdin to avoid ARG_MAX limits.
         """
-        command = [
-            self._cli_path,
-            "exec",
-            "--json",
-            "--skip-git-repo-check",
-            "-C",
-            self._cwd,
-            "--output-last-message",
-            output_last_message_path,
-        ]
+        command = [self._cli_path, "exec"]
+        active_profile = self._codex_profile or profile
+        # Codex has one --profile selector. Runtime-profile worker isolation
+        # owns that flag when configured; task-profile resolution may still
+        # contribute a --model fallback, but must not emit a competing profile.
+        if self._codex_profile:
+            command.extend(["--profile", self._codex_profile])
+        command.extend(
+            [
+                "--json",
+                "--skip-git-repo-check",
+                "-C",
+                self._cwd,
+                "--output-last-message",
+                output_last_message_path,
+            ]
+        )
 
         command.extend(self._build_permission_args())
+
+        if self._strict_mcp_config and self._has_effective_ouroboros_mcp(
+            active_profile=active_profile
+        ):
+            command.extend(["-c", "mcp_servers.ouroboros.enabled=false"])
 
         if self._ephemeral:
             command.append("--ephemeral")
@@ -374,7 +558,12 @@ class CodexCliLLMAdapter:
         if output_schema_path:
             command.extend(["--output-schema", output_schema_path])
 
-        if model:
+        if reasoning_effort in _CODEX_REASONING_EFFORT_LEVELS:
+            command.extend(["-c", f"model_reasoning_effort={reasoning_effort}"])
+
+        if profile and not self._codex_profile:
+            command.extend(["--profile", profile])
+        elif model:
             command.extend(["--model", model])
 
         return command
@@ -470,6 +659,152 @@ class CodexCliLLMAdapter:
                 return candidate.strip()
         return ""
 
+    @staticmethod
+    def _redact_env_presence(value: str | None) -> bool:
+        """Return presence without exposing secret material in error details."""
+        return bool(value and value.strip())
+
+    @staticmethod
+    def _path_exists(value: str | None, child: str | None = None) -> bool:
+        """Return whether an env-backed path exists without raising."""
+        if not value:
+            return False
+        path = Path(value).expanduser()
+        if child:
+            path = path / child
+        return path.exists()
+
+    @classmethod
+    def _codex_auth_context(cls) -> dict[str, object]:
+        """Return non-secret Codex auth-plane diagnostics for nested CLI failures."""
+        codex_home = os.environ.get("CODEX_HOME")
+        home = os.environ.get("HOME")
+        auth_base = codex_home or (str(Path(home).expanduser() / ".codex") if home else None)
+        return {
+            "codex_home": codex_home or "",
+            "home": home or "",
+            "codex_auth_json_exists": cls._path_exists(auth_base, "auth.json"),
+            "codex_config_toml_exists": cls._path_exists(auth_base, "config.toml"),
+            "openai_api_key_present": cls._redact_env_presence(os.environ.get("OPENAI_API_KEY")),
+        }
+
+    @staticmethod
+    def _looks_like_codex_auth_failure(message: str) -> bool:
+        """Identify Codex/OpenAI auth failures that are otherwise opaque 401s.
+
+        Requires BOTH an auth-related phrase AND a Codex/OpenAI-specific
+        provider marker. Without the marker, generic 401s from nested tool
+        or MCP calls would be misclassified as Codex auth-plane failures
+        and routed to the wrong remediation (``CODEX_HOME/auth.json``).
+        """
+        normalized = message.lower()
+        has_auth_phrase = any(pattern in normalized for pattern in _CODEX_AUTH_FAILURE_PATTERNS)
+        if not has_auth_phrase:
+            return False
+        return any(marker in normalized for marker in _CODEX_PROVIDER_MARKERS)
+
+    @staticmethod
+    def _uses_openai_responses_endpoint(message: str) -> bool:
+        """Return whether the error mentions the OpenAI Responses API endpoint."""
+        return _OPENAI_RESPONSES_ENDPOINT in message.lower()
+
+    @staticmethod
+    def _looks_like_codex_model_unavailable(message: str) -> bool:
+        """Recognize clear model-availability failures without guessing an update.
+
+        Account access, model retirement, and an outdated CLI can share this
+        symptom.  Callers must not turn this classification into an update
+        instruction without more evidence.
+        """
+        normalized = message.lower()
+        return "model" in normalized and any(
+            phrase in normalized
+            for phrase in (
+                "model not found",
+                "model unavailable",
+                "model is unavailable",
+                "unsupported model",
+                "unknown model",
+                "does not have access to model",
+            )
+        )
+
+    @staticmethod
+    def _codex_version(path: str) -> str | None:
+        """Return a CLI version without making model failures depend on diagnostics."""
+        try:
+            result = subprocess.run(
+                [path, "--version"], capture_output=True, text=True, timeout=2, check=False
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        version = (result.stdout or result.stderr).strip().splitlines()
+        return version[-1].strip() if result.returncode == 0 and version else None
+
+    @classmethod
+    def _codex_failure_details(
+        cls,
+        *,
+        returncode: int | None,
+        session_id: str | None,
+        stderr: str,
+        stdout_errors: list[str],
+        message: str,
+        cli_path: str | None = None,
+    ) -> dict[str, object]:
+        """Build structured, non-secret details for a failed Codex CLI call."""
+        details: dict[str, object] = {
+            "returncode": returncode,
+            "session_id": session_id,
+            "stderr": stderr,
+            "stdout_errors": stdout_errors,
+        }
+        if (http_status := codex_last_http_status(message)) is not None:
+            details["http_status"] = http_status
+        auth_failure = cls._looks_like_codex_auth_failure(message)
+        openai_responses = cls._uses_openai_responses_endpoint(message)
+        if auth_failure:
+            details.update(
+                {
+                    "failure_category": "codex_auth",
+                    "auth_plane": "codex_cli",
+                    "openai_responses_endpoint_seen": openai_responses,
+                    "codex_auth_context": cls._codex_auth_context(),
+                    "remediation": (
+                        "Verify that the nested Codex process inherits CODEX_HOME/HOME and "
+                        "that CODEX_HOME/auth.json contains the intended Codex OAuth login. "
+                        "If llm.backend is codex, this should not require OPENAI_API_KEY unless "
+                        "the selected Codex profile intentionally uses an OpenAI API-key provider."
+                    ),
+                }
+            )
+        elif cls._looks_like_codex_model_unavailable(message):
+            details.update(
+                {
+                    "failure_category": "codex_model_unavailable",
+                    "model_guidance": (
+                        "The requested model is not available in this Codex environment. "
+                        "Check the Codex App and CLI versions, then verify account access "
+                        "before changing the pinned model."
+                    ),
+                }
+            )
+            if cli_path:
+                cli_version = cls._codex_version(cli_path)
+                app_path = "/Applications/ChatGPT.app/Contents/Resources/codex"
+                app_version = cls._codex_version(app_path)
+                if cli_version and app_version:
+                    details["codex_app_version"] = app_version
+                    details["codex_cli_version"] = cli_version
+                    details["codex_app_cli_versions_match"] = app_version == cli_version
+                    if app_version != cli_version:
+                        details["model_guidance"] = (
+                            "The Codex App and the CLI used for this task report different "
+                            "versions. Update both Codex installations, then reopen Codex before "
+                            "retrying the pinned model."
+                        )
+        return details
+
     def _fallback_content(self, stdout_lines: list[str], stderr: str) -> str:
         """Build a fallback response from JSON events or stderr."""
         for line in reversed(stdout_lines):
@@ -537,11 +872,18 @@ class CodexCliLLMAdapter:
         return tool_name
 
     def _emit_callback_for_event(self, event: dict[str, Any]) -> None:
-        """Emit best-effort debug callbacks from Codex JSON events."""
+        """Emit best-effort debug callbacks from Codex JSON events.
+
+        External chat hosts such as Hermes/Discord need to distinguish tool
+        start from tool completion when they render nested Codex progress.
+        Keep the historical ``tool`` callback for completed items and add a
+        non-breaking ``tool_started`` callback for started tool events.
+        """
         if self._on_message is None:
             return
 
-        if event.get("type") != "item.completed":
+        event_type = event.get("type")
+        if event_type not in {"item.started", "item.completed"}:
             return
 
         item = event.get("item")
@@ -553,6 +895,8 @@ class CodexCliLLMAdapter:
             return
 
         if item_type in {"agent_message", "reasoning", "todo_list"}:
+            if event_type == "item.started":
+                return
             content = self._extract_text(item)
             if content:
                 self._on_message("thinking", content)
@@ -561,47 +905,41 @@ class CodexCliLLMAdapter:
         if item_type == "command_execution":
             command = self._extract_text({"command": item.get("command")}) or ""
             tool_info = self._format_tool_info("Bash", {"command": command})
-            self._on_message("tool", tool_info)
+            self._on_message("tool_started" if event_type == "item.started" else "tool", tool_info)
             return
 
         if item_type == "mcp_tool_call":
             tool_name = item.get("name") if isinstance(item.get("name"), str) else "mcp_tool"
             tool_info = self._format_tool_info(tool_name, self._extract_tool_input(item))
-            self._on_message("tool", tool_info)
+            self._on_message("tool_started" if event_type == "item.started" else "tool", tool_info)
             return
 
         if item_type == "file_change":
             tool_info = self._format_tool_info("Edit", {"file_path": self._extract_path(item)})
-            self._on_message("tool", tool_info)
+            self._on_message("tool_started" if event_type == "item.started" else "tool", tool_info)
             return
 
         if item_type == "web_search":
-            tool_info = self._format_tool_info("WebSearch", {"query": self._extract_text(item)})
-            self._on_message("tool", tool_info)
+            query = (
+                item.get("query")
+                if isinstance(item.get("query"), str)
+                else self._extract_text(item)
+            )
+            tool_info = self._format_tool_info("WebSearch", {"query": query})
+            self._on_message("tool_started" if event_type == "item.started" else "tool", tool_info)
 
-    async def _iter_stream_lines(
-        self,
-        stream: asyncio.StreamReader | None,
-        *,
-        chunk_size: int = 16384,
-    ) -> AsyncIterator[str]:
-        """Yield decoded lines without relying on StreamReader.readline()."""
-        async for line in iter_stream_lines(stream, chunk_size=chunk_size):
-            yield line
+    def _prompt_stdin_bytes(self, prompt: str) -> bytes | None:
+        """Return bytes to write to process stdin for the prompt, if any."""
+        return prompt.encode("utf-8")
 
-    async def _collect_stream_lines(
-        self,
-        stream: asyncio.StreamReader | None,
-    ) -> list[str]:
-        """Drain a subprocess stream without blocking stdout event parsing."""
-        return await collect_stream_lines(stream)
+    def _update_last_content(self, last_content: str, event_content: str) -> str:
+        """Return the fallback completion content after a streamed event.
 
-    async def _terminate_process(self, process: Any) -> None:
-        """Best-effort subprocess shutdown used for timeouts and cancellation."""
-        await terminate_process(
-            process,
-            shutdown_timeout=self._process_shutdown_timeout_seconds,
-        )
+        Codex-style events normally contain complete assistant messages, so the
+        latest content remains the fallback.  Delta-oriented adapters can
+        override this hook to accumulate chunks.
+        """
+        return event_content if event_content else last_content
 
     def _read_output_message(self, output_path: Path) -> str:
         """Read the output-last-message file if the backend wrote one."""
@@ -613,31 +951,20 @@ class CodexCliLLMAdapter:
     @staticmethod
     def _truncate_if_oversized(content: str, model: str) -> str:
         """Validate and truncate oversized LLM responses."""
-        is_valid, _ = InputValidator.validate_llm_response(content)
-        if not is_valid:
-            log.warning(
-                "llm.response.truncated",
-                model=model,
-                original_length=len(content),
-                max_length=MAX_LLM_RESPONSE_LENGTH,
-            )
-            return content[:MAX_LLM_RESPONSE_LENGTH]
-        return content
+        return truncate_llm_response_if_oversized(content, model=model)
 
     def _is_retryable_error(self, message: str) -> bool:
         """Check whether an error looks transient."""
-        lowered = message.lower()
-        return any(pattern in lowered for pattern in _RETRYABLE_ERROR_PATTERNS)
+        return is_transient_error(message)
 
     async def _collect_legacy_process_output(
         self,
         process: Any,
+        *,
+        deadline: float,
     ) -> tuple[list[str], list[str], str | None, str]:
         """Fallback for tests or wrappers that only expose communicate()."""
-        if self._timeout is not None:
-            async with asyncio.timeout(self._timeout):
-                stdout_bytes, stderr_bytes = await process.communicate()
-        else:
+        async with asyncio.timeout_at(deadline):
             stdout_bytes, stderr_bytes = await process.communicate()
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         stderr = stderr_bytes.decode("utf-8", errors="replace")
@@ -652,8 +979,7 @@ class CodexCliLLMAdapter:
                 continue
             self._emit_callback_for_event(event)
             event_content = self._extract_text(event.get("item") or event)
-            if event_content:
-                last_content = event_content
+            last_content = self._update_last_content(last_content, event_content)
 
         return stdout_lines, stderr_lines, session_id, last_content
 
@@ -679,8 +1005,19 @@ class CodexCliLLMAdapter:
         config: CompletionConfig,
     ) -> Result[CompletionResponse, ProviderError]:
         """Execute a single Codex CLI completion request."""
-        prompt = self._build_prompt(messages)
-        normalized_model = self._normalize_model(config.model)
+        profile_result = resolve_completion_profile_result(
+            config, backend=self._completion_profile_backend
+        )
+        if profile_result.is_err:
+            return Result.err(profile_result.error)
+        resolved = profile_result.value
+        effective_config = resolved.config
+        prompt = self._build_prompt(messages, max_turns=effective_config.max_turns)
+        normalized_model = (
+            None
+            if resolved.backend_profile and not self._codex_profile
+            else self._normalize_model(effective_config.model)
+        )
         output_fd, output_path_str = tempfile.mkstemp(prefix=self._tempfile_prefix, suffix=".txt")
         os.close(output_fd)
         output_path = Path(output_path_str)
@@ -696,13 +1033,34 @@ class CodexCliLLMAdapter:
             schema_path = Path(schema_path_str)
             schema_path.write_text(json.dumps(schema), encoding="utf-8")
 
-        command = self._build_command(
-            output_last_message_path=str(output_path),
-            output_schema_path=str(schema_path) if schema_path else None,
-            model=normalized_model,
-        )
+        # Goose and Pi reuse this completion flow but expose no Codex-style
+        # per-invocation effort flag. Pass it only to Codex's command builder;
+        # their narrower overrides intentionally do not accept this argument.
+        try:
+            if self._completion_profile_backend == "codex":
+                command = self._build_command(
+                    output_last_message_path=str(output_path),
+                    output_schema_path=str(schema_path) if schema_path else None,
+                    model=normalized_model,
+                    profile=resolved.backend_profile,
+                    reasoning_effort=effective_config.reasoning_effort,
+                    prompt=prompt,
+                )
+            else:
+                command = self._build_command(
+                    output_last_message_path=str(output_path),
+                    output_schema_path=str(schema_path) if schema_path else None,
+                    model=normalized_model,
+                    profile=resolved.backend_profile,
+                    prompt=prompt,
+                )
+        except ProviderError as exc:
+            output_path.unlink(missing_ok=True)
+            if schema_path:
+                schema_path.unlink(missing_ok=True)
+            return Result.err(exc)
 
-        prompt_bytes = prompt.encode("utf-8")
+        prompt_stdin_bytes = self._prompt_stdin_bytes(prompt)
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -711,7 +1069,11 @@ class CodexCliLLMAdapter:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=self._build_child_env(),
+                env=(
+                    self._build_env_for_instance()
+                    if hasattr(self, "_build_env_for_instance")
+                    else self._build_child_env()
+                ),
             )
         except FileNotFoundError as exc:
             output_path.unlink(missing_ok=True)
@@ -736,19 +1098,74 @@ class CodexCliLLMAdapter:
                 )
             )
 
-        # Feed prompt via stdin to avoid ARG_MAX limits
-        if process.stdin is not None:
-            process.stdin.write(prompt_bytes)
-            await process.stdin.drain()
-            process.stdin.close()
+        timeout_seconds = self._effective_timeout_seconds()
+        completion_deadline = asyncio.get_running_loop().time() + timeout_seconds
+
+        # Prompt delivery is part of the completion lifecycle: a child that
+        # stops reading stdin must not escape the same deadline as its output.
+        try:
+            async with asyncio.timeout_at(completion_deadline):
+                if process.stdin is not None and prompt_stdin_bytes is not None:
+                    process.stdin.write(prompt_stdin_bytes)
+                    await process.stdin.drain()
+                    process.stdin.close()
+                elif process.stdin is not None:
+                    process.stdin.close()
+        except TimeoutError:
+            await self._terminate_process(process)
+            output_path.unlink(missing_ok=True)
+            if schema_path:
+                schema_path.unlink(missing_ok=True)
+            return Result.err(
+                ProviderError(
+                    message=f"{self._display_name} request timed out after {timeout_seconds:.1f}s",
+                    provider=self._provider_name,
+                    details={
+                        "timed_out": True,
+                        "timeout_seconds": timeout_seconds,
+                        "timeout_was_default": self._timeout_is_default_ceiling(),
+                        "returncode": getattr(process, "returncode", None),
+                    },
+                )
+            )
+        except asyncio.CancelledError:
+            await self._terminate_process(process)
+            output_path.unlink(missing_ok=True)
+            if schema_path:
+                schema_path.unlink(missing_ok=True)
+            raise
 
         if not hasattr(process, "stdout") or not callable(getattr(process, "wait", None)):
-            (
-                stdout_lines,
-                stderr_lines,
-                session_id,
-                last_content,
-            ) = await self._collect_legacy_process_output(process)
+            try:
+                (
+                    stdout_lines,
+                    stderr_lines,
+                    session_id,
+                    last_content,
+                ) = await self._collect_legacy_process_output(
+                    process,
+                    deadline=completion_deadline,
+                )
+            except TimeoutError:
+                await self._terminate_process(process)
+                output_path.unlink(missing_ok=True)
+                if schema_path:
+                    schema_path.unlink(missing_ok=True)
+                return Result.err(
+                    ProviderError(
+                        message=(
+                            f"{self._display_name} legacy request timed out"
+                            f" after {timeout_seconds:.1f}s"
+                        ),
+                        provider=self._provider_name,
+                        details={
+                            "timed_out": True,
+                            "timeout_seconds": timeout_seconds,
+                            "timeout_was_default": self._timeout_is_default_ceiling(),
+                            "returncode": getattr(process, "returncode", None),
+                        },
+                    )
+                )
             content = self._read_output_message(output_path)
             output_path.unlink(missing_ok=True)
             if schema_path:
@@ -768,12 +1185,16 @@ class CodexCliLLMAdapter:
                         or content
                         or f"{self._display_name} exited with code {process.returncode}",
                         provider=self._provider_name,
-                        details={
-                            "returncode": process.returncode,
-                            "session_id": session_id,
-                            "stderr": "\n".join(stderr_lines).strip(),
-                            "stdout_errors": stdout_errors,
-                        },
+                        details=self._codex_failure_details(
+                            returncode=process.returncode,
+                            session_id=session_id,
+                            stderr="\n".join(stderr_lines).strip(),
+                            stdout_errors=stdout_errors,
+                            message=(stdout_errors[-1] if stdout_errors else None)
+                            or content
+                            or f"{self._display_name} exited with code {process.returncode}",
+                            cli_path=self._cli_path,
+                        ),
                     )
                 )
 
@@ -793,7 +1214,7 @@ class CodexCliLLMAdapter:
                 CompletionResponse(
                     content=content,
                     model=normalized_model or "default",
-                    usage=UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+                    usage=native_cli_usage(stdout_lines, provider=self._provider_name),
                     finish_reason="stop",
                     raw_response={
                         "session_id": session_id,
@@ -826,19 +1247,15 @@ class CodexCliLLMAdapter:
 
                 self._emit_callback_for_event(event)
                 event_content = self._extract_text(event.get("item") or event)
-                if event_content:
-                    last_content = event_content
+                last_content = self._update_last_content(last_content, event_content)
 
         stdout_task = asyncio.create_task(_read_stdout())
 
         try:
-            if self._timeout is None:
+            async with asyncio.timeout_at(completion_deadline):
                 await process.wait()
-            else:
-                async with asyncio.timeout(self._timeout):
-                    await process.wait()
-            await stdout_task
-            stderr_lines = await stderr_task
+                await stdout_task
+                stderr_lines = await stderr_task
         except ProviderError as exc:
             await self._terminate_process(process)
             if not stdout_task.done():
@@ -891,11 +1308,12 @@ class CodexCliLLMAdapter:
 
             return Result.err(
                 ProviderError(
-                    message=f"{self._display_name} request timed out after {self._timeout:.1f}s",
+                    message=f"{self._display_name} request timed out after {timeout_seconds:.1f}s",
                     provider=self._provider_name,
                     details={
                         "timed_out": True,
-                        "timeout_seconds": self._timeout,
+                        "timeout_seconds": timeout_seconds,
+                        "timeout_was_default": self._timeout_is_default_ceiling(),
                         "session_id": session_id,
                         "partial_content": content,
                         "returncode": getattr(process, "returncode", None),
@@ -932,12 +1350,16 @@ class CodexCliLLMAdapter:
                     or content
                     or f"{self._display_name} exited with code {process.returncode}",
                     provider=self._provider_name,
-                    details={
-                        "returncode": process.returncode,
-                        "session_id": session_id,
-                        "stderr": "\n".join(stderr_lines).strip(),
-                        "stdout_errors": stdout_errors,
-                    },
+                    details=self._codex_failure_details(
+                        returncode=process.returncode,
+                        session_id=session_id,
+                        stderr="\n".join(stderr_lines).strip(),
+                        stdout_errors=stdout_errors,
+                        message=(stdout_errors[-1] if stdout_errors else None)
+                        or content
+                        or f"{self._display_name} exited with code {process.returncode}",
+                        cli_path=self._cli_path,
+                    ),
                 )
             )
 
@@ -957,7 +1379,7 @@ class CodexCliLLMAdapter:
             CompletionResponse(
                 content=content,
                 model=normalized_model or "default",
-                usage=UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+                usage=native_cli_usage(stdout_lines, provider=self._provider_name),
                 finish_reason="stop",
                 raw_response={
                     "session_id": session_id,

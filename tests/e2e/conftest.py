@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
+import subprocess
 import tempfile
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -267,6 +268,9 @@ class MockClaudeAgentAdapter:
     message_sequences: list[list[AgentMessage]] = field(default_factory=list)
     _execution_count: int = field(default=0, init=False)
     _execution_history: list[dict[str, Any]] = field(default_factory=list, init=False)
+    _cwd: str | None = field(default=None, init=False)
+    _workspace: tempfile.TemporaryDirectory[str] | None = field(default=None, init=False)
+    _edit_count: int = field(default=0, init=False)
 
     @property
     def runtime_backend(self) -> str:
@@ -278,11 +282,45 @@ class MockClaudeAgentAdapter:
 
     @property
     def working_directory(self) -> str | None:
-        return None
+        # Executing adapters must identify the workspace they mutate.  The
+        # production adapters do so; keep the E2E double on the same contract.
+        # The default is a throwaway Git workspace, never the checkout the
+        # tests run from: the double writes the edits its messages claim.
+        return self._cwd or self._default_workspace()
+
+    def _default_workspace(self) -> str:
+        if self._workspace is None:
+            self._workspace = tempfile.TemporaryDirectory(prefix="ooo-e2e-workspace-")
+            root = self._workspace.name
+            Path(root, "README.md").write_text("e2e workspace\n", encoding="utf-8")
+            for args in (
+                ("init", "-q"),
+                ("add", "README.md"),
+                (
+                    "-c",
+                    "user.name=e2e",
+                    "-c",
+                    "user.email=e2e@example.com",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "base",
+                ),
+            ):
+                subprocess.run(("git", "-C", root, *args), check=True, capture_output=True)
+        return self._workspace.name
 
     @property
     def permission_mode(self) -> str | None:
         return "default"
+
+    @property
+    def self_governs_rate_limit(self) -> bool:
+        # The real Claude adapter self-governs its RPM/TPM bucket, so the executor
+        # must not add a dispatch-level rate gate (mirrors adapter.py's
+        # self_governs_rate_limit = True). Without it, failure-path retries wait
+        # out 30s rate-limit backoffs.
+        return True
 
     def add_execution_sequence(self, messages: list[AgentMessage]) -> MockClaudeAgentAdapter:
         """Add a sequence of messages for a single execution."""
@@ -368,6 +406,14 @@ class MockClaudeAgentAdapter:
         self._execution_count += 1
 
         for message in sequence:
+            if message.type == "tool" and message.tool_name in {"Edit", "Write"}:
+                # A worker that reports an edit leaves one in its workspace, as
+                # a real worker does; the no-evidence route reads the diff.
+                self._edit_count += 1
+                workspace = Path(cwd or self.working_directory or ".")
+                (workspace / f"mock_edit_{self._edit_count}.txt").write_text(
+                    f"{message.content}\n", encoding="utf-8"
+                )
             yield message
 
     @property
@@ -505,15 +551,31 @@ def mock_execution_id() -> str:
 
 @pytest.fixture
 async def persisted_session(
-    event_store: Any, mock_session_id: str, mock_execution_id: str, sample_seed: Seed
+    event_store: Any,
+    mock_claude_agent_adapter: MockClaudeAgentAdapter,
+    mock_session_id: str,
+    mock_execution_id: str,
+    sample_seed: Seed,
+    temp_dir: Path,
 ) -> dict[str, Any]:
-    """Create a persisted session in the event store for resumption testing."""
+    """Create a paused session that retains its creating-process capability."""
+    from ouroboros.orchestrator.runner import OrchestratorRunner
     from ouroboros.orchestrator.session import SessionRepository
 
+    # Resume validation requires a concrete constructor-level model pin. The
+    # real CLI adapters expose ``_model``; this minimal E2E adapter does not.
+    mock_claude_agent_adapter._model = "test-model"
+    mock_claude_agent_adapter._cwd = str(temp_dir)
+    runner = OrchestratorRunner(
+        adapter=mock_claude_agent_adapter,
+        event_store=event_store,
+        console=MagicMock(),
+        task_cwd=str(temp_dir),
+    )
     repo = SessionRepository(event_store)
-    result = await repo.create_session(
+    result = await runner.prepare_session(
+        sample_seed,
         execution_id=mock_execution_id,
-        seed_id=sample_seed.metadata.seed_id,
         session_id=mock_session_id,
     )
 
@@ -525,10 +587,14 @@ async def persisted_session(
     # Track some progress
     await repo.track_progress(mock_session_id, {"step": 1, "message": "Started"})
     await repo.track_progress(mock_session_id, {"step": 2, "message": "In progress"})
+    pause_result = await repo.mark_paused(mock_session_id, reason="Test interruption")
+    if pause_result.is_err:
+        raise RuntimeError(f"Failed to pause test session: {pause_result.error}")
 
     return {
         "session_id": mock_session_id,
         "execution_id": mock_execution_id,
         "seed_id": sample_seed.metadata.seed_id,
         "tracker": tracker,
+        "runner": runner,
     }

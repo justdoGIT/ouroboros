@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
+import sys
 from unittest.mock import patch
+
+import pytest
 
 from ouroboros.core.git_workflow import (
     GitWorkflowConfig,
@@ -146,7 +151,7 @@ class TestIsOnProtectedBranch:
         assert result is True
 
     def test_on_feature_branch(self, tmp_path: Path) -> None:
-        """Returns False when on a feature branch."""
+        """Returns False only when git confirms a concrete non-protected branch."""
         config = GitWorkflowConfig(use_branches=True, protected_branches=("main", "master"))
 
         with patch("subprocess.run") as mock_run:
@@ -158,10 +163,112 @@ class TestIsOnProtectedBranch:
         assert result is False
 
     def test_git_not_available(self, tmp_path: Path) -> None:
-        """Returns False when git is not available."""
+        """Fails closed (True) when git is not installed."""
         config = GitWorkflowConfig(use_branches=True)
 
         with patch("subprocess.run", side_effect=FileNotFoundError):
             result = is_on_protected_branch(tmp_path, config)
 
-        assert result is False
+        assert result is True
+
+    def test_git_timeout(self, tmp_path: Path) -> None:
+        """Fails closed (True) when the git call times out."""
+        config = GitWorkflowConfig(use_branches=True)
+
+        with patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="git", timeout=5),
+        ):
+            result = is_on_protected_branch(tmp_path, config)
+
+        assert result is True
+
+    def test_os_error(self, tmp_path: Path) -> None:
+        """Fails closed (True) on OS-level failures reaching project_root."""
+        config = GitWorkflowConfig(use_branches=True)
+
+        with patch("subprocess.run", side_effect=OSError("cwd is gone")):
+            result = is_on_protected_branch(tmp_path, config)
+
+        assert result is True
+
+    def test_not_a_git_repository(self, tmp_path: Path) -> None:
+        """Fails closed (True) when git exits non-zero, e.g. not a repo."""
+        config = GitWorkflowConfig(use_branches=True, protected_branches=("main", "master"))
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 128
+            mock_run.return_value.stdout = ""
+            mock_run.return_value.stderr = "fatal: not a git repository"
+
+            result = is_on_protected_branch(tmp_path, config)
+
+        assert result is True
+
+    def test_detached_head(self, tmp_path: Path) -> None:
+        """Fails closed (True) on detached HEAD.
+
+        ``git rev-parse --abbrev-ref HEAD`` exits 0 and prints the literal
+        "HEAD" when detached, so this would otherwise be read as a normal
+        non-protected branch name.
+        """
+        config = GitWorkflowConfig(use_branches=True, protected_branches=("main", "master"))
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = "HEAD\n"
+
+            result = is_on_protected_branch(tmp_path, config)
+
+        assert result is True
+
+    def test_empty_branch_output(self, tmp_path: Path) -> None:
+        """Fails closed (True) when git reports success but no branch name."""
+        config = GitWorkflowConfig(use_branches=True, protected_branches=("main", "master"))
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = "  \n"
+
+            result = is_on_protected_branch(tmp_path, config)
+
+        assert result is True
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows cannot create this branch name")
+def test_non_utf8_branch_name_does_not_abort_the_check(tmp_path: Path) -> None:
+    """A branch name Git prints as raw bytes must not raise UnicodeDecodeError.
+
+    The guard documents that it fails closed, but decoding Git's raw output
+    with the process code page raised first, so the caller crashed instead of
+    declining the commit.
+    """
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", "."], cwd=tmp_path, check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", os.fsdecode(b"feat-\xff")],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    config = GitWorkflowConfig(use_branches=True, protected_branches=("main", "master"))
+
+    assert is_on_protected_branch(tmp_path, config) is False

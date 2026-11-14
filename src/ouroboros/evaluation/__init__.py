@@ -31,8 +31,9 @@ Classes:
     PipelineConfig: Pipeline configuration
 """
 
+from typing import TYPE_CHECKING
+
 from ouroboros.evaluation.consensus import (
-    DEFAULT_CONSENSUS_MODELS,
     ConsensusConfig,
     ConsensusEvaluator,
     DeliberativeConfig,
@@ -56,6 +57,7 @@ from ouroboros.evaluation.mechanical import (
     run_mechanical_verification,
 )
 from ouroboros.evaluation.models import (
+    AcceptanceState,
     CheckResult,
     CheckType,
     ConsensusResult,
@@ -64,6 +66,7 @@ from ouroboros.evaluation.models import (
     EvaluationResult,
     FinalVerdict,
     JudgmentResult,
+    MechanicalDisposition,
     MechanicalResult,
     SemanticResult,
     Vote,
@@ -75,7 +78,6 @@ from ouroboros.evaluation.pipeline import (
     run_evaluation_pipeline,
 )
 from ouroboros.evaluation.semantic import (
-    DEFAULT_SEMANTIC_MODEL,
     SemanticConfig,
     SemanticEvaluator,
     run_semantic_evaluation,
@@ -89,8 +91,12 @@ from ouroboros.evaluation.trigger import (
     check_consensus_trigger,
 )
 
+if TYPE_CHECKING:
+    from ouroboros.evaluation.semantic import DEFAULT_SEMANTIC_MODEL
+
 __all__ = [
     # Models
+    "AcceptanceState",
     "CheckResult",
     "CheckType",
     "ConsensusResult",
@@ -99,6 +105,7 @@ __all__ = [
     "EvaluationResult",
     "FinalVerdict",
     "JudgmentResult",
+    "MechanicalDisposition",
     "MechanicalResult",
     "SemanticResult",
     "Vote",
@@ -119,7 +126,6 @@ __all__ = [
     "SemanticEvaluator",
     "run_semantic_evaluation",
     # Stage 3 - Simple Consensus
-    "DEFAULT_CONSENSUS_MODELS",
     "ConsensusConfig",
     "ConsensusEvaluator",
     "run_consensus_evaluation",
@@ -139,3 +145,18 @@ __all__ = [
     "PipelineConfig",
     "run_evaluation_pipeline",
 ]
+
+
+if not TYPE_CHECKING:  # hidden from type checkers so unknown names stay errors
+
+    def __getattr__(name: str) -> str:
+        # Forwarded so importing the package does not resolve the default model;
+        # ``semantic`` resolves it on first access and keeps that value.
+        if name == "DEFAULT_SEMANTIC_MODEL":
+            from ouroboros.evaluation import semantic
+
+            return semantic.DEFAULT_SEMANTIC_MODEL
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    def __dir__() -> list[str]:
+        return sorted({*globals(), "DEFAULT_SEMANTIC_MODEL"})

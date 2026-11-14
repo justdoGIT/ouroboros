@@ -5,26 +5,39 @@ Supports both standard workflow execution and agent-runtime orchestrator mode.
 """
 
 import asyncio
-from enum import Enum
+from collections.abc import Mapping
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 from uuid import uuid4
 
 import click
+from pydantic import ValidationError
 import typer
 import yaml
 
 if TYPE_CHECKING:
     from ouroboros.core.seed import Seed
+    from ouroboros.core.types import Result
     from ouroboros.mcp.client.manager import MCPClientManager
+    from ouroboros.orchestrator.session import SessionRepository
+    from ouroboros.persistence.event_store import EventStore
 
+from ouroboros import telemetry as usage_telemetry
 from ouroboros.cli.formatters import console
 from ouroboros.cli.formatters.panels import print_error, print_info, print_success, print_warning
-from ouroboros.config.loader import get_max_parallel_workers
+from ouroboros.cli.logging_setup import configure_cli_logging
+from ouroboros.cli.model_options import ModelOption, PinModelsOption, model_options
+from ouroboros.config.loader import (
+    get_config_dir,
+    get_max_parallel_workers,
+    load_config,
+    resolve_execution_model,
+)
 from ouroboros.core.errors import ConfigError
-from ouroboros.core.project_paths import resolve_seed_project_path
+from ouroboros.core.project_paths import resolve_path_against_base, resolve_seed_project_path
 from ouroboros.core.security import InputValidator
+from ouroboros.core.seed import ac_texts
 from ouroboros.core.worktree import (
     TaskWorkspace,
     WorktreeError,
@@ -32,7 +45,82 @@ from ouroboros.core.worktree import (
     maybe_restore_task_workspace,
 )
 from ouroboros.evaluation.verification_artifacts import build_verification_artifacts
-from ouroboros.orchestrator.parallel_executor import DEFAULT_MAX_DECOMPOSITION_DEPTH
+from ouroboros.orchestrator.decomposition_limits import (
+    DEFAULT_MAX_DECOMPOSITION_DEPTH,
+    MAX_DURABLE_DECOMPOSITION_DEPTH,
+    validate_max_decomposition_depth,
+)
+from ouroboros.package_profiles import (
+    PublicAgentRuntimeBackend as AgentRuntimeBackend,
+)
+from ouroboros.package_profiles import (
+    public_runtime_backend,
+)
+
+
+def _execution_model_status(runtime_backend: str | None, model: str | None) -> str:
+    """Return a truthful pre-run model summary for the CLI.
+
+    An absent Codex model means no ``--model`` flag is sent, so Codex owns the
+    choice. A config.toml value is diagnostic context, not proof of the model
+    selected by the current App/CLI session.
+    """
+    if model is not None:
+        return f"Execution model: {model} (fixed)"
+    if runtime_backend == "codex":
+        from ouroboros.backends.model_catalog import configured_default_model
+
+        hint = configured_default_model("codex")
+        if hint:
+            return (
+                "Execution model: follows Codex's currently selected model "
+                f"(config.toml: {hint}; not confirmed at runtime)"
+            )
+        return (
+            "Execution model: follows Codex's currently selected model "
+            "(concrete model not reported by Codex)"
+        )
+    return "Execution model: runtime default"
+
+
+def _resolve_run_execute_runtime_backend(
+    runtime_backend: str | None,
+    *,
+    resolve_backend,
+) -> str:
+    """Resolve the agent runtime backend used by ``ooo run`` execution.
+
+    ``--runtime`` remains an explicit whole-run override. Without it, the CLI
+    honors ``orchestrator.runtime_profile.stages.execute`` with the same
+    precedence as auto/MCP: execute stage mapping, profile default, then
+    ``orchestrator.runtime_backend``.
+    """
+
+    resolved_default = resolve_backend(runtime_backend)
+    if runtime_backend is not None:
+        return resolved_default
+
+    from ouroboros.orchestrator_stage import Stage, parse_stage, resolve_runtime_for_stage
+
+    try:
+        profile = load_config().orchestrator.runtime_profile
+    except ConfigError:
+        if (get_config_dir() / "config.yaml").exists():
+            raise
+        profile = None
+
+    if profile is None:
+        return resolved_default
+
+    profile_stages = {parse_stage(key): value for key, value in profile.stages.items()}
+    return resolve_backend(
+        resolve_runtime_for_stage(
+            Stage.EXECUTE,
+            stages=profile_stages,
+            default=profile.default,
+            fallback=resolved_default,
+        )
+    )
 
 
 class _DefaultWorkflowGroup(typer.core.TyperGroup):
@@ -58,18 +146,9 @@ app = typer.Typer(
 )
 
 
-class AgentRuntimeBackend(str, Enum):  # noqa: UP042
-    """Supported orchestrator runtime backends for CLI selection."""
-
-    CLAUDE = "claude"
-    CODEX = "codex"
-    OPENCODE = "opencode"
-    HERMES = "hermes"
-
-
 def _derive_quality_bar(seed: "Seed") -> str:
     """Derive a quality bar string from seed acceptance criteria."""
-    ac_lines = [f"- {ac}" for ac in seed.acceptance_criteria]
+    ac_lines = [f"- {ac}" for ac in ac_texts(seed.acceptance_criteria)]
     return "The execution must satisfy all acceptance criteria:\n" + "\n".join(ac_lines)
 
 
@@ -101,7 +180,7 @@ def _load_seed_from_yaml(seed_file: Path) -> dict[str, Any]:
         raise typer.Exit(1)
 
     try:
-        with open(seed_file) as f:
+        with open(seed_file, encoding="utf-8") as f:
             data: dict[str, Any] = yaml.safe_load(f)
             return data
     except Exception as e:
@@ -109,10 +188,171 @@ def _load_seed_from_yaml(seed_file: Path) -> dict[str, Any]:
         raise typer.Exit(1) from e
 
 
-def _resolve_cli_project_dir(seed: "Seed", seed_file: Path) -> Path:
-    """Resolve the project directory for CLI execution and verification."""
-    stable_base = seed_file.parent.resolve()
-    return resolve_seed_project_path(seed, stable_base=stable_base) or stable_base
+def _resolve_raw_metadata_project_dir(
+    seed_data: dict[str, Any],
+    *,
+    stable_base: Path,
+) -> Path | None:
+    """Resolve legacy raw metadata project_dir/working_directory fields."""
+    metadata = seed_data.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+
+    raw_project_dir = metadata.get("project_dir") or metadata.get("working_directory")
+    if not isinstance(raw_project_dir, str) or not raw_project_dir.strip():
+        return None
+
+    resolved = resolve_path_against_base(
+        raw_project_dir,
+        stable_base=stable_base,
+        enforce_containment=True,
+    )
+    if resolved is None:
+        print_error(
+            "Seed metadata encodes a project_dir/working_directory path that escapes "
+            f"the seed stable project directory ({stable_base}). Refusing to fall back "
+            "silently — edit the seed metadata to use a path inside the seed directory "
+            "or rerun with --project-dir pointing at the target project."
+        )
+        raise typer.Exit(1)
+    return resolved
+
+
+def _resolve_brownfield_target_dir(seed_data: dict[str, Any]) -> Path | None:
+    """Return an existing brownfield target_dir from raw seed data, if present."""
+    brownfield_context = seed_data.get("brownfield_context")
+    if not isinstance(brownfield_context, dict):
+        return None
+
+    raw_target_dir = brownfield_context.get("target_dir")
+    if not isinstance(raw_target_dir, str) or not raw_target_dir.strip():
+        return None
+
+    target_dir = Path(raw_target_dir).expanduser().resolve()
+    return target_dir if target_dir.is_dir() else None
+
+
+def _directory_for_runtime(path: Path) -> Path:
+    """Normalize a resolved project candidate into a runtime cwd."""
+    return path.parent if path.is_file() else path
+
+
+def _detect_project_root_from_seed_path(seed_file: Path, *, max_levels: int = 6) -> Path | None:
+    """Recover the project root for a *central* seed.
+
+    Central seeds authored by the seed generator live at
+    ``<project_root>/.ouroboros/seeds/<...>/seed.yaml`` (any nesting depth
+    under ``.ouroboros/seeds/``). When such a seed is invoked from a fresh
+    worktree without ``--project-dir``, the seed's parent directory is
+    inside ``.ouroboros/seeds/`` — not the project root — so joining
+    seed-relative reference paths against it produces non-existent
+    locations. Walking up the ancestry until ``.ouroboros/seeds`` is
+    found recovers the intended project root.
+
+    Detection is intentionally scoped to the ``.ouroboros/seeds`` ancestry,
+    not to any ancestor that happens to contain a ``.ouroboros/`` directory.
+    Non-central seeds such as ``examples/dummy_seed.yaml`` continue to
+    resolve via the existing ``seed_file.parent`` fallback in the caller
+    even when they live inside a project tree whose root has
+    ``.ouroboros/``; otherwise local/example seeds would create or verify
+    files at the repository root rather than next to the seed.
+
+    Returns ``None`` when no ``.ouroboros/seeds`` ancestry is found within
+    ``max_levels`` parents, or when the matching ancestry is the global
+    ``~/.ouroboros/seeds`` store rather than a project-local seed store;
+    the caller falls back to ``seed_file.parent`` in that case.
+    """
+    current = seed_file.parent.resolve()
+    for _ in range(max_levels):
+        if current.name == "seeds" and current.parent.name == ".ouroboros":
+            candidate = current.parent.parent
+            # Do not treat the home directory as a project root.
+            # ~/.ouroboros/seeds/ is the global Ouroboros seed store and
+            # matches the central-seed pattern structurally, but ~ is not a
+            # project root. Returning it as one causes opencode to start with
+            # cwd=$HOME for every globally-stored seed (issue #1312).
+            if candidate.resolve() == Path.home().resolve():
+                return None
+            return candidate
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
+def _in_global_seed_store(seed_file: Path) -> bool:
+    """Whether ``seed_file`` lives in the global Seed store, ``~/.ouroboros/seeds``."""
+    store = (Path.home() / ".ouroboros" / "seeds").resolve()
+    return seed_file.resolve().is_relative_to(store)
+
+
+def _resolve_cli_project_dir(
+    seed: "Seed",
+    seed_file: Path,
+    *,
+    seed_data: dict[str, Any] | None = None,
+    project_dir: Path | None = None,
+    fallback_dir: Path | None = None,
+) -> Path:
+    """Resolve the project directory for CLI execution and verification.
+
+    ``fallback_dir`` replaces the Seed file's own folder as the base used when
+    the Seed does not say where it belongs. Callers that hold a better answer
+    than "wherever the file sits" pass it — `init` passes the directory the
+    interview was run from — so a Seed written to the global store cannot turn
+    that store into a workspace. Without one, a Seed in the global store uses
+    the current directory for the same reason. It stays a *fallback*: an explicit
+    ``project_dir``, Seed metadata, and a valid brownfield target all still win,
+    and every one of those decisions is made here, once.
+    """
+    if project_dir is not None:
+        return project_dir.expanduser().resolve()
+
+    seed_data = seed_data or {}
+    detected_root = _detect_project_root_from_seed_path(seed_file)
+    seed_base = (
+        detected_root
+        or (fallback_dir.expanduser().resolve() if fallback_dir is not None else None)
+        or seed_file.parent.resolve()
+    )
+    metadata_project_dir = _resolve_raw_metadata_project_dir(seed_data, stable_base=seed_base)
+    if metadata_project_dir is not None:
+        return _directory_for_runtime(metadata_project_dir)
+
+    target_dir = _resolve_brownfield_target_dir(seed_data)
+    # The global store holds Seeds for every project, so its folder says
+    # nothing about where this one belongs; the directory the command runs
+    # from does, as for `init` (`ouroboros run ~/.ouroboros/seeds/<id>.yaml`
+    # is the documented terminal flow).
+    global_seed = (
+        detected_root is None and fallback_dir is None and _in_global_seed_store(seed_file)
+    )
+    project_root = detected_root or (Path.cwd().resolve() if global_seed else None)
+    stable_base = target_dir or project_root or seed_base
+    resolution = resolve_seed_project_path(seed, stable_base=stable_base)
+    if resolution.rejected:
+        print_error(
+            "Seed encodes a project_dir/brownfield path that escapes the seed "
+            f"stable project directory ({stable_base}). Refusing to fall back silently — "
+            "edit the seed to use a path inside the project directory or rerun "
+            "with --project-dir pointing at the target project."
+        )
+        raise typer.Exit(1)
+    if project_root is not None and target_dir is None:
+        # Central seed: the detected root *is* the project root; so is the
+        # current directory for a Seed in the global store.
+        # context_references are documentation pointers — collapsing an
+        # existing-file reference (e.g. ``src/.../foo.py``) to its parent
+        # would push the runtime cwd into a subdirectory and break the
+        # downstream task workspace and verification cwd. The metadata
+        # branch above already handled any user-declared override, and
+        # the containment check above still surfaces escapes. Honor the
+        # detected root directly.
+        return project_root
+    if resolution.path is not None:
+        return _directory_for_runtime(resolution.path)
+    return stable_base
 
 
 def _coerce_non_negative_int(value: object, *, source: str) -> int:
@@ -150,23 +390,40 @@ def _coerce_positive_int(value: object, *, source: str) -> int:
 def _resolve_max_decomposition_depth(seed_data: dict[str, Any], cli_value: int | None) -> int:
     """Resolve decomposition depth from CLI, env, seed config, then default."""
     if cli_value is not None:
-        return _coerce_non_negative_int(cli_value, source="--max-decomposition-depth")
+        return _coerce_max_decomposition_depth(
+            cli_value,
+            source="--max-decomposition-depth",
+        )
 
     env_value = os.environ.get("OUROBOROS_MAX_DECOMPOSITION_DEPTH", "").strip()
     if env_value:
-        return _coerce_non_negative_int(
+        return _coerce_max_decomposition_depth(
             env_value,
             source="OUROBOROS_MAX_DECOMPOSITION_DEPTH",
         )
 
     orchestrator_config = seed_data.get("orchestrator")
     if isinstance(orchestrator_config, dict) and "max_decomposition_depth" in orchestrator_config:
-        return _coerce_non_negative_int(
+        return _coerce_max_decomposition_depth(
             orchestrator_config.get("max_decomposition_depth"),
             source="seed.orchestrator.max_decomposition_depth",
         )
 
-    return DEFAULT_MAX_DECOMPOSITION_DEPTH
+    return validate_max_decomposition_depth(
+        DEFAULT_MAX_DECOMPOSITION_DEPTH,
+        source="default max_decomposition_depth",
+    )
+
+
+def _coerce_max_decomposition_depth(value: object, *, source: str) -> int:
+    """Parse every public depth source through the shared live/replay gate."""
+
+    parsed = _coerce_non_negative_int(value, source=source)
+    try:
+        return validate_max_decomposition_depth(parsed, source=source)
+    except ValueError as exc:
+        print_error(str(exc))
+        raise typer.Exit(1) from exc
 
 
 def _load_skip_completed_markers(
@@ -225,6 +482,67 @@ def _load_skip_completed_markers(
         resolved[ac_number - 1] = metadata
 
     return resolved
+
+
+def _resolve_fat_harness_mode(seed_data: dict[str, Any]) -> bool:
+    """Resolve the fresh-run fat-harness selector.
+
+    Verify-by-default: ``ooo run`` enforces typed evidence plus a verifier PASS
+    at AC acceptance unless the seed explicitly opts out with
+    ``seed.orchestrator.execution_mode: legacy``. Missing/blank selectors and an
+    explicit ``fat_harness`` selector both enable the stricter path.
+    """
+    orchestrator_config = seed_data.get("orchestrator")
+    if not isinstance(orchestrator_config, dict):
+        return True
+
+    execution_mode = orchestrator_config.get("execution_mode")
+    if execution_mode in (None, "", "fat_harness"):
+        return True
+    if execution_mode == "legacy":
+        # Explicit opt-out of verify-by-default: fall back to the self-report
+        # runner. This is the supported escape hatch, not an error.
+        return False
+
+    print_error(
+        "seed.orchestrator.execution_mode must be 'fat_harness' or 'legacy' when set "
+        f"(got {execution_mode!r})."
+    )
+    raise typer.Exit(1)
+
+
+def _resolve_resume_fat_harness_mode(
+    seed_data: dict[str, Any],
+    progress: dict[str, Any],
+) -> bool:
+    """Resolve resume acceptance mode from persisted contract with safe migration.
+
+    New sessions persist ``fat_harness_mode`` at prepare time and that durable
+    value always wins. Sessions without a persisted contract resume with
+    verify-by-default enabled unless the seed explicitly opts out with
+    ``execution_mode: legacy``.
+    """
+    persisted = progress.get("fat_harness_mode")
+    if isinstance(persisted, bool):
+        return persisted
+
+    orchestrator_config = seed_data.get("orchestrator")
+    return not (
+        isinstance(orchestrator_config, dict)
+        and orchestrator_config.get("execution_mode") == "legacy"
+    )
+
+
+def _resolve_resume_checkpoint_store_enabled(progress: Mapping[str, Any]) -> bool:
+    """Carry a persisted checkpoint mode into runner assembly on resume.
+
+    Only an actual boolean can select the old no-store mode. The runner still
+    validates the full durable contract and its proof before resuming.
+    """
+    contract = progress.get("execution_contract")
+    semantics = contract.get("execution_semantics") if isinstance(contract, Mapping) else None
+    mode = semantics.get("checkpoint_store_enabled") if isinstance(semantics, Mapping) else None
+    return mode if type(mode) is bool else True
 
 
 def _resolve_max_parallel_workers() -> int:
@@ -304,6 +622,115 @@ async def _initialize_mcp_manager(
     return manager
 
 
+_CLI_RUN_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+
+async def _record_cli_run_outcome(
+    result: "Result[Any, Any]",
+    *,
+    event_store: "EventStore",
+    session_repo: "SessionRepository",
+    execution_id: str | None,
+    session_id: str | None,
+    check_package_run: Any = None,
+) -> None:
+    """Emit one durable ``workflow_outcome`` for a terminal ``ooo run``.
+
+    Mirrors what an MCP ``execute_seed`` job records so the CLI entrypoint is
+    measured by the same rule: the terminal status comes from the
+    reconstructed session (``completed``/``failed``/``cancelled``), falling
+    back to the runner's success flag; a ``paused`` run is not terminal and
+    emits nothing (its resume will). A non-success outcome carries the closed
+    ``failure_cause`` derived from durable executor evidence, never prose. The
+    outcome id is fresh per invocation because ``--resume`` reuses the
+    execution id and each attempt is its own outcome. ``check_package_run``
+    (``boundary/run_control.py``) closes its record at the same terminal
+    status and sends only its anonymous no-evidence count
+    (``acceptance_no_evidence``). Never raises.
+    """
+    from ouroboros.mcp.tools.run_ac_tally import derive_run_ac_tally
+    from ouroboros.mcp.tools.run_failure_meta import derive_run_failure_meta
+    from ouroboros.orchestrator.session import SessionStatus
+
+    try:
+        session_status: SessionStatus | None = None
+        if result.is_ok:
+            res = result.value
+            execution_id = res.execution_id or execution_id
+            session_id = res.session_id or session_id
+            terminal_status = "completed" if res.success else "failed"
+            if not res.success and res.summary.get("cancelled") is True:
+                terminal_status = "cancelled"
+            if session_id is not None:
+                try:
+                    reconstructed = await session_repo.reconstruct_session(session_id)
+                    if reconstructed.is_ok:
+                        session_status = reconstructed.value.status
+                except Exception:
+                    session_status = None
+            if session_status is SessionStatus.PAUSED:
+                return
+            if session_status is not None and session_status.value in _CLI_RUN_TERMINAL_STATUSES:
+                terminal_status = session_status.value
+        else:
+            terminal_status = "failed"
+        if not execution_id:
+            return
+        result_meta: dict[str, Any] = {"success": terminal_status == "completed"}
+        if terminal_status != "completed" and session_id is not None:
+            # The cause is enrichment; the outcome must land without it
+            # (``failure_reason_code=unknown``) rather than be dropped.
+            try:
+                result_meta.update(
+                    await derive_run_failure_meta(
+                        event_store,
+                        session_id=session_id,
+                        execution_id=execution_id,
+                        session_status=session_status,
+                    )
+                )
+            except Exception:
+                pass
+        if check_package_run is not None:
+            try:
+                # A paused run returned above: the final verdict exists.
+                check_package_run.finish(terminal_status, surface="cli_run")
+            except Exception:
+                pass
+        if session_id is not None:
+            # Same enrichment rule: the tally never blocks the outcome.
+            try:
+                result_meta.update(
+                    await derive_run_ac_tally(
+                        event_store, session_id=session_id, execution_id=execution_id
+                    )
+                )
+            except Exception:
+                pass
+        usage_telemetry.capture_job_outcome(
+            f"{execution_id}:{uuid4().hex}",
+            "run",
+            terminal_status=terminal_status,
+            result_meta=result_meta,
+        )
+    except Exception:
+        pass
+
+
+def _record_cli_prelaunch_failure(cause: str, reason: str) -> None:
+    """Record a closed pre-launch outcome without affecting the original error."""
+    try:
+        usage_telemetry.capture_job_outcome(
+            f"cli-run:{uuid4().hex}",
+            "run",
+            terminal_status="failed",
+            result_meta={"success": False, "failure_cause": cause, "failure_reason_code": reason},
+        )
+        usage_telemetry.flush()
+    except Exception:  # telemetry must not change the original failure
+        pass
+
+
 async def _run_orchestrator(
     seed_file: Path,
     resume_session: str | None = None,
@@ -315,6 +742,11 @@ async def _run_orchestrator(
     runtime_backend: str | None = None,
     max_decomposition_depth: int | None = None,
     skip_completed: str | None = None,
+    project_dir: Path | None = None,
+    project_fallback_dir: Path | None = None,
+    check_package: bool | None = None,
+    auto_evaluate: bool | None = None,
+    auto_evolve: bool | None = None,
 ) -> None:
     """Run workflow via orchestrator mode.
 
@@ -329,25 +761,48 @@ async def _run_orchestrator(
         runtime_backend: Optional orchestrator runtime backend override.
         max_decomposition_depth: Optional recursive decomposition depth cap override.
         skip_completed: Optional path to a marker file for already-satisfied ACs.
+        project_dir: Optional explicit project directory for seed path resolution.
+        project_fallback_dir: Directory to stand in for the Seed file's folder
+            when the Seed itself does not say where it belongs.
+        check_package: ``--check-package`` (``decide``) / ``--no-check-package``
+            (``off``); ``None`` defers to ``OUROBOROS_CHECK_PACKAGE``, then
+            ``boundary.check_package``, then the default, which is ``record``
+            (``ouroboros.boundary.switch``).
+        auto_evaluate: Override ``execution.auto_evaluate`` for this run.
+        auto_evolve: Override ``execution.auto_evolve`` for this run.
     """
     from ouroboros.core.seed import Seed
-    from ouroboros.orchestrator import OrchestratorRunner, create_agent_runtime
+    from ouroboros.orchestrator import (
+        create_agent_runtime,
+        create_agent_runtime_async,
+        preflight_agent_runtime,
+        resolve_agent_runtime_backend,
+    )
+    from ouroboros.orchestrator.runner_factory import build_orchestrator_runner
     from ouroboros.orchestrator.session import SessionRepository
     from ouroboros.persistence.event_store import EventStore
 
     # Load seed
-    seed_data = _load_seed_from_yaml(seed_file)
+    try:
+        seed_data = _load_seed_from_yaml(seed_file)
+    except typer.Exit as exc:
+        if isinstance(exc.__cause__, yaml.YAMLError):
+            _record_cli_prelaunch_failure("launch_seed_invalid", "validation")
+        raise
 
     try:
         seed = Seed.from_dict(seed_data)
     except Exception as e:
         print_error(f"Invalid seed format: {e}")
+        if isinstance(e, ValidationError):
+            _record_cli_prelaunch_failure("launch_seed_invalid", "validation")
         raise typer.Exit(1) from e
 
     resolved_max_decomposition_depth = _resolve_max_decomposition_depth(
         seed_data,
         max_decomposition_depth,
     )
+    resolved_fat_harness_mode = False if resume_session else _resolve_fat_harness_mode(seed_data)
     resolved_max_parallel_workers = _resolve_max_parallel_workers()
     externally_satisfied_acs: dict[int, dict[str, Any]] | None = None
     if skip_completed:
@@ -364,6 +819,8 @@ async def _run_orchestrator(
         print_info(f"Acceptance criteria: {len(seed.acceptance_criteria)}")
         print_info(f"Max decomposition depth: {resolved_max_decomposition_depth}")
         print_info(f"Max parallel workers: {resolved_max_parallel_workers}")
+        if resolved_fat_harness_mode:
+            print_info("Execution mode: fat_harness")
         if externally_satisfied_acs:
             print_info(f"Externally satisfied ACs: {len(externally_satisfied_acs)}")
 
@@ -375,16 +832,26 @@ async def _run_orchestrator(
         mcp_manager = await _initialize_mcp_manager(mcp_config, mcp_tool_prefix)
 
     # Initialize components
-    db_path = os.path.expanduser("~/.ouroboros/ouroboros.db")
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    event_store = EventStore(f"sqlite+aiosqlite:///{db_path}")
+    event_store = EventStore()
     await event_store.initialize()
 
-    project_dir = _resolve_cli_project_dir(seed, seed_file)
+    project_dir = _resolve_cli_project_dir(
+        seed,
+        seed_file,
+        seed_data=seed_data,
+        project_dir=project_dir,
+        fallback_dir=project_fallback_dir,
+    )
+    # Always visible, never inferred by the reader: this is the directory the
+    # agent will write in. Seed metadata, a brownfield target, a caller's
+    # fallback, and `--project-dir` can each decide it, so printing the winner
+    # is the only way the person knows before the first write lands.
+    print_info(f"Project directory: {project_dir}")
     session_repo = SessionRepository(event_store)
     workspace: TaskWorkspace | None = None
     execution_id: str | None = None
     session_id_for_run: str | None = None
+    checkpoint_store_enabled = True
 
     try:
         if resume_session:
@@ -402,35 +869,121 @@ async def _run_orchestrator(
             )
             session_id_for_run = resume_session
             execution_id = reconstructed.value.execution_id
+            resolved_fat_harness_mode = _resolve_resume_fat_harness_mode(
+                seed_data,
+                reconstructed.value.progress,
+            )
+            checkpoint_store_enabled = _resolve_resume_checkpoint_store_enabled(
+                reconstructed.value.progress
+            )
         else:
             session_id_for_run = f"orch_{uuid4().hex[:12]}"
             execution_id = f"exec_{uuid4().hex[:12]}"
             workspace = maybe_prepare_task_workspace(project_dir, session_id_for_run)
     except WorktreeError as e:
         print_error(f"Task workspace error: {e.message}")
+        _record_cli_prelaunch_failure("launch_workspace_unavailable", "config")
         raise typer.Exit(1) from e
 
     if workspace is not None:
         print_info(f"Task worktree: {workspace.worktree_path}")
         print_info(f"Task branch: {workspace.branch}")
 
-    adapter = create_agent_runtime(
-        backend=runtime_backend,
+    resolved_runtime_backend = _resolve_run_execute_runtime_backend(
+        runtime_backend,
+        resolve_backend=resolve_agent_runtime_backend,
+    )
+    if debug:
+        print_info(f"Execution runtime: {resolved_runtime_backend}")
+
+    if resolved_runtime_backend == "host":
+        # Host-driven execution needs an MCP host model pumping job_wait and
+        # spawning dispatch payloads; a terminal run has no such host, so the
+        # dispatch would park forever. Reject with the working alternative.
+        print_error(
+            "The 'host' agent runtime dispatches execution to the calling MCP "
+            "host and cannot run from the terminal. Start the run from your "
+            "host chat session (ooo run / ouroboros_start_execute_seed), or "
+            "pick an executable runtime (claude-cli, codex, opencode, ...)."
+        )
+        raise typer.Exit(1)
+
+    execution_model = resolve_execution_model(resolved_runtime_backend)
+    print_info(_execution_model_status(resolved_runtime_backend, execution_model))
+    adapter = await create_agent_runtime_async(
+        create_agent_runtime,
+        backend=resolved_runtime_backend,
+        model=execution_model,
         cwd=Path(workspace.effective_cwd) if workspace else project_dir,
     )
-    runner = OrchestratorRunner(
-        adapter,
-        event_store,
-        console,
+    runtime_blocker = preflight_agent_runtime(adapter)
+    if runtime_blocker is not None:
+        print_error(f"Runtime '{resolved_runtime_backend}' cannot execute: {runtime_blocker}")
+        raise typer.Exit(1)
+    runner = build_orchestrator_runner(
+        adapter=adapter,
+        event_store=event_store,
+        console=console,
         mcp_manager=mcp_manager,
         mcp_tool_prefix=mcp_tool_prefix,
         debug=debug,
         task_workspace=workspace,
+        enable_decomposition=True,
         max_decomposition_depth=resolved_max_decomposition_depth,
         max_parallel_workers=resolved_max_parallel_workers,
+        fat_harness_mode=resolved_fat_harness_mode,
+        base_model_tier=None,
+        efficiency_mode=None,
+        frugality_assurance=None,
+        inherited_runtime_handle=None,
+        inherited_tools=None,
+        session_signal_hub=None,
+        checkpoint_store_enabled=checkpoint_store_enabled,
     )
 
+    # The URL is emitted before execution starts so it can be opened while the
+    # board is still empty. It is pinned with ?run= and therefore remains
+    # correct when other run/auto invocations use the same singleton daemon.
+    try:
+        from ouroboros.mcp.tools._dashboard import resolve_dashboard_run_url
+
+        dashboard_url = await resolve_dashboard_run_url(execution_id, event_store)
+    except Exception:  # noqa: BLE001 - observability must never block execution
+        dashboard_url = None
+    if dashboard_url:
+        print_info(f"Live Dashboard: {dashboard_url}")
+
+    check_package_run = await _prepare_check_package_boundary(
+        runner,
+        seed,
+        check_package,
+        event_store=event_store,
+        execution_id=execution_id,
+        resume_session=resume_session,
+        worker_dir=Path(workspace.effective_cwd) if workspace else project_dir,
+        runtime_backend=resolved_runtime_backend,
+        execution_model=execution_model,
+    )
+
+    async def _continue_into_evaluation(res: Any) -> None:
+        # Same successor chain as the MCP run job: evaluate, then Ralph.
+        from ouroboros.cli.commands import run_successors
+
+        await run_successors.continue_run_into_evaluation(
+            res,
+            session_repo=session_repo,
+            seed_content=yaml.dump(seed_data, default_flow_style=False),
+            worktree_path=workspace.worktree_path if workspace is not None else None,
+            # The directory the run executed in (and QA judged): the task
+            # worktree's counterpart of the project directory, not its root.
+            working_dir=Path(workspace.effective_cwd) if workspace is not None else project_dir,
+            runtime_override=runtime_backend,
+            auto_evaluate=auto_evaluate,
+            auto_evolve=auto_evolve,
+        )
+
     # Execute
+    start_new_attempt = False
     try:
         if resume_session:
             if debug:
@@ -454,6 +1007,20 @@ async def _run_orchestrator(
             result = await runner.execute_seed(**execute_kwargs)
 
         # Handle result
+        # CLI runs use the same durable funnel as MCP jobs so fleet
+        # success-rate measurements include the primary user entrypoint.
+        # Recorded before either branch can raise ``typer.Exit`` so a failed
+        # run is counted exactly like a successful one.
+        await _record_cli_run_outcome(
+            result,
+            event_store=event_store,
+            session_repo=session_repo,
+            execution_id=execution_id,
+            session_id=session_id_for_run,
+            check_package_run=check_package_run,
+        )
+        for line in check_package_run.render_outcome():
+            console.print(line)
         if result.is_ok:
             res = result.value
             if res.success:
@@ -467,7 +1034,7 @@ async def _run_orchestrator(
                     from ouroboros.mcp.tools.qa import QAHandler
 
                     print_info("Running post-execution QA...")
-                    qa_handler = QAHandler()
+                    qa_handler = QAHandler(event_store=event_store)
                     quality_bar = _derive_quality_bar(seed)
                     execution_artifact = _get_verification_artifact(res.summary, res.final_message)
                     verification_working_dir = (
@@ -499,11 +1066,23 @@ async def _run_orchestrator(
                         console.print(qa_result.value.content[0].text)
                     else:
                         print_warning(f"QA evaluation skipped: {qa_result.error}")
+                await _continue_into_evaluation(res)
             else:
                 print_error("Execution failed")
                 print_info(f"Session ID: {res.session_id}")
                 console.print(f"[dim]Error: {res.final_message[:200]}[/dim]")
+                await _continue_into_evaluation(res)
                 raise typer.Exit(1)
+        elif resume_session and _held_out_checks_were_lost(result.error):
+            # The resumed run's held-out checks lived only in the process that
+            # started it, so it cannot continue here (the runner has recorded
+            # it as failed). Start a new attempt instead of exiting.
+            print_warning(
+                "This run cannot continue in a new process: its check package lived in the "
+                "process that started it. Starting a new attempt from the project; the "
+                "interrupted attempt's work stays on its task branch."
+            )
+            start_new_attempt = True
         else:
             print_error(f"Orchestrator error: {result.error}")
             raise typer.Exit(1)
@@ -513,6 +1092,87 @@ async def _run_orchestrator(
             if debug:
                 print_info("Disconnecting MCP servers...")
             await mcp_manager.disconnect_all()
+        # The telemetry worker is a daemon thread: a ``typer.Exit`` raised
+        # right after the outcome was queued would end the process before the
+        # event is posted, so failed runs would be dropped while successful
+        # ones (which keep going through QA) survive. The run is over, so a
+        # best-effort exit flush may wait up to 1.5 seconds after output.
+        usage_telemetry.flush()
+
+    if start_new_attempt:
+        await _run_orchestrator(
+            seed_file,
+            None,
+            mcp_config,
+            mcp_tool_prefix,
+            debug,
+            parallel=parallel,
+            no_qa=no_qa,
+            runtime_backend=runtime_backend,
+            max_decomposition_depth=max_decomposition_depth,
+            skip_completed=skip_completed,
+            project_dir=project_dir,
+            check_package=check_package,
+            auto_evaluate=auto_evaluate,
+            auto_evolve=auto_evolve,
+        )
+
+
+def _held_out_checks_were_lost(error: object) -> bool:
+    """Whether a resume failed because the run's live process-local state is gone.
+
+    The runner reports that exact outcome as ``resume_blocked ==
+    "process_local_resume_unavailable"`` after recording the session failed.
+    """
+    details = getattr(error, "details", None)
+    return (
+        isinstance(details, dict)
+        and details.get("resume_blocked") == "process_local_resume_unavailable"
+    )
+
+
+async def _prepare_check_package_boundary(
+    runner: Any,
+    seed: "Seed",
+    cli_value: bool | None,
+    *,
+    event_store: Any,
+    execution_id: str | None,
+    resume_session: str | None,
+    worker_dir: Path,
+    runtime_backend: str,
+    execution_model: str | None,
+) -> Any:
+    """Resolve the check-package switch and, unless off, prepare the package before dispatch.
+
+    Returns the run's ``CheckPackageRun``. With the switch ``off`` nothing here
+    calls a model, writes an event, or changes the runner. Otherwise the
+    package is frozen and admitted before the worker starts, and the runner
+    gets the acceptance authority, which in ``decide`` mode decides covered
+    criteria before the terminal status is persisted and in ``record`` mode
+    (the default) only records what it would have decided.
+    """
+    from ouroboros.boundary.ledger import BoundaryOrderError
+    from ouroboros.boundary.run_control import CheckPackageRun
+
+    check_package_run = CheckPackageRun.resolve(cli_value)
+    try:
+        lines = await check_package_run.prepare(
+            runner,
+            seed,
+            event_store=event_store,
+            execution_id=execution_id,
+            worker_dir=worker_dir,
+            runtime_backend=runtime_backend,
+            model=execution_model,
+            resume=bool(resume_session),
+        )
+    except BoundaryOrderError as exc:
+        print_error(f"Check package refused the worker start: {exc}")
+        raise typer.Exit(1) from exc
+    for line in lines:
+        print_info(line)
+    return check_package_run
 
 
 @app.command()
@@ -557,6 +1217,16 @@ def workflow(
             help="Prefix to add to all MCP tool names (e.g., 'mcp_').",
         ),
     ] = "",
+    project_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--project-dir",
+            help="Explicit project directory for resolving seed-relative paths.",
+            file_okay=False,
+            dir_okay=True,
+            resolve_path=True,
+        ),
+    ] = None,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", "-n", help="Validate seed without executing."),
@@ -577,7 +1247,12 @@ def workflow(
         AgentRuntimeBackend | None,
         typer.Option(
             "--runtime",
-            help="Agent runtime backend for orchestrator mode (claude, codex, opencode, or hermes).",
+            help=(
+                "Agent runtime backend for orchestrator mode (claude, claude-sdk, "
+                "claude-cli, codex, "
+                "opencode, hermes, gemini, copilot, goose, kiro, pi, gjc, "
+                "antigravity, grok, or zcode)."
+            ),
             case_sensitive=False,
         ),
     ] = None,
@@ -595,7 +1270,9 @@ def workflow(
             min=0,
             help=(
                 "Maximum recursive AC decomposition depth. "
-                "0 disables decomposition; 1 allows one split; default 2."
+                "0 disables decomposition; default 2. "
+                f"Depths above {MAX_DURABLE_DECOMPOSITION_DEPTH} use the historical "
+                "legacy non-resumable path."
             ),
         ),
     ] = None,
@@ -609,13 +1286,55 @@ def workflow(
             ),
         ),
     ] = None,
+    check_package: Annotated[
+        bool | None,
+        typer.Option(
+            "--check-package/--no-check-package",
+            help=(
+                "Before the worker starts, build executable checks from the acceptance "
+                "criteria and admit them on the current tree. By default they only "
+                "record what they would have decided on the finished work (record mode); "
+                "--check-package lets them decide the criteria they cover (or "
+                "OUROBOROS_CHECK_PACKAGE=decide, or boundary.check_package: decide in "
+                "config); --no-check-package turns them off (or OUROBOROS_CHECK_PACKAGE=off, "
+                "or boundary.check_package: off). "
+                "The checks are model-written Python scripts. They run on throwaway "
+                "copies of the project with the project's interpreter, a per-check "
+                "timeout, and an allowlisted environment, confined by the execution "
+                "sandbox: they can write only inside their copy and a scratch "
+                "directory and have no network, but they can read files you can read."
+            ),
+        ),
+    ] = None,
+    auto_evaluate: Annotated[
+        bool | None,
+        typer.Option(
+            "--auto-evaluate/--no-auto-evaluate",
+            help=(
+                "After the run, enqueue formal evaluation (failed runs included) and follow "
+                "it. Default: execution.auto_evaluate in config (on)."
+            ),
+        ),
+    ] = None,
+    auto_evolve: Annotated[
+        bool | None,
+        typer.Option(
+            "--auto-evolve/--no-auto-evolve",
+            help=(
+                "When formal evaluation is not approved, continue into a bounded Ralph loop "
+                "and follow it. Default: execution.auto_evolve in config (on)."
+            ),
+        ),
+    ] = None,
+    model: ModelOption = None,
+    pin_models: PinModelsOption = None,
 ) -> None:
     """Execute a workflow from a seed file.
 
     Reads the seed YAML configuration and runs the Ouroboros workflow.
     Orchestrator mode is enabled by default.
 
-    Use --no-orchestrator for legacy standard workflow mode.
+    Use --no-orchestrator only for the non-orchestrated standard workflow path.
     Use --resume to continue a previous session.
     Use --mcp-config to connect to external MCP servers for additional tools.
 
@@ -648,12 +1367,23 @@ def workflow(
         # Skip post-execution QA
         ouroboros run seed.yaml --no-qa
 
+        # Stop after the run instead of continuing into formal evaluation
+        ouroboros run seed.yaml --no-auto-evaluate
+
+        # Run every role, evaluation included, on the frontier tier
+        ouroboros run seed.yaml --model frontier
+
         # Limit recursive decomposition depth
         ouroboros run seed.yaml --max-decomposition-depth 1
 
         # Skip ACs already satisfied by the working tree
         ouroboros run seed.yaml --skip-completed docs/completed.yaml
     """
+    # Apply the saved logging.level before the orchestrator is imported: its
+    # module-level get_logger() auto-configures logging at the default level,
+    # and whichever runs first wins.
+    configure_cli_logging(debug=debug)
+
     # Validate MCP config requires orchestrator mode
     if mcp_config and not orchestrator and not resume_session:
         print_warning("--mcp-config requires --orchestrator flag. Enabling orchestrator mode.")
@@ -667,20 +1397,25 @@ def workflow(
                 "Enabling orchestrator mode.[/yellow]"
             )
         try:
-            asyncio.run(
-                _run_orchestrator(
-                    seed_file,
-                    resume_session,
-                    mcp_config,
-                    mcp_tool_prefix,
-                    debug,
-                    parallel=not sequential,
-                    no_qa=no_qa,
-                    runtime_backend=runtime.value if runtime else None,
-                    max_decomposition_depth=max_decomposition_depth,
-                    skip_completed=skip_completed,
+            with model_options(model, pin_models):
+                asyncio.run(
+                    _run_orchestrator(
+                        seed_file,
+                        resume_session,
+                        mcp_config,
+                        mcp_tool_prefix,
+                        debug,
+                        parallel=not sequential,
+                        no_qa=no_qa,
+                        runtime_backend=public_runtime_backend(runtime.value if runtime else None),
+                        max_decomposition_depth=max_decomposition_depth,
+                        skip_completed=skip_completed,
+                        project_dir=project_dir,
+                        check_package=check_package,
+                        auto_evaluate=auto_evaluate,
+                        auto_evolve=auto_evolve,
+                    )
                 )
-            )
         except (ValueError, NotImplementedError) as e:
             print_error(str(e))
             raise typer.Exit(1) from e

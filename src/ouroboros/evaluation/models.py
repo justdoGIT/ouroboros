@@ -16,11 +16,28 @@ Classes:
     EvaluationResult: Complete pipeline output
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from ouroboros.core.acceptance import AcceptanceState
+from ouroboros.core.seed import AcceptanceCriterionSpec
 from ouroboros.events.base import BaseEvent
+
+# Above this reward-hacking risk the final gate vetoes an otherwise-passing
+# artifact.  It is deliberately high (0.7): it only vetoes *high-confidence*
+# gaming signals so a nervous evaluator's mild suspicion never blocks a
+# genuine pass.  Defined here (not in pipeline.py) so the gate and the
+# ``EvaluationResult.failure_reason`` surface share one source of truth
+# without a models<->pipeline import cycle.  pipeline.py imports this.
+REWARD_HACKING_VETO_THRESHOLD = 0.7
+
+# Below this Stage 2 score, semantic review withholds approval.  It never
+# grants approval above it: acceptance requires executed Stage 1 evidence.
+# Shared with ``pipeline.py`` so the gate and the failure reason that has to
+# name it cannot drift apart.
+SEMANTIC_APPROVAL_SCORE = 0.8
 
 
 class VoterRole(StrEnum):
@@ -53,6 +70,18 @@ class CheckType(StrEnum):
     TEST = "test"
     STATIC = "static"
     COVERAGE = "coverage"
+    CHECK_PACKAGE = "check_package"
+    """The controller's recorded check package decision for one criterion, not a command."""
+
+
+COMMAND_CHECK_TYPES: tuple[CheckType, ...] = (
+    CheckType.LINT,
+    CheckType.BUILD,
+    CheckType.TEST,
+    CheckType.STATIC,
+    CheckType.COVERAGE,
+)
+"""The checks Stage 1 runs as project commands; the same for every criterion."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,12 +93,37 @@ class CheckResult:
         passed: Whether the check passed
         message: Human-readable result message
         details: Additional check-specific details
+        executed: Whether a configured command was attempted, so that
+            ``passed`` reports its outcome. An unconfigured check is reported
+            as ``passed`` so it does not fail Stage 1, but it is not evidence.
+            Defaults to ``False`` so a check that does not declare execution
+            never counts as evidence.
     """
 
     check_type: CheckType
     passed: bool
     message: str
     details: dict[str, Any] = field(default_factory=dict)
+    executed: bool = False
+
+
+class MechanicalDisposition(StrEnum):
+    """What a Stage 1 result is evidence of; the one classifier every reader uses.
+
+    Attributes:
+        EXECUTED_PASS: At least one check ran a command and every check passed.
+            The only disposition that can support acceptance.
+        EXECUTED_FAIL: A check that ran a command failed. Authoritative
+            rejection; model review is not consulted.
+        NO_EVIDENCE: No executed check decided anything: every check was
+            skipped, or the only failures were never executed. Not approvable
+            and not a rejection; the outcome is unverified and model review
+            still runs to supply feedback.
+    """
+
+    EXECUTED_PASS = "executed_pass"
+    EXECUTED_FAIL = "executed_fail"
+    NO_EVIDENCE = "no_evidence"
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,10 +143,78 @@ class MechanicalResult:
     checks: tuple[CheckResult, ...]
     coverage_score: float | None = None
 
+    def __post_init__(self) -> None:
+        """Reconcile the aggregate verdict with its checks, fail-closed.
+
+        ``passed`` duplicates what the checks already say, and a directly
+        constructed or rehydrated result can make the two disagree. The
+        aggregate may only claim a pass that every check confirms with a
+        literal ``True``; any disagreement resolves to not passed, so no
+        reader (the pipeline's Stage 1 gate, the acceptance gate, failure
+        reasons) can see an executed failing check as a pass.
+        """
+        reconciled = self.passed is True and all(c.passed is True for c in self.checks)
+        if reconciled is not self.passed:
+            object.__setattr__(self, "passed", reconciled)
+
     @property
     def failed_checks(self) -> tuple[CheckResult, ...]:
-        """Return only the checks that failed."""
-        return tuple(c for c in self.checks if not c.passed)
+        """Return only the checks that did not report a literal pass."""
+        return tuple(c for c in self.checks if c.passed is not True)
+
+    @property
+    def executed_checks(self) -> tuple[CheckResult, ...]:
+        """Return only the checks whose configured command actually ran."""
+        return tuple(c for c in self.checks if c.executed is True)
+
+    @property
+    def executed_failures(self) -> tuple[CheckResult, ...]:
+        """Return the checks that ran a command and did not pass."""
+        return tuple(c for c in self.failed_checks if c.executed is True)
+
+    @property
+    def disposition(self) -> MechanicalDisposition:
+        """Classify this result once, for the pipeline and every projection.
+
+        An executed failure rejects. A pass counts only when every check
+        passed and at least one ran a command (a skipped check reports
+        ``passed`` but is not evidence). Everything else, including a failure
+        that was never executed, is no evidence.
+        """
+        if self.executed_failures:
+            return MechanicalDisposition.EXECUTED_FAIL
+        if self.passed and self.executed_checks:
+            return MechanicalDisposition.EXECUTED_PASS
+        return MechanicalDisposition.NO_EVIDENCE
+
+    def with_recorded(self, recorded: tuple[CheckResult, ...]) -> "MechanicalResult":
+        """This result plus checks the controller already ran for one criterion.
+
+        ``recorded`` holds ``CHECK_PACKAGE`` results only; the one classifier
+        (``disposition``) then decides over the command checks and them alike.
+        """
+        if any(check.check_type is not CheckType.CHECK_PACKAGE for check in recorded):
+            raise ValueError("only check package results are recorded evidence")
+        checks = self.command_checks().checks + recorded
+        return MechanicalResult(
+            passed=all(check.passed is True for check in checks),
+            checks=checks,
+            coverage_score=self.coverage_score,
+        )
+
+    def command_checks(self) -> "MechanicalResult":
+        """This result without recorded criterion evidence: what every criterion shares."""
+        checks = tuple(c for c in self.checks if c.check_type is not CheckType.CHECK_PACKAGE)
+        return MechanicalResult(
+            passed=all(check.passed is True for check in checks),
+            checks=checks,
+            coverage_score=self.coverage_score,
+        )
+
+    @property
+    def has_executed_evidence(self) -> bool:
+        """Whether Stage 1 is executed verification evidence for acceptance."""
+        return self.disposition is MechanicalDisposition.EXECUTED_PASS
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +311,10 @@ class ConsensusResult:
     majority_ratio: float
     disagreements: tuple[str, ...] = ()
     is_single_model: bool = False
+    # PR-X X2: honest label of executor/reviewer independence
+    # ("independent" | "same_vendor" | "unavailable" | "unverified" |
+    # None when not resolved). See evaluation.reviewer_independence.
+    reviewer_independence: str | None = None
 
     @property
     def approving_votes(self) -> int:
@@ -297,6 +423,8 @@ class ArtifactBundle:
     files: tuple[FileArtifact, ...] = ()
     text_summary: str = ""
     total_chars: int = 0
+    scan_complete: bool = True
+    scan_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,6 +435,11 @@ class EvaluationContext:
         execution_id: Unique identifier for the execution
         seed_id: Identifier of the seed being evaluated against
         current_ac: The acceptance criterion being evaluated
+        current_ac_spec: Structured success contract for ``current_ac`` when
+            the seed declared one (verify_command / expected_artifacts /
+            output_assertion).  ``None`` for bare-string ACs — the evaluator
+            then falls back to judging ``current_ac`` text alone (today's
+            behavior).
         artifact: The output artifact to evaluate
         artifact_type: Type of artifact (code, document, etc.)
         goal: Original goal from seed
@@ -318,11 +451,20 @@ class EvaluationContext:
     seed_id: str
     current_ac: str
     artifact: str
+    current_ac_spec: AcceptanceCriterionSpec | None = None
     artifact_type: str = "code"
     goal: str = ""
     constraints: tuple[str, ...] = ()
     artifact_bundle: ArtifactBundle | None = None
     trigger_consensus: bool = False
+    # PR-X X2: the runtime backend that produced ``artifact``, when known. Lets
+    # consensus keep the executor's own vendor out of the reviewer jury. ``None``
+    # (the default) means "unknown" — today's behavior, no independence binding.
+    executor_backend: str | None = None
+    # Checks the controller already ran for ``current_ac`` (its recorded check
+    # package decision, ``CheckType.CHECK_PACKAGE``). Stage 1 adds them to the
+    # project command checks for this criterion only.
+    recorded_checks: tuple[CheckResult, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,22 +502,161 @@ class EvaluationResult:
         return 0
 
     @property
-    def failure_reason(self) -> str | None:
-        """Return the reason for failure, if any.
+    def has_executed_evidence(self) -> bool:
+        """Whether Stage 1 produced executed verification evidence."""
+        return self.stage1_result is not None and self.stage1_result.has_executed_evidence
 
-        Stage 3 is checked before Stage 2 because when Stage 3 ran,
-        it is the authoritative verdict (Stage 2 may have been bypassed
-        via trigger_consensus).
-        """
-        if self.final_approved:
-            return None
-        if self.stage1_result and not self.stage1_result.passed:
-            failed = self.stage1_result.failed_checks
-            return f"Stage 1 failed: {', '.join(c.check_type for c in failed)}"
-        if self.stage3_result and not self.stage3_result.approved:
+    @property
+    def acceptance_state(self) -> AcceptanceState:
+        """Return whether this result is approved, rejected, or unverified."""
+        return derive_acceptance_state(
+            final_approved=self.final_approved,
+            stage1_result=self.stage1_result,
+        )
+
+    @property
+    def failure_reason(self) -> str | None:
+        """Return the reason for failure, if any."""
+        return build_failure_reason(
+            final_approved=self.final_approved,
+            stage1_result=self.stage1_result,
+            stage2_result=self.stage2_result,
+            stage3_result=self.stage3_result,
+        )
+
+
+def model_review_withhold_reason(
+    *,
+    stage2_result: SemanticResult | None,
+    stage3_result: ConsensusResult | None,
+) -> str | None:
+    """Return why model review withheld approval, or ``None`` if it did not.
+
+    Model review (Stage 2 semantic, Stage 3 consensus, and the reward-hacking
+    veto) is advisory: it can withhold approval and explain why, but it can
+    never grant acceptance. Every stage that ran is consulted and any one of
+    them withholding settles it; a Stage 3 approval does not lift a Stage 2
+    block. The first withholding gate is named, in the order below.
+    """
+    if stage3_result is not None and not stage3_result.approved:
+        return f"Stage 3 failed: Consensus not reached ({stage3_result.majority_ratio:.0%})"
+    if stage2_result is not None and not stage2_result.ac_compliance:
+        return (
+            "Stage 2 failed: AC non-compliance "
+            f"(ac_compliance=false; semantic score {stage2_result.score:.2f} "
+            "did not gate this)"
+        )
+    if stage2_result is not None and stage2_result.score < SEMANTIC_APPROVAL_SCORE:
+        return (
+            "Stage 2 failed: semantic score "
+            f"{stage2_result.score:.2f} < {SEMANTIC_APPROVAL_SCORE:.2f} "
+            "(ac_compliance=true; the score gate decided this)"
+        )
+    if (
+        stage2_result is not None
+        and stage2_result.reward_hacking_risk >= REWARD_HACKING_VETO_THRESHOLD
+    ):
+        return (
+            "Stage 2 veto: reward-hacking risk "
+            f"{stage2_result.reward_hacking_risk:.2f} >= "
+            f"{REWARD_HACKING_VETO_THRESHOLD:.2f}; artifact appears optimized to game the "
+            "evaluator rather than solve the real task"
+        )
+    return None
+
+
+def decide_final_approval(
+    *,
+    stage1_result: MechanicalResult | None,
+    stage2_result: SemanticResult | None,
+    stage3_result: ConsensusResult | None,
+) -> bool:
+    """The single acceptance gate: executed evidence grants, model review withholds.
+
+    Approval requires Stage 1 to have run at least one configured check with
+    every check passing. Model review that ran may withhold that approval;
+    no model verdict can supply it.
+    """
+    if stage1_result is None or not stage1_result.has_executed_evidence:
+        return False
+    return (
+        model_review_withhold_reason(
+            stage2_result=stage2_result,
+            stage3_result=stage3_result,
+        )
+        is None
+    )
+
+
+def derive_acceptance_state(
+    *,
+    final_approved: bool,
+    stage1_result: MechanicalResult | None,
+) -> AcceptanceState:
+    """Classify an evaluation outcome for callers and feedback loops."""
+    if final_approved:
+        return AcceptanceState.APPROVED
+    if stage1_result is None:
+        return AcceptanceState.UNVERIFIED
+    disposition = stage1_result.disposition
+    if disposition is MechanicalDisposition.NO_EVIDENCE:
+        return AcceptanceState.UNVERIFIED
+    # EXECUTED_FAIL, or EXECUTED_PASS that model review withheld.
+    return AcceptanceState.REJECTED
+
+
+def aggregate_acceptance_state(states: Sequence[AcceptanceState]) -> AcceptanceState:
+    """The run's state from its criteria' states (each from ``derive_acceptance_state``).
+
+    Approved only when every criterion is; rejected when any criterion was
+    rejected on executed evidence or model review; otherwise unverified.
+    """
+    if states and all(state is AcceptanceState.APPROVED for state in states):
+        return AcceptanceState.APPROVED
+    if any(state is AcceptanceState.REJECTED for state in states):
+        return AcceptanceState.REJECTED
+    return AcceptanceState.UNVERIFIED
+
+
+def build_failure_reason(
+    *,
+    final_approved: bool,
+    stage1_result: MechanicalResult | None,
+    stage2_result: SemanticResult | None,
+    stage3_result: ConsensusResult | None,
+) -> str | None:
+    """Return why an evaluation was not approved, or ``None`` when it was.
+
+    A failed executed check is named first because it is the decisive
+    evidence. Without executed evidence the result is unverified, and the
+    reason says so before appending whatever model review concluded, so the
+    feedback is not mistaken for a verdict. With executed evidence that
+    passed, the withholding model gate is named.
+    """
+    if final_approved:
+        return None
+    disposition = stage1_result.disposition if stage1_result is not None else None
+    if stage1_result is not None and disposition is MechanicalDisposition.EXECUTED_FAIL:
+        failed = stage1_result.executed_failures
+        return f"Stage 1 failed: {', '.join(c.check_type for c in failed)}"
+
+    model_reason = model_review_withhold_reason(
+        stage2_result=stage2_result,
+        stage3_result=stage3_result,
+    )
+    if stage1_result is None or disposition is MechanicalDisposition.NO_EVIDENCE:
+        if stage1_result is None:
+            missing = "Stage 1 did not run"
+        elif stage1_result.failed_checks:
+            missing = "Stage 1 reported failures from no executed check"
+        else:
+            missing = "Stage 1 ran no configured check"
+        reason = f"Not approved: unverified. No executed verification evidence ({missing})."
+        if model_reason is not None:
+            return f"{reason} Advisory model review also withheld approval: {model_reason}"
+        if stage2_result is not None or stage3_result is not None:
             return (
-                f"Stage 3 failed: Consensus not reached ({self.stage3_result.majority_ratio:.0%})"
+                f"{reason} Advisory model review raised no objection, but cannot grant acceptance."
             )
-        if self.stage2_result and not self.stage2_result.ac_compliance:
-            return f"Stage 2 failed: AC non-compliance (score={self.stage2_result.score:.2f})"
-        return "Unknown failure"
+        return reason
+    return model_reason or "Unknown failure"

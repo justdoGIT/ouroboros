@@ -31,10 +31,46 @@ def __getattr__(name: str) -> object:
         from ouroboros.providers.codex_cli_adapter import CodexCliLLMAdapter
 
         return CodexCliLLMAdapter
+    if name == "CopilotCliLLMAdapter":
+        from ouroboros.providers.copilot_cli_adapter import CopilotCliLLMAdapter
+
+        return CopilotCliLLMAdapter
     if name == "OpenCodeLLMAdapter":
         from ouroboros.providers.opencode_adapter import OpenCodeLLMAdapter
 
         return OpenCodeLLMAdapter
+    if name == "HermesCliLLMAdapter":
+        from ouroboros.providers.hermes_cli_adapter import HermesCliLLMAdapter
+
+        return HermesCliLLMAdapter
+    if name == "GooseCliLLMAdapter":
+        from ouroboros.providers.goose_cli_adapter import GooseCliLLMAdapter
+
+        return GooseCliLLMAdapter
+    if name == "PiLLMAdapter":
+        from ouroboros.providers.pi_llm_adapter import PiLLMAdapter
+
+        return PiLLMAdapter
+    if name == "OmpLLMAdapter":
+        from ouroboros.providers.omp_llm_adapter import OmpLLMAdapter
+
+        return OmpLLMAdapter
+    if name == "GjcLLMAdapter":
+        from ouroboros.providers.gjc_llm_adapter import GjcLLMAdapter
+
+        return GjcLLMAdapter
+    if name == "OurocodeLLMAdapter":
+        from ouroboros.providers.ourocode_llm_adapter import OurocodeLLMAdapter
+
+        return OurocodeLLMAdapter
+    if name == "DshLLMAdapter":
+        from ouroboros.providers.dsh_llm_adapter import DshLLMAdapter
+
+        return DshLLMAdapter
+    if name == "ZcodeCliLLMAdapter":
+        from ouroboros.providers.zcode_cli_adapter import ZcodeCliLLMAdapter
+
+        return ZcodeCliLLMAdapter
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -50,7 +86,16 @@ __all__ = [
     # Implementations (AnthropicAdapter is the recommended default)
     "AnthropicAdapter",
     "CodexCliLLMAdapter",
+    "CopilotCliLLMAdapter",
     "OpenCodeLLMAdapter",
+    "HermesCliLLMAdapter",
+    "GooseCliLLMAdapter",
+    "PiLLMAdapter",
+    "OmpLLMAdapter",
+    "GjcLLMAdapter",
+    "OurocodeLLMAdapter",
+    "DshLLMAdapter",
+    "ZcodeCliLLMAdapter",
     "LiteLLMAdapter",
     # Factory helpers
     "create_llm_adapter",

@@ -61,12 +61,37 @@ llm:
   backend: gemini                             # for interview / seed / eval
 ```
 
+### Completion model selection
+
+For the `llm.backend: gemini` completion path (interview, seed, and evaluation),
+an automatic role model resolves to Ouroboros' internal `default` sentinel.
+Without an explicit model preference, the completion adapter omits `--model`,
+leaving the installed Gemini CLI's configured/default selection in control.
+Ouroboros does not substitute a fixed Gemini model version.
+
+Explicit request models and role/provider profile pins retain their existing
+precedence. Direct adapter callers can also set a constructor model. These
+choices pass `--model` to the CLI; aliases such as `flash`, `pro`, and `auto`,
+as well as concrete IDs, remain explicit choices. Request/profile model values
+keep the existing `gemini/` and `google/` prefix normalization. An invocation-level Ouroboros
+`auto` choice is different: the role resolver converts it to `default`.
+
+The completion response reports native `result.stats` token counts. Batch JSON
+statistics are aggregated across the reported models. Provider totals beyond
+reported prompt and completion tokens are preserved as `unallocated_tokens`;
+cached counts and per-model streaming breakdowns are not added twice.
+
+The completion response uses the model reported by the CLI's `init` event.
+If no model was selected and that event does not report one, the response uses
+`default` rather than inventing a concrete model ID. This completion behavior does not
+establish per-task adaptive model placement for the workflow runtime.
+
 The same `gemini` value is accepted by every CLI surface that takes a
 backend name:
 
 - `ouroboros setup --runtime gemini`
 - `ouroboros config backend gemini`
-- `ouroboros mcp serve --llm-backend gemini`
+- `ouroboros mcp serve --runtime gemini --llm-backend gemini`
 - `ouroboros init --llm-backend gemini`
 
 ## Headless contract
@@ -78,6 +103,7 @@ gemini --prompt <PROMPT> \
        --non-interactive \
        --output-format stream-json \
        --approval-mode yolo \
+       --skip-trust \
        [--model gemini-2.5-pro]
 ```
 
@@ -86,8 +112,23 @@ gemini --prompt <PROMPT> \
 | `--prompt`          | Carries the request (Gemini's documented headless API)  |
 | `--non-interactive` | Disables TTY prompts so the subprocess never blocks     |
 | `--output-format`   | NDJSON event stream parsed by `GeminiEventNormalizer`   |
-| `--approval-mode`   | `yolo` — required for headless approvals                |
+| `--approval-mode`   | `auto_edit` by default (`acceptEdits`); `yolo` only when `bypassPermissions` is explicitly configured |
+| `--skip-trust`      | Preserves `yolo` in fresh task worktrees that are not yet in Gemini's workspace trust registry |
 | `--model`           | Optional model override (`gemini-2.5-pro`, `flash`)     |
+
+Ouroboros maps its permission modes onto Gemini's non-blocking headless
+approval modes:
+
+| Ouroboros permission mode | Gemini flag value | When used                                      |
+|---------------------------|-------------------|------------------------------------------------|
+| `acceptEdits`             | `auto_edit`       | Default; applies edits without TTY prompts     |
+| `bypassPermissions`       | `yolo`            | Explicit full bypass requested by the operator |
+
+Runner-driven seed execution forces `bypassPermissions`, so its fresh and logical-resume invocations use `--approval-mode yolo --skip-trust`. Direct lower-level callers that explicitly select `acceptEdits` continue to use `auto_edit` without `--skip-trust`.
+
+The interactive Ouroboros `default` permission mode is normalized to
+`acceptEdits` for Gemini because `--non-interactive` cannot service TTY
+approval prompts.
 
 ## Event mapping
 
@@ -97,18 +138,18 @@ The runtime parses Gemini's `stream-json` events through
 | Gemini event   | Ouroboros message                                 |
 |----------------|---------------------------------------------------|
 | `init`         | session metadata only — no message emitted        |
-| `message` / `text` | `assistant` message                            |
+| `message` / `text` | assistant content; native `role=user` echoes are omitted and `delta=true` chunks are concatenated exactly |
 | `thinking`     | `assistant` with `data.thinking`                  |
 | `tool_use`     | `assistant` with `tool_name` + `data.tool_input`  |
 | `tool_result`  | `tool` message with `data.is_error`               |
 | `error`        | `system` message with `data.is_error=True`        |
 | `result`       | **terminal** `assistant` message — Gemini emits the final response in this event when no intermediate `message` event was produced |
 
-The terminal `result` event is critical: it is the only way the final
-assistant text reaches the orchestrator when Gemini chose not to emit a
-mid-stream `message`. Earlier prototypes dropped this event and lost the
-final answer; the runtime now surfaces it explicitly with
-`data.terminal=True`.
+Native assistant `message` chunks with `delta=true` are concatenated without
+inserting whitespace. The CLI's status/statistics-only `result` keeps that
+streamed answer. For compatible emitters that include `result.response`, a
+nonempty full response replaces the accumulated chunks. Legacy `role=model`
+completion messages remain supported by the LLM adapter.
 
 ## Capabilities
 

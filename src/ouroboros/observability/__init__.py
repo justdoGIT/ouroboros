@@ -17,6 +17,7 @@ from ouroboros.observability.drift import (
     DriftThresholdExceededEvent,
     calculate_constraint_drift,
     calculate_goal_drift,
+    calculate_goal_drift_async,
     calculate_ontology_drift,
 )
 from ouroboros.observability.logging import (
@@ -24,6 +25,7 @@ from ouroboros.observability.logging import (
     LogMode,
     bind_context,
     configure_logging,
+    default_logging_config,
     get_logger,
     unbind_context,
 )
@@ -42,6 +44,7 @@ __all__ = [
     "LoggingConfig",
     "bind_context",
     "configure_logging",
+    "default_logging_config",
     "get_logger",
     "unbind_context",
     # Drift
@@ -52,6 +55,7 @@ __all__ = [
     "DriftThresholdExceededEvent",
     "calculate_constraint_drift",
     "calculate_goal_drift",
+    "calculate_goal_drift_async",
     "calculate_ontology_drift",
     # Retrospective
     "DEFAULT_RETROSPECTIVE_INTERVAL",

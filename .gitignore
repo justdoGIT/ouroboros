@@ -103,6 +103,7 @@ _bmad/
 .claude/commands/bmad/
 .omc/
 .smoke-home/
+.acp-artifacts/
 
 
 # Local archive for removed/held docs and assets
@@ -129,3 +130,29 @@ docs/code-surface-inventory.yaml
 docs/code-surface-lookup.yaml
 docs/cli-inventory.yaml
 
+# Eval/QA run artifact written to the repo root; never tracked
+# (recurring stray — has been accidentally committed before).
+.ouroboros_eval_artifact.md
+
+# Deterministic run-worker context pack cache written under the target repo.
+# Machine-generated and keyed by working-tree state; never tracked.
+.ouroboros/context_pack.json
+**/.ouroboros/context_pack.json
+
+
+# PM interview artifacts and opencode plugin build output
+.ouroboros/
+src/ouroboros/opencode/plugin/node_modules/
+src/ouroboros/opencode/plugin/bun.lock
+
+# Vendored security skills (.claude/skills/*): checkpoint state and scan
+# output, which carries exploit detail and must not be committed.
+.threat-model-state/
+.triage-state/
+.vuln-scan-state/
+docs/security/VULN-FINDINGS.*
+docs/security/TRIAGE.*
+/TRIAGE.json
+/TRIAGE.md
+/VULN-FINDINGS.json
+/VULN-FINDINGS.md

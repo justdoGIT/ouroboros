@@ -6,7 +6,7 @@ communicating with LLM providers in a unified way.
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol
+from typing import Literal, Protocol
 
 from ouroboros.core.errors import ProviderError
 from ouroboros.core.types import Result
@@ -54,6 +54,23 @@ class CompletionConfig:
         response_format: Optional response format constraint.
             Use {"type": "json_object"} to force JSON output.
             Use {"type": "json_schema", "json_schema": {...}} for strict schema.
+        role: Optional logical Ouroboros task role used to resolve llm_profiles.
+        profile: Optional explicit Ouroboros llm_profiles key.
+        max_turns: Optional per-request agent turn budget for CLI-backed providers.
+        reasoning_effort: Optional reasoning-effort dial
+            ("low"/"medium"/"high"/"xhigh"). ``xhigh`` is available only
+            through a Codex provider profile; backends that do not accept it
+            continue to ignore or validate it at their own boundary.
+            The effort-first investment lever (RFC #1405). Adapters with a native
+            effort knob translate it: LiteLLM forwards a ``reasoning_effort`` kwarg
+            (provider-agnostic), and the Anthropic-direct adapter maps it to
+            ``output_config.effort`` plus adaptive thinking where required (the
+            GA effort parameter — NOT the removed ``thinking.budget_tokens``,
+            which 400s on current Claude models).
+            Adapters without an effort knob ignore it. ``None`` preserves prior
+            behavior everywhere.
+        model_is_explicit: True when ``model`` is a request-level pin that must
+            not be replaced by role-based profile resolution.
     """
 
     model: str
@@ -62,6 +79,11 @@ class CompletionConfig:
     stop: list[str] | None = None
     top_p: float = 1.0
     response_format: dict[str, object] | None = None
+    role: str | None = None
+    profile: str | None = None
+    max_turns: int | None = None
+    reasoning_effort: Literal["low", "medium", "high", "xhigh"] | None = None
+    model_is_explicit: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,11 +94,17 @@ class UsageInfo:
         prompt_tokens: Number of tokens in the prompt.
         completion_tokens: Number of tokens in the completion.
         total_tokens: Total tokens used (prompt + completion).
+        unallocated_tokens: Authoritative provider-reported tokens that cannot
+            be truthfully assigned to prompt or completion.  This includes a
+            total-only report and additive cache counters when the public
+            prompt/completion fields exclude them.  Accounted spend is
+            ``total_tokens + unallocated_tokens``.
     """
 
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    unallocated_tokens: int = 0
 
 
 @dataclass(frozen=True, slots=True)

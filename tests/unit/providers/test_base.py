@@ -77,26 +77,66 @@ class TestCompletionConfig:
         config = CompletionConfig(model="gpt-4")
 
         assert config.model == "gpt-4"
+        assert config.role is None
+        assert config.profile is None
         assert config.temperature == 0.7
         assert config.max_tokens == 4096
+        assert config.max_turns is None
+        assert config.model_is_explicit is False
         assert config.stop is None
         assert config.top_p == 1.0
+        assert config.reasoning_effort is None
+
+    def test_completion_config_accepts_reasoning_effort(self) -> None:
+        """The effort-first dial is an optional, None-defaulted field."""
+        config = CompletionConfig(model="claude-sonnet-4-6", reasoning_effort="high")
+        assert config.reasoning_effort == "high"
 
     def test_completion_config_custom_values(self) -> None:
         """CompletionConfig accepts custom values."""
         config = CompletionConfig(
             model="openrouter/anthropic/claude-3-opus",
+            role="qa",
+            profile="fast",
             temperature=0.3,
             max_tokens=1000,
+            max_turns=2,
+            model_is_explicit=True,
             stop=["###", "END"],
             top_p=0.9,
         )
 
         assert config.model == "openrouter/anthropic/claude-3-opus"
+        assert config.role == "qa"
+        assert config.profile == "fast"
         assert config.temperature == 0.3
         assert config.max_tokens == 1000
+        assert config.max_turns == 2
+        assert config.model_is_explicit is True
         assert config.stop == ["###", "END"]
         assert config.top_p == 0.9
+
+    def test_completion_config_preserves_existing_positional_order(self) -> None:
+        """New profile fields do not break older positional callers."""
+        config = CompletionConfig(
+            "gpt-4",
+            0.2,
+            1000,
+            ["END"],
+            0.9,
+            {"type": "json_object"},
+        )
+
+        assert config.model == "gpt-4"
+        assert config.temperature == 0.2
+        assert config.max_tokens == 1000
+        assert config.stop == ["END"]
+        assert config.top_p == 0.9
+        assert config.response_format == {"type": "json_object"}
+        assert config.role is None
+        assert config.profile is None
+        assert config.max_turns is None
+        assert config.model_is_explicit is False
 
     def test_completion_config_is_frozen(self) -> None:
         """CompletionConfig is immutable."""
@@ -120,6 +160,19 @@ class TestUsageInfo:
         assert usage.prompt_tokens == 100
         assert usage.completion_tokens == 50
         assert usage.total_tokens == 150
+        assert usage.unallocated_tokens == 0
+
+    def test_usage_info_explicitly_preserves_unallocated_authority(self) -> None:
+        usage = UsageInfo(
+            prompt_tokens=100,
+            completion_tokens=20,
+            total_tokens=120,
+            unallocated_tokens=12,
+        )
+
+        assert usage.total_tokens == usage.prompt_tokens + usage.completion_tokens
+        assert usage.unallocated_tokens == 12
+        assert usage.total_tokens + usage.unallocated_tokens == 132
 
     def test_usage_info_is_frozen(self) -> None:
         """UsageInfo is immutable."""

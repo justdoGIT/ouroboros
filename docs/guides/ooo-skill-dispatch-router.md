@@ -19,7 +19,7 @@ can intercept exact skill commands before starting their model/subprocess flow:
 
 ```text
 ooo run seed.yaml
-/ouroboros:run seed.yaml
+/ouroboros:ouroboros-run seed.yaml
 ```
 
 The shared router lives in `ouroboros.router`. It owns the deterministic
@@ -45,7 +45,7 @@ Codex CLI, Hermes, and OpenCode remain responsible for:
 - falling through to the normal runtime path for non-dispatch prompts
 
 The MCP server remains unaware of `ooo` syntax and channel identifiers. It only
-exposes ordinary MCP tools such as `ouroboros_execute_seed`,
+exposes ordinary MCP tools such as `ouroboros_start_execute_seed`,
 `ouroboros_pm_interview`, and `ouroboros_evaluate`.
 
 ## Adding Commands
@@ -57,9 +57,9 @@ Example frontmatter:
 
 ```yaml
 ---
-name: run
+name: ouroboros-run
 description: Execute a Seed specification through the workflow engine
-mcp_tool: ouroboros_execute_seed
+mcp_tool: ouroboros_start_execute_seed
 mcp_args:
   seed_path: "$1"
   cwd: "$CWD"
@@ -67,4 +67,6 @@ mcp_args:
 ```
 
 Aliases are also declared in skill metadata, so runtimes pick them up through
-the same shared router without code changes.
+the same shared router without code changes. The containing directory remains
+the canonical runtime identity (`skills/run` in this example); the frontmatter
+name is the host-facing registration name.

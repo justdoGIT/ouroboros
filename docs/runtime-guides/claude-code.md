@@ -5,9 +5,16 @@ doc_metadata:
 
 # Running Ouroboros with Claude Code
 
+> 한국어: [claude-code.ko.md](./claude-code.ko.md)
+
 Ouroboros can use **Claude Code** as a runtime backend, leveraging your **Claude Code Pro or Max Plan** subscription to execute workflows without requiring a separate API key.
 
 > For installation and first-run onboarding, see [Getting Started](../getting-started.md).
+
+The `ooo` skill remains available for onboarding discovery. The one-shot
+`setup`, `tutorial`, and `welcome` skills disable automatic model invocation in
+Claude Code; invoke `/ouroboros:setup`, `/ouroboros:tutorial`, or
+`/ouroboros:welcome` explicitly to run their existing flows.
 
 > **Command context guide:** This page contains commands for two different contexts:
 > - **Terminal** -- commands you run in your regular shell (bash, zsh, etc.)
@@ -18,10 +25,23 @@ Ouroboros can use **Claude Code** as a runtime backend, leveraging your **Claude
 ## Prerequisites
 
 - Claude Code CLI installed and authenticated (Pro or Max Plan)
-- Python >= 3.12
-- Ouroboros installed (see [Getting Started](../getting-started.md) for install options)
+- **uv** if you use the marketplace plugin. The plugin's MCP manifest launches
+  the server with the bundled `uvx` command
+  ([`.claude-plugin/.mcp.json`](../../.claude-plugin/.mcp.json)), so a host with
+  only Claude Code cannot start it. Install uv with `pipx install uv`,
+  `pip install --user uv`, or `brew install uv`.
+- No global Python is required for the marketplace plugin. Its shipped skills
+  resolve Python >= 3.12 in this order: compatible `python3`, compatible
+  `python`, then `uv run --no-project --quiet --python '>=3.12' python`. This
+  rejects older host interpreters and lets the same uv prerequisite cover the
+  first-run welcome, setup, and seed snippets.
+- Python >= 3.12 specifically, **for the standalone CLI**.
+- Ouroboros installed, for the standalone CLI (see [Getting Started](../getting-started.md) for install options)
 
-> The `[claude]` extra (`pip install ouroboros-ai[claude]`) installs `claude-agent-sdk` and `anthropic` -- required for Claude Code runtime integration. The base `ouroboros-ai` package does not include these.
+> Install `ouroboros-ai[claude]` for the default in-process SDK runtime on MCP
+> 1.x. The marketplace plugin launches the MCP 2 server from an isolated
+> `ouroboros-ai[mcp]` environment and selects the `[claude-cli]` worker. Never
+> combine `[mcp]` with `[claude]`, `[claude-sdk]`, or `[all]` in one interpreter.
 
 ## Configuration
 
@@ -29,7 +49,7 @@ To select Claude Code as the runtime backend, set the following in your Ouroboro
 
 ```yaml
 orchestrator:
-  runtime_backend: claude
+  runtime_backend: claude  # written by `ouroboros setup --runtime claude`
 ```
 
 When using the `--orchestrator` CLI flag, Claude Code is the default runtime backend.
@@ -54,7 +74,10 @@ When using the `--orchestrator` CLI flag, Claude Code is the default runtime bac
                         +------------------+
 ```
 
-The orchestrator uses `claude-agent-sdk` which connects directly to your authenticated Claude Code session. No API key required. For LiteLLM consensus models, see [`credentials.yaml`](../config-reference.md#credentialsyaml).
+The default profile uses the Agent SDK and its bundled/authenticated Claude Code
+transport. The SDK remains on MCP 1.x. The plugin-owned MCP 2 server is a
+separate `uvx` process and uses `--runtime claude-cli`, so no interpreter loads
+both MCP majors. For LiteLLM consensus models, see [`credentials.yaml`](../config-reference.md#credentialsyaml).
 
 > For a side-by-side comparison of all runtime backends, see the [runtime capability matrix](../runtime-capability-matrix.md).
 
@@ -117,7 +140,7 @@ uv run ouroboros run workflow --orchestrator seed.yaml
 
 ### "EventStore not initialized"
 
-The database will be created automatically at `~/.ouroboros/ouroboros.db`.
+The database will be created automatically at the active path shown by `ouroboros config show`.
 
 ## Cost
 
@@ -127,3 +150,17 @@ Using Claude Code as the runtime backend with a Pro or Max Plan means:
 - Typical simple tasks: 15-30 seconds
 - Complex multi-file tasks: 1-3 minutes
 > **Note:** Pro plan ($20/month) works but has lower usage limits. For long agentic workflows, **Max plan is recommended** to avoid hitting limits mid-session.
+
+## Active Conductor and Synapse
+
+Claude Agent SDK and persisted Claude worker sessions are proven Synapse
+`inform`/`after_turn` transports. Delivery resumes the same native session only
+after the current turn; resumability is not presented as live checkpoint
+`redirect`, and hard `replace` remains unsupported.
+
+The main Claude conversation delegates exactly one read-only observer, stays
+available to the user, and relays current runtime/model, efficiency assurance,
+bounded Discover targets, dependency/parallel levels, first scheduled ACs,
+attention, and terminal assurance. It chooses an AC semantically without asking
+for internal IDs. Guidance is canonical English; the host responds naturally in
+the user's current conversation language.

@@ -7,15 +7,27 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 
+from ouroboros.runtime.child_env import (
+    DEFAULT_MAX_OUROBOROS_DEPTH,
+    DEFAULT_OUROBOROS_STRIP_KEYS,
+    build_child_env,
+)
+
 DEFAULT_CODEX_CLI_NAME = "codex"
-DEFAULT_MAX_OUROBOROS_DEPTH = 5
-DEFAULT_CODEX_CHILD_ENV_KEYS = ("OUROBOROS_AGENT_RUNTIME", "OUROBOROS_LLM_BACKEND")
+DEFAULT_CODEX_CHILD_ENV_KEYS = DEFAULT_OUROBOROS_STRIP_KEYS
 DEFAULT_CODEX_CHILD_SESSION_ENV_KEYS = ("CODEX_THREAD_ID",)
-_WRAPPER_MAGIC_HEADERS = (
+_COMPILED_BINARY_MAGIC_HEADERS = (
     b"\xcf\xfa\xed\xfe",  # Mach-O 64-bit
     b"\xce\xfa\xed\xfe",  # Mach-O 32-bit
     b"\x7fELF",  # ELF
 )
+_WRAPPER_SIGNATURES = (
+    b"zeude",
+    b"Zeude",
+    b"wrapper:codex",
+    b"codex-wrapper",
+)
+_WRAPPER_SIGNATURE_SCAN_BYTES = 128 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,13 +50,18 @@ def resolve_codex_cli_path(
 ) -> CodexCliResolution:
     """Resolve the safest Codex CLI path for nested automation.
 
-    When the configured candidate is a compiled wrapper (for example a Zeude
-    shim), prefer the next real ``codex`` binary on ``PATH`` instead.
+    When the configured candidate is a known compiled wrapper (for example a
+    Zeude shim), prefer the next real ``codex`` binary on ``PATH`` instead.
     """
     if explicit_cli_path is not None:
-        candidate = str(Path(explicit_cli_path).expanduser())
+        candidate = _normalize_cli_path_candidate(str(explicit_cli_path))
     else:
-        candidate = configured_cli_path or _which(default_cli_name) or default_cli_name
+        found = _which(default_cli_name) if not configured_cli_path else None
+        candidate = (
+            _normalize_cli_path_candidate(configured_cli_path)
+            if configured_cli_path
+            else _normalize_found_cli_path(found) or default_cli_name
+        )
 
     path = Path(candidate).expanduser()
     if not path.exists():
@@ -57,7 +74,7 @@ def resolve_codex_cli_path(
     logger.warning(
         f"{log_namespace}.cli_wrapper_detected",
         wrapper_path=resolved,
-        hint="Searching PATH for the real Node.js codex CLI.",
+        hint="Searching PATH for the real Codex CLI.",
     )
     fallback = find_real_cli(default_cli_name=default_cli_name, skip=resolved)
     if fallback is not None:
@@ -84,13 +101,23 @@ def resolve_codex_cli_path(
 
 
 def is_wrapper_binary(path: str) -> bool:
-    """Return True when *path* looks like a compiled wrapper."""
+    """Return True when *path* looks like a known compiled Codex wrapper.
+
+    Older Zeude-era shims were compiled binaries, but the official OpenAI
+    Codex CLI is now also shipped as a native Mach-O/ELF Rust binary. A binary
+    magic header alone is therefore not enough evidence that a candidate is a
+    wrapper. Require both a compiled-binary header and a wrapper-specific
+    marker string so official Rust binaries are treated as real CLI targets.
+    """
     try:
         with open(path, "rb") as fh:
-            magic = fh.read(4)
+            payload = fh.read(_WRAPPER_SIGNATURE_SCAN_BYTES)
     except OSError:
         return False
-    return magic in _WRAPPER_MAGIC_HEADERS
+
+    if len(payload) < 4 or payload[:4] not in _COMPILED_BINARY_MAGIC_HEADERS:
+        return False
+    return any(signature in payload for signature in _WRAPPER_SIGNATURES)
 
 
 def find_real_cli(*, default_cli_name: str = DEFAULT_CODEX_CLI_NAME, skip: str) -> str | None:
@@ -103,9 +130,9 @@ def find_real_cli(*, default_cli_name: str = DEFAULT_CODEX_CLI_NAME, skip: str) 
         resolved = Path(candidate).resolve()
         if resolved == skip_path:
             continue
-        if is_wrapper_binary(candidate):
+        if is_wrapper_binary(str(resolved)):
             continue
-        return candidate
+        return str(resolved)
     return None
 
 
@@ -117,25 +144,15 @@ def build_codex_child_env(
     depth_error_factory: Callable[[int, int], Exception],
 ) -> dict[str, str]:
     """Build an isolated environment for nested Codex subprocesses."""
-    env = dict(os.environ if base_env is None else base_env)
-    for key in DEFAULT_CODEX_CHILD_ENV_KEYS:
-        env.pop(key, None)
-    for key in child_session_env_keys:
-        env.pop(key, None)
-    # Strip CLAUDECODE so child codex does not detect the parent Codex/Claude
-    # session and hang or refuse to start.
-    env.pop("CLAUDECODE", None)
-
-    try:
-        depth = int(env.get("_OUROBOROS_DEPTH", "0")) + 1
-    except (ValueError, TypeError):
-        depth = 1
-
-    if depth > max_depth:
-        raise depth_error_factory(depth, max_depth)
-
-    env["_OUROBOROS_DEPTH"] = str(depth)
-    return env
+    return build_child_env(
+        base_env=base_env,
+        # Order preserved: Ouroboros markers, then Codex session keys, then
+        # CLAUDECODE (so child codex does not detect the parent Codex/Claude
+        # session and hang or refuse to start).
+        strip_keys=(*DEFAULT_CODEX_CHILD_ENV_KEYS, *child_session_env_keys, "CLAUDECODE"),
+        max_depth=max_depth,
+        depth_error_factory=depth_error_factory,
+    )
 
 
 def _which(name: str) -> str | None:
@@ -147,6 +164,28 @@ def _which(name: str) -> str | None:
     import shutil
 
     return shutil.which(name)
+
+
+def _normalize_cli_path_candidate(candidate: str | None) -> str | None:
+    """Return a durable CLI path candidate for persisted or explicit overrides."""
+    if candidate is None:
+        return None
+    expanded = Path(candidate).expanduser()
+    if expanded.is_absolute():
+        return str(expanded)
+    if os.sep in candidate or (os.altsep is not None and os.altsep in candidate):
+        return str(expanded.resolve(strict=False))
+    found = _which(candidate)
+    if found:
+        return _normalize_found_cli_path(found)
+    return candidate
+
+
+def _normalize_found_cli_path(candidate: str | None) -> str | None:
+    """Return a durable absolute path for an executable discovered on PATH."""
+    if candidate is None:
+        return None
+    return str(Path(candidate).expanduser().resolve(strict=False))
 
 
 __all__ = [

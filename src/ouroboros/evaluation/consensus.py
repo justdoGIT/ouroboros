@@ -20,6 +20,7 @@ ensuring root cause resolution is important.
 import asyncio
 from dataclasses import dataclass, field
 import json
+import math
 import os
 
 from ouroboros.config import (
@@ -27,7 +28,9 @@ from ouroboros.config import (
     get_consensus_devil_model,
     get_consensus_judge_model,
     get_consensus_models,
+    get_llm_backend_for_role,
 )
+from ouroboros.config.model_selection import backend_model_selection
 from ouroboros.core.errors import ProviderError, ValidationError
 from ouroboros.core.ontology_aspect import AnalysisResult
 from ouroboros.core.types import Result
@@ -46,13 +49,9 @@ from ouroboros.events.evaluation import (
     create_stage3_completed_event,
     create_stage3_started_event,
 )
+from ouroboros.evolution.provider_usage import tracked_complete
 from ouroboros.providers.base import CompletionConfig, LLMAdapter, Message, MessageRole
 from ouroboros.strategies.devil_advocate import ConsensusContext, DevilAdvocateStrategy
-
-# Default models for consensus voting (Frontier tier)
-# Can be overridden via ConsensusConfig.models
-DEFAULT_CONSENSUS_MODELS: tuple[str, ...] = get_consensus_models()
-
 
 # Perspective labels for single-model fallback (same model, different prompts)
 SINGLE_MODEL_PERSPECTIVES: tuple[tuple[str, VoterRole, str], ...] = (
@@ -123,18 +122,34 @@ class ConsensusConfig:
     """Configuration for consensus evaluation.
 
     Attributes:
-        models: List of models to use for voting (at least 3)
+        models: Models to use for voting. When omitted, the consensus roster is
+            resolved for the consensus-role backend when the config is built.
+        backend: Backend the voters run on. Set when the roster is resolved
+            here; ``None`` for a caller-supplied roster.
         temperature: Sampling temperature
         max_tokens: Maximum tokens per response
         majority_threshold: Required majority ratio (default 2/3)
         diversity_required: Require different providers
     """
 
-    models: tuple[str, ...] = field(default_factory=get_consensus_models)
+    models: tuple[str, ...] | None = None
+    models_are_explicit: bool = field(default=False, init=False)
+    backend: str | None = field(default=None, init=False)
     temperature: float = 0.3
     max_tokens: int = 1024
     majority_threshold: float = 0.66  # 2/3 = 0.6666...
     diversity_required: bool = True
+
+    def __post_init__(self) -> None:
+        """Resolve implicit default models while preserving explicit caller pins."""
+        object.__setattr__(self, "models_are_explicit", self.models is not None)
+        if self.models is None:
+            # Restore the multi-model roster (config.consensus.models): consensus
+            # needs >=2 distinct voters, so collapsing to one model breaks voting
+            # (len(votes) < 2) and defeats cross-model diversity.
+            backend = get_llm_backend_for_role("consensus")
+            object.__setattr__(self, "backend", backend)
+            object.__setattr__(self, "models", get_consensus_models(backend))
 
 
 def _get_consensus_system_prompt() -> str:
@@ -174,6 +189,23 @@ def build_consensus_prompt(context: EvaluationContext) -> str:
 ```
 
 Cast your vote as a JSON object with: approved (boolean), confidence (0-1), and reasoning."""
+
+
+class _InvalidConfidence(ValueError):
+    """A present confidence is not a finite numeric value."""
+
+
+def _parse_confidence(value: object) -> float:
+    """Accept finite numeric confidence without coercing booleans or NaNs."""
+    if isinstance(value, bool):
+        raise _InvalidConfidence("confidence must be a finite number")
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _InvalidConfidence("confidence must be a finite number") from exc
+    if not math.isfinite(number):
+        raise _InvalidConfidence("confidence must be a finite number")
+    return max(0.0, min(1.0, number))
 
 
 def parse_vote_response(response_text: str, model: str) -> Result[Vote, ValidationError]:
@@ -217,15 +249,29 @@ def parse_vote_response(response_text: str, model: str) -> Result[Vote, Validati
             )
         )
 
+    approved = data["approved"]
+    if not isinstance(approved, bool):
+        return Result.err(
+            ValidationError(
+                f"'approved' must be a boolean in vote from {model}",
+                field="approved",
+                value=approved,
+            )
+        )
+
     try:
-        confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
+        confidence = _parse_confidence(data.get("confidence", 0.5))
         return Result.ok(
             Vote(
                 model=model,
-                approved=bool(data["approved"]),
+                approved=approved,
                 confidence=confidence,
                 reasoning=str(data.get("reasoning", "No reasoning provided")),
             )
+        )
+    except _InvalidConfidence as e:
+        return Result.err(
+            ValidationError(f"Invalid confidence in vote from {model}: {e}", field="confidence")
         )
     except (TypeError, ValueError) as e:
         return Result.err(
@@ -290,10 +336,21 @@ class ConsensusEvaluator:
     def _should_use_multi_model(self) -> bool:
         """Determine whether to use multi-model or single-model mode.
 
-        Uses multi-model when:
+        Uses single-model perspectives when the roster was resolved for a
+        tier-alias backend (the Claude CLI family) and names one model in every
+        slot, as the automatic roster does: three votes from one model add no
+        diversity, so it comes from the perspective prompts instead. Otherwise
+        uses multi-model when:
         - Models are NOT openrouter/* (custom models, tests), OR
         - OPENROUTER_API_KEY is properly configured
         """
+        assert self._config.models is not None
+        if (
+            not self._config.models_are_explicit
+            and len(set(self._config.models)) == 1
+            and backend_model_selection(self._config.backend) == "alias"
+        ):
+            return False
         needs_openrouter = any(m.startswith("openrouter/") for m in self._config.models)
         if not needs_openrouter:
             return True  # Custom models (e.g., tests) — use as-is
@@ -306,7 +363,28 @@ class ConsensusEvaluator:
     ) -> Result[tuple[ConsensusResult, list[BaseEvent]], ProviderError | ValidationError]:
         """Multi-model consensus: each model votes independently."""
         events: list[BaseEvent] = []
+        assert self._config.models is not None
         models = list(self._config.models)
+
+        # PR-X X2: keep the executor's own vendor out of the jury when an
+        # independent alternative is actually configured. A no-op when the
+        # executor backend is unknown or only one vendor is installed.
+        reviewer_independence: str | None = None
+        if context.executor_backend:
+            from ouroboros.evaluation.reviewer_independence import (
+                resolve_reviewer_independence,
+            )
+            from ouroboros.orchestrator.runtime_picker import available_runtime_backends
+
+            independence = resolve_reviewer_independence(
+                context.executor_backend,
+                models,
+                available_runtime_backends(),
+                voter_backend=self._config.backend,
+            )
+            reviewer_independence = independence.status
+            if independence.filtered_voters:
+                models = list(independence.filtered_voters)
 
         events.append(
             create_stage3_started_event(
@@ -332,6 +410,8 @@ class ConsensusEvaluator:
                 errors.append(f"{model}: {result}")
                 continue
             if result.is_err:
+                if isinstance(result.error, ValidationError) and result.error.field == "confidence":
+                    return Result.err(result.error)
                 errors.append(f"{model}: {result.error.message}")
                 continue
             votes.append(result.value)
@@ -344,7 +424,13 @@ class ConsensusEvaluator:
                 )
             )
 
-        return self._build_consensus(context, votes, events, is_single_model=False)
+        return self._build_consensus(
+            context,
+            votes,
+            events,
+            is_single_model=False,
+            reviewer_independence=reviewer_independence,
+        )
 
     async def _evaluate_single_model(
         self,
@@ -383,6 +469,8 @@ class ConsensusEvaluator:
                 errors.append(f"{label}: {result}")
                 continue
             if result.is_err:
+                if isinstance(result.error, ValidationError) and result.error.field == "confidence":
+                    return Result.err(result.error)
                 errors.append(f"{label}: {result.error.message}")
                 continue
             votes.append(result.value)
@@ -395,7 +483,17 @@ class ConsensusEvaluator:
                 )
             )
 
-        return self._build_consensus(context, votes, events, is_single_model=True)
+        # Single-model perspectives are the same vendor by construction, so there
+        # is no independent reviewer to claim (PR-X X2).
+        from ouroboros.evaluation.reviewer_independence import UNAVAILABLE
+
+        return self._build_consensus(
+            context,
+            votes,
+            events,
+            is_single_model=True,
+            reviewer_independence=UNAVAILABLE,
+        )
 
     async def _get_perspective_vote(
         self,
@@ -415,12 +513,13 @@ class ConsensusEvaluator:
 
         config = CompletionConfig(
             model="",  # Use adapter's default model
+            role="consensus_perspective",
             temperature=self._config.temperature,
             max_tokens=self._config.max_tokens,
             response_format={"type": "json_schema", "json_schema": VOTE_SCHEMA},
         )
 
-        llm_result = await self._llm.complete(messages, config)
+        llm_result = await tracked_complete(self._llm, messages, config)
         if llm_result.is_err:
             return Result.err(llm_result.error)
 
@@ -447,6 +546,7 @@ class ConsensusEvaluator:
         events: list[BaseEvent],
         *,
         is_single_model: bool,
+        reviewer_independence: str | None = None,
     ) -> Result[tuple[ConsensusResult, list[BaseEvent]], ProviderError | ValidationError]:
         """Build ConsensusResult from collected votes."""
         approving = sum(1 for v in votes if v.approved)
@@ -460,6 +560,7 @@ class ConsensusEvaluator:
             majority_ratio=majority_ratio,
             disagreements=disagreements,
             is_single_model=is_single_model,
+            reviewer_independence=reviewer_independence,
         )
 
         events.append(
@@ -498,12 +599,14 @@ class ConsensusEvaluator:
         """
         config = CompletionConfig(
             model=model,
+            role="consensus_vote",
+            model_is_explicit=self._config.models_are_explicit,
             temperature=self._config.temperature,
             max_tokens=self._config.max_tokens,
             response_format={"type": "json_schema", "json_schema": VOTE_SCHEMA},
         )
 
-        llm_result = await self._llm.complete(messages, config)
+        llm_result = await tracked_complete(self._llm, messages, config)
         if llm_result.is_err:
             return Result.err(llm_result.error)
 
@@ -537,11 +640,29 @@ class DeliberativeConfig:
         max_tokens: Maximum tokens per response
     """
 
-    advocate_model: str = field(default_factory=get_consensus_advocate_model)
-    devil_model: str = field(default_factory=get_consensus_devil_model)
-    judge_model: str = field(default_factory=get_consensus_judge_model)
+    advocate_model: str | None = None
+    devil_model: str | None = None
+    judge_model: str | None = None
+    advocate_model_is_explicit: bool = field(default=False, init=False)
+    devil_model_is_explicit: bool = field(default=False, init=False)
+    judge_model_is_explicit: bool = field(default=False, init=False)
     temperature: float = 0.3
     max_tokens: int = 2048
+
+    def __post_init__(self) -> None:
+        """Resolve implicit default models while preserving explicit caller pins."""
+        object.__setattr__(self, "advocate_model_is_explicit", self.advocate_model is not None)
+        object.__setattr__(self, "devil_model_is_explicit", self.devil_model is not None)
+        object.__setattr__(self, "judge_model_is_explicit", self.judge_model is not None)
+        # Distinct advocate/devil/judge models: deliberation depends on
+        # cross-model disagreement, so all three must not collapse to one model.
+        backend = get_llm_backend_for_role("consensus")
+        if self.advocate_model is None:
+            object.__setattr__(self, "advocate_model", get_consensus_advocate_model(backend))
+        if self.devil_model is None:
+            object.__setattr__(self, "devil_model", get_consensus_devil_model(backend))
+        if self.judge_model is None:
+            object.__setattr__(self, "judge_model", get_consensus_judge_model(backend))
 
 
 def _parse_judgment_response(
@@ -605,7 +726,7 @@ def _parse_judgment_response(
         )
 
     try:
-        confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
+        confidence = _parse_confidence(data.get("confidence", 0.5))
         conditions = data.get("conditions")
         if conditions is not None:
             conditions = tuple(str(c) for c in conditions)
@@ -617,6 +738,10 @@ def _parse_judgment_response(
                 reasoning=str(data.get("reasoning", "No reasoning provided")),
                 conditions=conditions,
             )
+        )
+    except _InvalidConfidence as e:
+        return Result.err(
+            ValidationError(f"Invalid confidence in judgment from {model}: {e}", field="confidence")
         )
     except (TypeError, ValueError) as e:
         return Result.err(
@@ -663,9 +788,11 @@ class DeliberativeConsensus:
         """
         self._llm = llm_adapter
         self._config = config or DeliberativeConfig()
+        assert self._config.devil_model is not None
         self._devil_strategy = devil_strategy or DevilAdvocateStrategy(
             llm_adapter=llm_adapter,
             model=self._config.devil_model,
+            model_is_explicit=self._config.devil_model_is_explicit,
             temperature=self._config.temperature,
             max_tokens=self._config.max_tokens,
         )
@@ -790,6 +917,7 @@ class DeliberativeConsensus:
             # Advocate uses direct LLM call with role-specific prompt
             system_prompt = _get_advocate_system_prompt()
             model = self._config.advocate_model
+            assert model is not None
 
             messages = [
                 Message(role=MessageRole.SYSTEM, content=system_prompt),
@@ -798,12 +926,14 @@ class DeliberativeConsensus:
 
             config = CompletionConfig(
                 model=model,
+                role="consensus_advocate",
+                model_is_explicit=self._config.advocate_model_is_explicit,
                 temperature=self._config.temperature,
                 max_tokens=self._config.max_tokens,
                 response_format={"type": "json_schema", "json_schema": VOTE_SCHEMA},
             )
 
-            llm_result = await self._llm.complete(messages, config)
+            llm_result = await tracked_complete(self._llm, messages, config)
             if llm_result.is_err:
                 return Result.err(llm_result.error)
 
@@ -937,17 +1067,21 @@ Based on both positions above, make your final judgment."""
             Message(role=MessageRole.USER, content=user_prompt),
         ]
 
+        assert self._config.judge_model is not None
         config = CompletionConfig(
             model=self._config.judge_model,
+            role="consensus_judge",
+            model_is_explicit=self._config.judge_model_is_explicit,
             temperature=self._config.temperature,
             max_tokens=self._config.max_tokens,
             response_format={"type": "json_schema", "json_schema": JUDGMENT_SCHEMA},
         )
 
-        llm_result = await self._llm.complete(messages, config)
+        llm_result = await tracked_complete(self._llm, messages, config)
         if llm_result.is_err:
             return Result.err(llm_result.error)
 
+        assert self._config.judge_model is not None
         return _parse_judgment_response(llm_result.value.content, self._config.judge_model)
 
 

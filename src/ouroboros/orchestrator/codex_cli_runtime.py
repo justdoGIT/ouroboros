@@ -3,40 +3,89 @@
 from __future__ import annotations
 
 import asyncio
-import codecs
 from collections import deque
 from collections.abc import AsyncIterator, Mapping
 import contextlib
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shlex
+import subprocess  # noqa: F401  # compatibility: tests patch this shared module
+import sys
 import tempfile
+import tomllib
 from typing import Any
 
 from ouroboros.codex.cli_policy import (
     DEFAULT_CODEX_CHILD_SESSION_ENV_KEYS,
     DEFAULT_MAX_OUROBOROS_DEPTH,
-    build_codex_child_env,
     resolve_codex_cli_path,
 )
+from ouroboros.codex.runtime_profile import resolve_codex_profile
 from ouroboros.codex_permissions import (
     build_codex_exec_permission_args,
     resolve_codex_permission_mode,
 )
 from ouroboros.config import get_codex_cli_path
 from ouroboros.core.errors import ProviderError
+from ouroboros.core.session_signal import SessionSignalCapabilities
+from ouroboros.core.text import truncate_with_ellipsis
 from ouroboros.core.types import Result
 from ouroboros.observability.logging import get_logger
 from ouroboros.orchestrator.adapter import (
+    _CODEX_BACKENDS,
+    FULL_CAPABILITIES,
     AgentMessage,
+    ParamSupport,
+    ResolvedWorkerCwd,
+    RuntimeCapabilities,
     RuntimeHandle,
     SkillDispatchHandler,
+    SubagentOrchestration,
     TaskResult,
+    resolve_worker_cwd,
+    worker_cwd_failure_message,
 )
+from ouroboros.orchestrator.cli_version_attestation import (
+    CliExecutableVersionAttestation,
+    CliExecutableVersionState,
+    compare_cli_executable_version_attestations,
+    is_unavailable_attestation_error,
+    probe_cli_executable_version_attestation,
+    read_cli_executable_content_identity,
+    read_cli_executable_filesystem_identity,
+    read_cli_executable_resolution_chain_identity,
+    verify_cli_executable_identity_unchanged,
+)
+from ouroboros.orchestrator.codex_instruction_assets import (
+    update_codex_instruction_asset_fingerprint,
+)
+from ouroboros.orchestrator.frugality_runtime_attestation import (
+    attested_codex_child_environment,
+    build_codex_runtime_child_environment,
+    clear_attested_codex_child_environment,
+    codex_cli_runtime_attestation,
+)
+from ouroboros.orchestrator.interview_session import (
+    InterviewSessionTransition,
+    interview_transition_digest,
+)
+from ouroboros.orchestrator.runtime_drift import DRIFT_EPOCH_UNKNOWN, RuntimeDriftLedger
+from ouroboros.orchestrator.runtime_model_errors import safe_retry_metadata
+from ouroboros.orchestrator.skill_tool_mapping import discover_skill_tool_mappings
+from ouroboros.orchestrator.tooling_guidance import render_tooling_guidance
+from ouroboros.providers.base import CompletionConfig
+from ouroboros.providers.codex_cli_stream import (
+    iter_runtime_stream_lines,
+    parse_json_event,
+    terminate_runtime_process,
+)
+from ouroboros.providers.profiles import resolve_completion_profile
 from ouroboros.router import (
     InvalidInputReason,
     InvalidSkill,
@@ -52,24 +101,193 @@ _TOP_LEVEL_EVENT_MESSAGE_TYPES: dict[str, str] = {
     "error": "assistant",
 }
 
-_INTERVIEW_SESSION_METADATA_KEY = "ouroboros_interview_session_id"
+# ``codex exec --json`` does not currently promise an effective-model field on
+# every event.  Accept a model only when a lifecycle event reports one itself;
+# never infer it from a configured profile, a requested command argument, or
+# arbitrary item metadata.  That distinction keeps automatic mode honest when
+# a Codex version does not disclose the model it selected.
+_MODEL_REPORT_EVENT_TYPES = frozenset(
+    {
+        "thread.started",
+        "turn.started",
+        "turn.completed",
+        "session.started",
+        "session.updated",
+        "run.started",
+        "run.completed",
+    }
+)
+_MODEL_REPORT_KEYS = (
+    "effective_model",
+    "selected_model",
+    "resolved_model",
+    "model_id",
+    "model",
+)
+
+# Token-usage keys Codex's ``turn.completed`` event may carry. Kept in sync by
+# convention with the adapter's ``_USAGE_TOKEN_KEYS`` (a tiny duplicated helper,
+# not a shared module, per the token-attribution seam design).
+_USAGE_TOKEN_KEYS: tuple[str, ...] = (
+    "input_tokens",
+    "output_tokens",
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "total_tokens",
+)
+
+
+def _normalized_usage(obj: object) -> dict[str, int | float] | None:
+    """Extract a plain dict of finite numeric token counts from a usage payload.
+
+    Reads only the known token keys (:data:`_USAGE_TOKEN_KEYS`) from either a
+    ``Mapping`` or an attribute-bearing object. If any present known key is not a
+    finite, non-negative ``int``/``float`` (bools rejected), the entire payload is
+    rejected. Silently retaining only the valid half of a partially corrupted
+    usage object can undercount spend and create a false frugality proof. Returns
+    ``None`` when the payload is malformed or carries no known counters. Never
+    raises.
+    """
+    if obj is None:
+        return None
+    missing = object()
+    result: dict[str, int | float] = {}
+    for key in _USAGE_TOKEN_KEYS:
+        if isinstance(obj, Mapping):
+            if key not in obj:
+                continue
+            value = obj.get(key)
+        else:
+            try:
+                value = getattr(obj, key, missing)
+            except Exception:
+                return None
+            if value is missing:
+                continue
+        if value is None or isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            number = float(value)
+        except (OverflowError, TypeError, ValueError):
+            return None
+        if not math.isfinite(number) or number < 0:
+            return None
+        result[key] = value
+    return result or None
+
 
 _SAFE_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+# Effort levels Codex's ``model_reasoning_effort`` config key accepts. Used to
+# allow-list the value forwarded via ``-c model_reasoning_effort=<level>`` so an
+# unexpected effort string can never be injected into the override (RFC #1405).
+_CODEX_REASONING_EFFORT_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
 _MAX_LINE_BUFFER_BYTES = 50 * 1024 * 1024  # 50 MB
+_RUNTIME_PROFILE_ROLE_PREFIX = "agent_runtime"
+_RUNTIME_PROFILE_METADATA_KEYS = (
+    "llm_profile",
+    "ouroboros_profile",
+    "agent_runtime_profile",
+)
+_RUNTIME_CODEX_PROFILE_METADATA_KEYS = (
+    "codex_profile",
+    "codex_cli_profile",
+)
+
+# Codex thread-item types that map onto the shared tool lifecycle
+# (``item.started`` → tool start, ``item.completed`` → tool result). See
+# issues #1690/#1724: both halves must be projected as a correlated pair so
+# the deliver gate can prove tool completions.
+_TOOL_LIFECYCLE_ITEM_TYPES = frozenset(
+    {"command_execution", "mcp_tool_call", "file_change", "web_search"}
+)
+_TOOL_STARTED_RUNTIME_EVENT_TYPE = "tool.started"
+_SENSITIVE_META_KEY_RE = re.compile(
+    r"(authorization|api[_-]?key|token|secret|password|passwd|credential|"
+    r"private[_-]?key|session[_-]?token|bearer|cookie)",
+    re.IGNORECASE,
+)
+_TOOL_RESULT_RUNTIME_EVENT_TYPE = "tool.result"
+# Containers that may hold nested command-result metadata on a thread item.
+# Shared by ``_extract_command_metadata`` and the fail-closed success resolver.
+_ITEM_METADATA_CONTAINER_KEYS = ("output", "result", "metadata", "data")
+# Explicit status strings. Anything outside both sets is treated as unknown
+# and produces no success claim (fail closed, #1692 review blocker 1).
+_ITEM_FAILURE_STATUSES = frozenset(
+    {
+        "failed",
+        "failure",
+        "error",
+        "errored",
+        # Non-success terminal states: a cancelled or interrupted item must
+        # never be laundered into success by a stale nested completed status.
+        "cancelled",
+        "declined",
+        "canceled",
+        "aborted",
+        "interrupted",
+        "killed",
+        "timeout",
+        "timed_out",
+    }
+)
+_ITEM_SUCCESS_STATUSES = frozenset({"completed", "success", "succeeded"})
+
+
+_CliExecutableVersionState = CliExecutableVersionState
+_CliExecutableVersionAttestation = CliExecutableVersionAttestation
+
+
+@dataclass(frozen=True, slots=True)
+class _CodexToolCall:
+    """One normalized tool invocation derived from a Codex thread item."""
+
+    tool_name: str
+    start_content: str
+    tool_call_id: str | None
+    tool_input: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class _CodexItemCorrelationScope:
+    """Per-stream correlation state for Codex item lifecycle pairing.
+
+    Each streamed Codex process gets its own scope so parallel or sequential
+    ACs sharing one adapter can never suppress another stream's synthetic
+    start with stale item ids. The scope is cleared on a ``thread.started``
+    event only when the thread identity actually changes, so an exact
+    same-thread header replay does not orphan in-flight starts.
+    """
+
+    started_item_signatures: dict[str, str] = field(default_factory=dict)
+    unkeyed_started_nonces: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+    completed_item_keys: set[str] = field(default_factory=set)
+    current_thread_id: str | None = None
+    # Drift epoch this invocation was admitted under (set after command build).
+    admitted_drift_epoch: int | None = None
+    _nonce_seq: int = 0
+
+    def allocate_nonce(self) -> str:
+        """Return a monotonic, scope-unique correlation nonce for id-less items."""
+        self._nonce_seq += 1
+        return f"syn:{self._nonce_seq}"
+
+    def clear(self) -> None:
+        self.started_item_signatures.clear()
+        self.unkeyed_started_nonces.clear()
+        self.completed_item_keys.clear()
 
 
 class CodexCliRuntime:
     """Agent runtime that shells out to the locally installed Codex CLI."""
 
-    _runtime_handle_backend = "codex_cli"
-    _runtime_backend = "codex"
+    _runtime_handle_backend, _runtime_backend = "codex_cli", "codex"
     _requires_memory_gate = True
-    _provider_name = "codex_cli"
-    _runtime_error_type = "CodexCliError"
+    _provider_name, _runtime_error_type = "codex_cli", "CodexCliError"
     _log_namespace = "codex_cli_runtime"
     _display_name = "Codex CLI"
-    _default_cli_name = "codex"
-    _default_llm_backend = "codex"
+    _default_cli_name, _default_llm_backend = "codex", "codex"
+    _exec_session_flags: tuple[str, ...] = ()  # ("--ephemeral",): keep no session on disk
     _tempfile_prefix = "ouroboros-codex-"
     _skills_package_uri = "packaged://ouroboros.codex/skills"
     _process_shutdown_timeout_seconds = 5.0
@@ -79,25 +297,108 @@ class CodexCliRuntime:
     _stdout_idle_timeout_seconds = 300.0
     _max_stderr_lines = 512
     _child_session_env_keys = DEFAULT_CODEX_CHILD_SESSION_ENV_KEYS
+    _use_process_group = os.name == "posix"
+    _completed_process_group_shutdown_timeout_seconds = 0.2
+    frugality_runtime_attestation = codex_cli_runtime_attestation
+    frugality_runtime_attestation_complete = clear_attested_codex_child_environment
 
     def __init__(
         self,
         cli_path: str | Path | None = None,
         permission_mode: str | None = None,
         model: str | None = None,
-        cwd: str | Path | None = None,
+        cwd: str | Path | ResolvedWorkerCwd | None = None,
         skills_dir: str | Path | None = None,
         skill_dispatcher: SkillDispatchHandler | None = None,
         llm_backend: str | None = None,
+        runtime_profile: str | None = None,
+        startup_output_timeout_seconds: float | None = None,
+        stdout_idle_timeout_seconds: float | None = None,
     ) -> None:
         self._cli_path = self._resolve_cli_path(cli_path)
         self._permission_mode = self._resolve_permission_mode(permission_mode)
         self._model = model
-        self._cwd = str(Path(cwd).expanduser()) if cwd is not None else os.getcwd()
+        self._cwd = resolve_worker_cwd(cwd)
         self._skills_dir = self._resolve_skills_dir(skills_dir)
         self._skill_dispatcher = skill_dispatcher
+        self._skill_dispatcher_identity = self._fingerprint_skill_dispatcher(skill_dispatcher)
         self._llm_backend = llm_backend or self._default_llm_backend
         self._builtin_mcp_handlers: dict[str, Any] | None = None
+        self._runtime_profile = runtime_profile
+        self._codex_profile = resolve_codex_profile(
+            runtime_profile,
+            logger=log,
+            log_namespace=self._log_namespace,
+        )
+        snapshots_cli_execution_identity = self._runtime_backend in {
+            "codex",
+            "copilot",
+            "gemini",
+            "goose",
+            "grok",
+        }
+        self._snapshot_cli_executable_identity(enabled=snapshots_cli_execution_identity)
+        # Freeze the role-default model/profile once per runtime. Without this,
+        # every ``codex exec`` call re-reads mutable profile config, so a long
+        # run (or its resume) can silently switch models while the persisted
+        # execution identity still describes the earlier resolution.
+        if self._runtime_backend == "codex":
+            (
+                self._resolved_fallback_model,
+                self._resolved_fallback_profile,
+                self._resolved_fallback_reasoning_effort,
+            ) = self._resolve_runtime_codex_config_uncached(None)
+            # Freeze both layers that can retarget a Codex command without
+            # changing its visible --profile name: Ouroboros role/profile
+            # resolution and Codex's own global/profile TOML files. The values
+            # are hashes only; secrets or provider configuration never enter
+            # events. Resume compares the hashes, and command construction
+            # checks them again before consulting any role-dependent fallback.
+            self._profile_resolution_fingerprint = self._fingerprint_profile_resolution_config()
+            self._codex_profile_v2_names = self._codex_profile_v2_names_from_ouroboros_config()
+            self._codex_project_trust_baseline = self._read_codex_project_trust_levels()
+            self._codex_config_fingerprint = self._fingerprint_codex_config_files()
+            self._skill_dispatch_registry_fingerprint = self._fingerprint_skill_dispatch_registry()
+            self._builtin_mcp_handler_registry_fingerprint = (
+                self._fingerprint_builtin_mcp_handler_registry()
+            )
+            self._runtime_handle_profile_fingerprints: dict[str, str] = {}
+            self._runtime_handle_codex_config_fingerprints: dict[str, str] = {}
+            self._runtime_handle_resolved_routing: dict[
+                str, tuple[str | None, str | None, str | None]
+            ] = {}
+        else:
+            # Subclasses reuse the process/session machinery but implement
+            # their own model/config semantics. Do not make their construction
+            # depend on an unrelated Codex agent_runtime profile.
+            self._resolved_fallback_model = None
+            self._resolved_fallback_profile = None
+            self._resolved_fallback_reasoning_effort = None
+            self._profile_resolution_fingerprint = None
+            self._codex_config_fingerprint = None
+            self._codex_profile_v2_names = set()
+            self._codex_project_trust_baseline = None
+            self._skill_dispatch_registry_fingerprint = None
+            self._builtin_mcp_handler_registry_fingerprint = None
+            self._runtime_handle_profile_fingerprints = {}
+            self._runtime_handle_codex_config_fingerprints = {}
+            self._runtime_handle_resolved_routing = {}
+        # Drift of frozen authority inputs is observed, not fatal (runtime_drift.py).
+        self._drift = RuntimeDriftLedger(runtime_backend=self._runtime_backend)
+        self._cli_attestation_unavailable_detail: str | None = None
+        # Item-lifecycle correlation state (#1690): item ids whose
+        # ``item.started`` was already projected as a tool start, so the
+        # matching ``item.completed`` never duplicates the start. Id-less
+        # legacy items are tracked by (item_type, signature) counts instead.
+        self._default_item_scope = _CodexItemCorrelationScope()
+        if startup_output_timeout_seconds is not None:
+            self._startup_output_timeout_seconds = (
+                None if startup_output_timeout_seconds <= 0 else startup_output_timeout_seconds
+            )
+        if stdout_idle_timeout_seconds is not None:
+            self._stdout_idle_timeout_seconds = (
+                None if stdout_idle_timeout_seconds <= 0 else stdout_idle_timeout_seconds
+            )
 
         log.info(
             f"{self._log_namespace}.initialized",
@@ -105,6 +406,10 @@ class CodexCliRuntime:
             permission_mode=permission_mode,
             model=model,
             cwd=self._cwd,
+            runtime_profile=runtime_profile,
+            codex_profile=self._codex_profile,
+            startup_output_timeout_seconds=self._startup_output_timeout_seconds,
+            stdout_idle_timeout_seconds=self._stdout_idle_timeout_seconds,
             skills_dir=(
                 str(self._skills_dir) if self._skills_dir is not None else self._skills_package_uri
             ),
@@ -115,6 +420,47 @@ class CodexCliRuntime:
     @property
     def runtime_backend(self) -> str:
         return self._runtime_handle_backend
+
+    @property
+    def capabilities(self) -> RuntimeCapabilities:
+        # Codex composes the system prompt and tool guidance into the user
+        # message rather than passing native runtime parameters; surface those
+        # as TRANSLATED while preserving the default feature flags.
+        # Reasoning effort IS enforced natively: ``codex exec`` accepts a
+        # per-invocation ``-c model_reasoning_effort=<level>`` override (see
+        # _build_command), so the orchestrator's chosen level is honored, not
+        # merely advised.
+        return replace(
+            FULL_CAPABILITIES,
+            system_prompt_support=ParamSupport.TRANSLATED,
+            tool_restriction_support=ParamSupport.TRANSLATED,
+            empty_tool_restriction_support=ParamSupport.IGNORED,
+            reasoning_effort_support=ParamSupport.NATIVE,
+            # Codex enforces only the allow-listed levels (see _build_command); a
+            # level outside this set is silently dropped, so declare the vocabulary
+            # to keep enforced/advised classification truthful.
+            enforceable_reasoning_efforts=_CODEX_REASONING_EFFORT_LEVELS,
+            # Model-tier override IS enforced natively: ``codex exec`` accepts a
+            # per-invocation ``--model`` (see _build_command), so a per-call model
+            # the orchestrator routes is honored, not merely advised. (The router's
+            # provider map is anthropic-only today, so codex is not yet routed —
+            # but the plumbing is truthful and ready.)
+            model_override_support=ParamSupport.NATIVE,
+            # Codex can self-parallelize inside a session, but ``codex mcp-server``
+            # exposes only ``codex`` / ``codex-reply`` — its native multi-agent
+            # team tools are not reachable by an external driver. So ouroboros can
+            # reuse/continue a Codex thread but cannot orchestrate Codex children;
+            # sub-agent fan-out stays in-process. See SubagentOrchestration.
+            subagent_orchestration=SubagentOrchestration.INTERNAL,
+            # ``codex exec resume <thread-id>`` re-enters one exact persisted
+            # thread. Synapse only drains signals after the current turn has
+            # completed, so this capability does not claim live interruption.
+            session_signals=SessionSignalCapabilities(
+                inform_delivery=True,
+                background_reply=True,
+                after_turn_delivery=True,
+            ),
+        )
 
     @property
     def llm_backend(self) -> str | None:
@@ -145,6 +491,7 @@ class CodexCliRuntime:
         return build_codex_exec_permission_args(
             self._permission_mode,
             default_mode="acceptEdits",
+            source=f"{self._log_namespace}.agent_runtime",
         )
 
     def _get_configured_cli_path(self) -> str | None:
@@ -162,6 +509,63 @@ class CodexCliRuntime:
         )
         return resolution.cli_path
 
+    def _cli_executable_identity(self) -> str | None:
+        """Return the stable path of the executable selected for this runtime.
+
+        ``codex`` may be selected through PATH, an explicit configuration value,
+        or the wrapper fallback policy.  A bare command name is not durable:
+        another process can resolve it to a different binary after PATH changes.
+        Only an absolute, existing path may therefore authorize the automatic
+        (no ``--model``) Codex resume exception.  Keep the selected path itself
+        rather than dereferencing symlinks so two launch paths remain distinct
+        execution identities even when they currently point at the same target.
+        """
+        try:
+            candidate = Path(self._cli_path).expanduser()
+            if not candidate.is_absolute() or not candidate.exists():
+                return None
+            return str(candidate.absolute())
+        except (OSError, RuntimeError):
+            return None
+
+    def _cli_executable_version_identity(self) -> str | None:
+        """Hash the selected CLI's bytes and version response for safe resumes.
+
+        The absolute launch path distinguishes parallel installations, while
+        this value detects both in-place binary changes and version-visible
+        upgrades at that same path. A model-less automatic resume is
+        deliberately unavailable when the executable cannot provide a stable
+        version response or content digest.
+        """
+        return self._cli_executable_version_attestation().identity
+
+    def _cli_executable_version_attestation(
+        self,
+        initialized: _CliExecutableVersionAttestation | None = None,
+    ) -> _CliExecutableVersionAttestation:
+        """Return bounded evidence for one stable executable generation."""
+        return probe_cli_executable_version_attestation(
+            self._cli_executable_identity(),
+            initialized=initialized,
+            filesystem_identity=self._cli_executable_filesystem_identity,
+            resolution_chain_identity=self._cli_executable_resolution_chain_identity,
+            content_identity=self._cli_executable_content_identity,
+            hash_payload=self._hash_json_payload,
+        )
+
+    def _cli_executable_filesystem_identity(self) -> tuple[int, int] | None:
+        return read_cli_executable_filesystem_identity(self._cli_executable_identity())
+
+    def _cli_executable_resolution_chain_identity(self) -> tuple[tuple[object, ...], ...] | None:
+        return read_cli_executable_resolution_chain_identity(self._cli_executable_identity())
+
+    _compare_cli_executable_version_attestations = staticmethod(
+        compare_cli_executable_version_attestations
+    )
+
+    def _cli_executable_content_identity(self) -> str | None:
+        return read_cli_executable_content_identity(self._cli_executable_identity())
+
     def _resolve_skills_dir(self, skills_dir: str | Path | None) -> Path | None:
         """Resolve an optional explicit skill override directory for intercept metadata."""
         if skills_dir is None:
@@ -178,12 +582,972 @@ class CodexCliRuntime:
             return None
         return candidate
 
+    @staticmethod
+    def _normalize_runtime_reported_model(value: object) -> str | None:
+        """Accept one safe, machine-readable model identifier from Codex output."""
+        if not isinstance(value, str):
+            return None
+        candidate = value.strip()
+        # Model identifiers are protocol values, not user-facing text. Reject
+        # whitespace/control-containing values so arbitrary stream content can
+        # never be relabeled as the active model.
+        if not candidate or len(candidate) > 256 or any(char.isspace() for char in candidate):
+            return None
+        return candidate
+
+    @classmethod
+    def _runtime_reported_model(cls, event: Mapping[str, Any]) -> tuple[str, str] | None:
+        """Return an effective model explicitly reported by a Codex lifecycle event.
+
+        The command's ``--model`` is a requested pin, while profile/global
+        config is only an input to Codex's selection.  Neither is evidence of
+        what an automatic run actually used.  A model becomes *observed* only
+        when the runtime stream reports it on a lifecycle event.
+        """
+        event_type = event.get("type")
+        if not isinstance(event_type, str) or event_type not in _MODEL_REPORT_EVENT_TYPES:
+            return None
+
+        sources: tuple[tuple[str, Mapping[str, Any]], ...] = (("event", event),)
+        for container_key in ("session", "runtime", "metadata", "data"):
+            candidate = event.get(container_key)
+            if isinstance(candidate, Mapping):
+                sources += ((container_key, candidate),)
+
+        for source_name, source in sources:
+            for key in _MODEL_REPORT_KEYS:
+                model = cls._normalize_runtime_reported_model(source.get(key))
+                if model is not None:
+                    return model, f"runtime_stream:{event_type}:{source_name}.{key}"
+        return None
+
+    @staticmethod
+    def _command_requested_model(command: list[str]) -> str | None:
+        """Return the exact model handed to ``codex exec --model``, if any."""
+        try:
+            index = command.index("--model")
+        except ValueError:
+            return None
+        if index + 1 >= len(command):
+            return None
+        return CodexCliRuntime._normalize_runtime_reported_model(command[index + 1])
+
+    @classmethod
+    def _initial_model_observation(cls, command: list[str]) -> dict[str, str | None]:
+        """Describe the selection state before any runtime model report arrives."""
+        requested_model = cls._command_requested_model(command)
+        if requested_model is not None:
+            return {
+                "mode": "pinned",
+                "status": "requested",
+                "requested_model": requested_model,
+                "effective_model": None,
+                "source": "command:--model",
+            }
+        return {
+            "mode": "automatic",
+            "status": "unreported",
+            "requested_model": None,
+            "effective_model": None,
+            "source": None,
+        }
+
+    @staticmethod
+    def _observed_model_observation(
+        previous: Mapping[str, str | None],
+        *,
+        model: str,
+        source: str,
+    ) -> dict[str, str | None]:
+        """Upgrade selection metadata only from a runtime-reported model."""
+        return {
+            "mode": previous.get("mode"),
+            "status": "observed",
+            "requested_model": previous.get("requested_model"),
+            "effective_model": model,
+            "source": source,
+        }
+
+    @staticmethod
+    def _hash_json_payload(payload: object) -> str:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _fingerprint_profile_resolution_config(
+        self,
+        runtime_handle: RuntimeHandle | None = None,
+    ) -> str:
+        """Hash only Ouroboros profile fields that can alter a Codex command."""
+        return self._observe_profile_resolution_config(runtime_handle)[0]
+
+    def _observe_profile_resolution_config(
+        self,
+        runtime_handle: RuntimeHandle | None = None,
+    ) -> tuple[str, bool]:
+        """Return (fingerprint, loadable); an unloadable config is never adopted as routing."""
+        from ouroboros.providers import profiles as profile_module
+
+        try:
+            config = profile_module.load_config()
+        except Exception as exc:
+            # Role resolution also falls back when config loading fails. Keep
+            # that state stable without persisting path-rich error messages.
+            return (
+                self._hash_json_payload({"version": 1, "load_error": type(exc).__name__}),
+                False,
+            )
+
+        relevant_role_profiles: dict[str, str] = {}
+        relevant_profile_names: set[str] = set()
+        if isinstance(self._runtime_profile, str) and self._runtime_profile.strip():
+            relevant_profile_names.add(self._runtime_profile.strip())
+        handle_profile = self._runtime_profile_from_metadata(runtime_handle)
+        if handle_profile:
+            relevant_profile_names.add(handle_profile)
+        for role, role_profile in sorted(config.llm_role_profiles.items()):
+            if role_profile:
+                relevant_role_profiles[role] = role_profile
+                relevant_profile_names.add(role_profile)
+
+        # Runtime handles may select `llm_profile` directly through metadata.
+        # After runtime recreation the process-local handle cache is empty, so
+        # the durable identity must already cover every handle-selectable
+        # semantic profile, including provider-neutral profiles that only carry
+        # top-level model / reasoning settings and no Codex provider mapping.
+        relevant_profile_names.update(config.llm_profiles)
+
+        profiles: dict[str, object] = {}
+        for name, profile in sorted(config.llm_profiles.items()):
+            if name not in relevant_profile_names:
+                continue
+            ordered_codex_providers: list[tuple[str, dict[str, str | None]]] = []
+            for key, provider in profile.providers.items():
+                if key.strip().lower() not in {"codex", "codex_cli"}:
+                    continue
+                provider_contract: dict[str, str | None] = {
+                    "model": provider.model,
+                    "profile": provider.profile,
+                }
+                # Retain the v1 identity when the newly introduced field is
+                # dormant. Existing sessions persisted that older shape, and
+                # a null value changes no command-line behavior.
+                if provider.reasoning_effort is not None:
+                    provider_contract["reasoning_effort"] = provider.reasoning_effort
+                ordered_codex_providers.append((key, provider_contract))
+
+            if len(ordered_codex_providers) == 1:
+                _, contract = ordered_codex_providers[0]
+                codex_providers: object = {"codex": contract}
+            else:
+                # Multiple keys that normalize to Codex are an invalid profile
+                # state. Command resolution rejects it regardless of insertion
+                # order, so the durable fingerprint must represent the same
+                # invalid semantics order-independently instead of blocking
+                # resume for a no-op alias reorder.
+                codex_providers = {
+                    "invalid_duplicate_aliases": sorted(
+                        (
+                            {
+                                "normalized_backend": "codex",
+                                "config": contract,
+                            }
+                            for _, contract in ordered_codex_providers
+                        ),
+                        key=lambda item: json.dumps(item, sort_keys=True),
+                    )
+                }
+
+            profile_contract: dict[str, object] = {
+                "model": profile.model,
+                "providers": codex_providers,
+            }
+            if profile.reasoning_effort is not None:
+                profile_contract["reasoning_effort"] = profile.reasoning_effort
+            profiles[name] = profile_contract
+
+        return (
+            self._hash_json_payload(
+                {
+                    "version": 1,
+                    "llm_profiles": profiles,
+                    "llm_role_profiles": dict(sorted(relevant_role_profiles.items())),
+                }
+            ),
+            True,
+        )
+
+    @staticmethod
+    def _codex_home() -> Path:
+        from ouroboros.codex.home import resolve_codex_home
+
+        return resolve_codex_home()
+
+    @staticmethod
+    def _codex_profile_v2_names_from_ouroboros_config() -> set[str]:
+        """Return Codex profile-v2 names referenced by current Ouroboros profiles."""
+        from ouroboros.providers import profiles as profile_module
+
+        try:
+            config = profile_module.load_config()
+        except Exception:
+            return set()
+
+        names: set[str] = set()
+        for profile in config.llm_profiles.values():
+            for key, provider in profile.providers.items():
+                if key.strip().lower() not in {"codex", "codex_cli"}:
+                    continue
+                if isinstance(provider.profile, str) and provider.profile.strip():
+                    names.add(provider.profile.strip())
+        return names
+
+    def _read_codex_project_trust_levels(self) -> set[str] | None:
+        """Snapshot project trust state before Codex can mutate it on first use."""
+        config_path = self._codex_home() / "config.toml"
+        try:
+            parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            return None
+
+        projects = parsed.get("projects")
+        if not isinstance(projects, dict):
+            return {}
+        return {
+            self._canonical_codex_project_path(str(project_path))
+            for project_path, settings in projects.items()
+            if isinstance(settings, dict) and "trust_level" in settings
+        }
+
+    @staticmethod
+    def _canonical_codex_project_path(project_path: str) -> str:
+        """Match Codex project keys to the canonical cwd without weakening drift."""
+        candidate = Path(project_path).expanduser()
+        if not candidate.is_absolute():
+            return project_path
+        try:
+            return str(candidate.resolve(strict=False))
+        except (OSError, RuntimeError, ValueError):
+            return project_path
+
+    def _fingerprint_codex_config_files(
+        self,
+        runtime_handle: RuntimeHandle | None = None,
+    ) -> str:
+        """Hash global Codex config plus command-reachable profile-v2 TOML."""
+        codex_home = self._codex_home()
+        candidates: dict[str, Path] = {"config.toml": codex_home / "config.toml"}
+        for profile_name in self._codex_profile_v2_names:
+            filename = f"{profile_name}.config.toml"
+            candidates[filename] = codex_home / filename
+        handle_native_profile = self._codex_profile_from_metadata(runtime_handle)
+        handle_resolved_profile: str | None = None
+        if runtime_handle is not None and self._runtime_handle_has_profile_selection(
+            runtime_handle
+        ):
+            try:
+                _, handle_resolved_profile, _ = self._resolve_runtime_codex_config_uncached(
+                    runtime_handle
+                )
+            except Exception as exc:
+                raise RuntimeError("Cannot resolve Codex runtime profile configuration") from exc
+        for profile_name in {
+            self._codex_profile,
+            self._resolved_fallback_profile,
+            handle_native_profile,
+            handle_resolved_profile,
+        }:
+            if isinstance(profile_name, str) and profile_name.strip():
+                filename = f"{profile_name.strip()}.config.toml"
+                candidates[filename] = codex_home / filename
+        # Runtime handles may select `codex_profile` directly after a resume.
+        # Include all profile-v2 files so durable identity fails closed instead
+        # of accepting current contents as a fresh first command.
+        try:
+            for profile_path in codex_home.glob("*.config.toml"):
+                candidates.setdefault(profile_path.name, profile_path)
+        except OSError as exc:
+            raise RuntimeError("Cannot inspect Codex profile configuration") from exc
+
+        digest = hashlib.sha256()
+        digest.update(b"ouroboros-codex-config-v2\0")
+        # CODEX_HOME also owns the session database used by ``codex exec
+        # resume``. Identical profile files under a different home must not
+        # authorize reconnecting a persisted thread id in another store.
+        digest.update(str(codex_home.resolve(strict=False)).encode("utf-8"))
+        digest.update(b"\0")
+        for name, path in sorted(candidates.items()):
+            digest.update(name.encode("utf-8", errors="surrogateescape"))
+            digest.update(b"\0")
+            try:
+                stat_result = path.lstat()
+            except FileNotFoundError:
+                # Missing config ≡ only the exempt first-use trust entry.
+                digest.update(
+                    self._stable_global_codex_config_bytes(b"") + b"\0"
+                    if name == "config.toml"
+                    else b"missing\0"
+                )
+                continue
+            except OSError as exc:
+                raise RuntimeError("Cannot inspect Codex profile configuration") from exc
+
+            if path.is_symlink():
+                try:
+                    digest.update(b"symlink\0")
+                    digest.update(os.readlink(path).encode("utf-8", errors="surrogateescape"))
+                    digest.update(b"\0")
+                except OSError as exc:
+                    raise RuntimeError("Cannot inspect Codex profile configuration") from exc
+            if not path.is_file():
+                digest.update(f"non-file:{stat_result.st_mode}\0".encode("ascii"))
+                continue
+            try:
+                contents = path.read_bytes()
+            except OSError as exc:
+                raise RuntimeError("Cannot read Codex profile configuration") from exc
+            if name == "config.toml":
+                contents = self._stable_global_codex_config_bytes(contents)
+            elif name.endswith(".config.toml"):
+                contents = self._stable_codex_profile_config_bytes(contents)
+            digest.update(contents)
+            digest.update(b"\0")
+        for asset_name in ("rules", "skills"):
+            update_codex_instruction_asset_fingerprint(
+                digest,
+                codex_home / asset_name,
+                relative_name=asset_name,
+                ignore_direct_system=asset_name == "skills",
+            )
+        return digest.hexdigest()
+
+    @staticmethod
+    def _stable_codex_profile_config_bytes(contents: bytes) -> bytes:
+        """Canonicalize valid profile-v2 TOML for semantic drift checks."""
+        try:
+            parsed = tomllib.loads(contents.decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+            return contents
+        return json.dumps(
+            parsed,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            default=str,
+        ).encode("utf-8")
+
+    def _stable_global_codex_config_bytes(
+        self,
+        contents: bytes,
+        *,
+        reachable_profiles: set[str] | None = None,
+    ) -> bytes:
+        """Ignore Codex's automatic first-use trust entries, whichever project.
+
+        ``codex exec`` adds ``projects.<root>.trust_level = "trusted"`` the
+        first time it runs in a repository — keyed by the git MAIN repository
+        root, not the worktree cwd. That mutation cannot retarget a model,
+        profile, sandbox, or instruction asset, so it must not invalidate the
+        thread handle created by the same command. The same is true when the
+        entry is written by a *different* session: a concurrent ``ooo run``,
+        or the user running ``codex`` in another terminal, records trust for
+        its own repository and would otherwise fail every remaining AC of
+        this run instantly ("configuration changed"; observed live, 10/10
+        concurrent runs). Only an entry that is new relative to the baseline
+        and exactly ``trusted`` is exempt: an existing entry changing, a
+        non-trusted level, and every other project-scoped or global setting
+        remain authority-bearing drift.
+        """
+        try:
+            parsed = tomllib.loads(contents.decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+            return contents
+
+        projects = parsed.get("projects")
+        if isinstance(projects, dict):
+            retained_projects: dict[str, object] = {}
+            for project_path, raw_settings in projects.items():
+                if not isinstance(raw_settings, dict):
+                    retained_projects[str(project_path)] = raw_settings
+                    continue
+                project_key = str(project_path)
+                canonical_project_key = self._canonical_codex_project_path(project_key)
+                automatic_first_use_trust = (
+                    self._codex_project_trust_baseline is not None
+                    and canonical_project_key not in self._codex_project_trust_baseline
+                    and raw_settings.get("trust_level") == "trusted"
+                )
+                retained_settings = {
+                    str(key): value
+                    for key, value in raw_settings.items()
+                    if key != "trust_level" or not automatic_first_use_trust
+                }
+                if retained_settings:
+                    retained_projects[project_key] = retained_settings
+            if retained_projects:
+                parsed["projects"] = retained_projects
+            else:
+                parsed.pop("projects", None)
+
+        profiles = parsed.get("profiles")
+        if isinstance(profiles, dict):
+            resolved_reachable_profiles = reachable_profiles
+            retained_profiles = {
+                str(name): settings
+                for name, settings in profiles.items()
+                if resolved_reachable_profiles is None or str(name) in resolved_reachable_profiles
+            }
+            if retained_profiles:
+                parsed["profiles"] = retained_profiles
+            else:
+                parsed.pop("profiles", None)
+
+        return json.dumps(
+            parsed,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            default=str,
+        ).encode("utf-8")
+
+    def _runtime_handle_has_profile_selection(self, runtime_handle: RuntimeHandle) -> bool:
+        metadata = runtime_handle.metadata
+        if any(
+            isinstance(metadata.get(key), str) and bool(metadata[key].strip())
+            for key in (
+                *_RUNTIME_PROFILE_METADATA_KEYS,
+                *_RUNTIME_CODEX_PROFILE_METADATA_KEYS,
+                "llm_role",
+                "agent_runtime_role",
+                "session_role",
+            )
+        ):
+            return True
+        normalized_kind = (runtime_handle.kind or "").strip().lower().replace("-", "_")
+        return normalized_kind not in {"", _RUNTIME_PROFILE_ROLE_PREFIX}
+
+    def _runtime_handle_fingerprint_key(self, runtime_handle: RuntimeHandle | None) -> str | None:
+        if runtime_handle is None:
+            return None
+        if not self._runtime_handle_has_profile_selection(runtime_handle):
+            return None
+        selector = self.resume_handle_execution_identity_contract(runtime_handle)
+        return self._hash_json_payload(selector)
+
+    def _rebaseline_fingerprint(
+        self, attribute: str, current: str | None, *, kind: str, detail: str
+    ) -> None:
+        """Adopt ``current`` as the frozen baseline, observing drift if it moved."""
+        baseline = getattr(self, attribute)
+        if baseline is None:
+            if current is not None:
+                self._drift.observe("baseline_unavailable", f"{detail} was unavailable")
+                setattr(self, attribute, current)
+            return
+        if current != baseline:
+            self._drift.observe(kind, f"{detail} changed after initialization")
+            setattr(self, attribute, current)
+
+    def _reconcile_codex_config_files(
+        self,
+        runtime_handle: RuntimeHandle | None = None,
+    ) -> None:
+        """Re-baseline on Codex config drift instead of failing the AC."""
+        if self._runtime_backend != "codex":
+            return
+        key = self._runtime_handle_fingerprint_key(runtime_handle)
+        current = self._fingerprint_codex_config_files(runtime_handle if key is not None else None)
+        if key is not None:
+            previous = self._runtime_handle_codex_config_fingerprints.get(key)
+            if previous is None:
+                previous = self._codex_config_fingerprint
+                self._runtime_handle_codex_config_fingerprints[key] = previous
+            if current == previous:
+                return
+        elif current == self._codex_config_fingerprint:
+            return
+        self._drift.observe("codex_config", "Codex configuration changed after initialization")
+        self._codex_project_trust_baseline = self._read_codex_project_trust_levels()
+        self._codex_config_fingerprint = self._fingerprint_codex_config_files()
+        self._runtime_handle_codex_config_fingerprints = {}
+        if key is not None:
+            self._runtime_handle_codex_config_fingerprints[key] = (
+                self._fingerprint_codex_config_files(runtime_handle)
+            )
+
+    def _reconcile_cli_executable_identity(self) -> None:
+        """Re-attest on drift; unchanged unavailable evidence is reported once."""
+        try:
+            self._verify_cli_executable_identity_unchanged()
+        except RuntimeError as exc:
+            detail = str(exc)
+            unavailable = is_unavailable_attestation_error(detail)
+            # Unavailable evidence is one state however its message is
+            # phrased (check-time vs. re-snapshotted init-time wording).
+            if not (unavailable and self._cli_attestation_unavailable_detail is not None):
+                self._drift.observe(
+                    "baseline_unavailable" if unavailable else "cli_executable", detail
+                )
+            self._cli_attestation_unavailable_detail = detail if unavailable else None
+            self._snapshot_cli_executable_identity(enabled=True)
+        else:
+            self._cli_attestation_unavailable_detail = None
+
+    def _snapshot_cli_executable_identity(self, *, enabled: bool) -> None:
+        """Freeze (or re-freeze) the executable's path, content, and version identity."""
+        self._cli_executable_path_identity = self._cli_executable_identity() if enabled else None
+        self._cli_executable_content_identity_snapshot = (
+            self._cli_executable_content_identity() if enabled else None
+        )
+        self._cli_executable_version_attestation_snapshot = (
+            self._cli_executable_version_attestation() if enabled else None
+        )
+        self._cli_executable_version_identity_snapshot = (
+            self._cli_executable_version_attestation_snapshot.identity
+            if self._cli_executable_version_attestation_snapshot is not None
+            else None
+        )
+
+    def _verify_cli_executable_identity_unchanged(self) -> None:
+        """Raise on drift or unavailable version-attestation evidence."""
+        verify_cli_executable_identity_unchanged(
+            display_name=self._display_name,
+            cli_path=str(self._cli_path),
+            codex_native=self._runtime_backend == "codex",
+            path_identity_snapshot=self._cli_executable_path_identity,
+            content_identity_snapshot=self._cli_executable_content_identity_snapshot,
+            version_attestation_snapshot=self._cli_executable_version_attestation_snapshot,
+            current_path_identity=self._cli_executable_identity,
+            current_content_identity=self._cli_executable_content_identity,
+            current_version_attestation=self._cli_executable_version_attestation,
+        )
+
+    def _fingerprint_skill_dispatch_registry(self) -> str | None:
+        """Fingerprint the effective SKILL.md frontmatter dispatch registry."""
+        try:
+            mappings = discover_skill_tool_mappings(self._skills_dir)
+        except (OSError, ValueError):
+            return None
+        payload = [
+            {
+                "skill_name": mapping.skill_name,
+                "mcp_tool": mapping.mcp_tool,
+                "skill_path": mapping.skill_path,
+                "mcp_args": dict(mapping.mcp_args),
+                "context_keys": list(mapping.context_keys),
+            }
+            for mapping in mappings
+        ]
+        return self._hash_json_payload(payload)
+
+    def _fingerprint_skill_dispatcher(self, dispatcher: SkillDispatchHandler | None) -> str:
+        """Fingerprint the bound callable or packaged transition implementation."""
+        if dispatcher is None:
+            return f"packaged:{interview_transition_digest()}"
+        owner = getattr(dispatcher, "__self__", None)
+        stable_identity = getattr(owner, "stable_identity_contract", None)
+        if callable(stable_identity):
+            try:
+                identity = stable_identity()
+            except Exception:
+                identity = None
+            if isinstance(identity, Mapping):
+                return self._hash_json_payload(
+                    {
+                        "module": getattr(dispatcher, "__module__", None),
+                        "qualname": getattr(dispatcher, "__qualname__", None),
+                        "stable_identity": dict(identity),
+                    }
+                )
+        return self._hash_json_payload(
+            {
+                "module": getattr(dispatcher, "__module__", None),
+                "qualname": getattr(dispatcher, "__qualname__", None),
+                "identity": id(dispatcher),
+            }
+        )
+
+    def _reconcile_skill_dispatcher(self) -> None:
+        if self._runtime_backend == "codex":
+            self._rebaseline_fingerprint(
+                "_skill_dispatcher_identity",
+                self._fingerprint_skill_dispatcher(self._skill_dispatcher),
+                kind="skill_dispatcher",
+                detail="skill dispatcher",
+            )
+
+    def _handler_source_digest(self, handler: Any) -> str | None:
+        """Return a stable source-file digest for a built-in MCP handler."""
+        handler_type = type(handler)
+        module = sys.modules.get(handler_type.__module__)
+        module_file = getattr(module, "__file__", None)
+        if not module_file:
+            return None
+        try:
+            return hashlib.sha256(Path(module_file).read_bytes()).hexdigest()
+        except OSError:
+            return None
+
+    def _fingerprint_builtin_mcp_handler_registry(self) -> str | None:
+        """Fingerprint effectful built-in MCP handler authority."""
+        try:
+            handlers = self._builtin_mcp_handlers
+            if handlers is None:
+                from ouroboros.mcp.tools import runtime_tool_composition
+
+                handlers = runtime_tool_composition.lightweight_runtime_tool_map(
+                    runtime_backend=self._runtime_backend, llm_backend=self._llm_backend
+                )
+        except Exception:
+            return None
+        payload: list[dict[str, Any]] = []
+        for name, handler in sorted(handlers.items()):
+            definition = getattr(handler, "definition", None)
+            try:
+                definition_payload = definition.model_dump(mode="json")
+            except AttributeError:
+                definition_payload = repr(definition)
+            handler_type = type(handler)
+            payload.append(
+                {
+                    "tool_name": name,
+                    "handler_module": handler_type.__module__,
+                    "handler_qualname": handler_type.__qualname__,
+                    "handler_source_sha256": self._handler_source_digest(handler),
+                    "definition": definition_payload,
+                }
+            )
+        return self._hash_json_payload(payload)
+
+    def _reconcile_builtin_mcp_handler_registry(self) -> None:
+        if self._runtime_backend == "codex":
+            self._rebaseline_fingerprint(
+                "_builtin_mcp_handler_registry_fingerprint",
+                self._fingerprint_builtin_mcp_handler_registry(),
+                kind="mcp_handler_registry",
+                detail="built-in MCP handler registry",
+            )
+
+    def _reconcile_skill_dispatch_registry(self) -> None:
+        if self._runtime_backend != "codex":
+            return
+        self._reconcile_skill_dispatcher()
+        self._reconcile_builtin_mcp_handler_registry()
+        self._rebaseline_fingerprint(
+            "_skill_dispatch_registry_fingerprint",
+            self._fingerprint_skill_dispatch_registry(),
+            kind="skill_dispatch_registry",
+            detail="skill dispatch registry",
+        )
+
+    def _reconcile_profile_resolution_config(
+        self,
+        runtime_handle: RuntimeHandle | None = None,
+    ) -> bool:
+        """Re-baseline on valid routing drift; unloadable config keeps frozen routing."""
+        if self._runtime_backend != "codex":
+            return True
+        key = self._runtime_handle_fingerprint_key(runtime_handle)
+        if runtime_handle is not None and key is None:
+            return True
+        current, loadable = self._observe_profile_resolution_config(
+            runtime_handle if key is not None else None
+        )
+        if key is not None:
+            previous = self._runtime_handle_profile_fingerprints.get(key)
+            if previous is None:
+                previous = self._profile_resolution_fingerprint
+                self._runtime_handle_profile_fingerprints[key] = previous
+            if current == previous:
+                return loadable
+        elif current == self._profile_resolution_fingerprint:
+            return loadable
+        if not loadable:
+            self._drift.observe(
+                "baseline_unavailable",
+                "Ouroboros config became unloadable after initialization; "
+                "keeping the frozen profile routing",
+            )
+            # Reported once; resolved routing deliberately untouched.
+            if key is not None:
+                self._runtime_handle_profile_fingerprints[key] = current
+            else:
+                self._profile_resolution_fingerprint = current
+            return False
+        self._drift.observe(
+            "profile_routing", "Ouroboros Codex profile routing changed after initialization"
+        )
+        (
+            self._resolved_fallback_model,
+            self._resolved_fallback_profile,
+            self._resolved_fallback_reasoning_effort,
+        ) = self._resolve_runtime_codex_config_uncached(None)
+        self._profile_resolution_fingerprint = self._fingerprint_profile_resolution_config()
+        self._runtime_handle_profile_fingerprints = {}
+        self._runtime_handle_resolved_routing = {}
+        if key is not None:
+            self._runtime_handle_profile_fingerprints[key] = current
+        return True
+
+    def execution_identity_contract(
+        self,
+        runtime_handle: RuntimeHandle | None = None,
+    ) -> dict[str, Any]:
+        """Return the resolved Codex execution identity used across resumes.
+
+        ``_model`` alone is not a complete model pin for Codex.  When it is
+        absent, ``codex exec`` may select both its model and provider through a
+        provider-neutral runtime profile, a Codex-native ``--profile``, or the
+        role-based completion profile.  Persist the command-relevant resolved
+        fallback so a config/profile change cannot silently retarget a resumed
+        session while the generic constructor-model check still sees ``None``.
+        """
+
+        constructor_model = self._normalize_model(self._model)
+        normalized_llm_backend = (
+            self._llm_backend.strip()
+            if isinstance(self._llm_backend, str) and self._llm_backend.strip()
+            else None
+        )
+
+        # Gemini, Goose, Grok, and Copilot reuse Codex's subprocess/session
+        # machinery but override command construction. They do not consume the
+        # Codex runtime/profile fallback below, so inheriting that state as
+        # proof of their effective model would authorize resumes using an
+        # unrelated ~/.codex profile. Record only inputs their commands really
+        # consume; an unpinned model remains explicitly unobserved and the
+        # runner fails closed unless native per-call routing enforces it.
+        if self._runtime_backend != "codex":
+            native_agent = getattr(self, "_copilot_agent", None)
+            if not isinstance(native_agent, str) or not native_agent.strip():
+                native_agent = None
+            return {
+                "kind": f"{self._runtime_handle_backend}_v1",
+                "cli_executable_path": self._cli_executable_identity(),
+                "cli_executable_content_sha256": self._cli_executable_content_identity(),
+                "cli_executable_version": self._cli_executable_version_identity_snapshot,
+                "fallback_model": None if native_agent else constructor_model,
+                "native_agent": native_agent,
+                "effective_model_observed": constructor_model is not None and native_agent is None,
+                "llm_backend": normalized_llm_backend,
+                "skills_dir": str(self._skills_dir) if self._skills_dir is not None else None,
+                "skill_dispatcher": "custom" if self._skill_dispatcher is not None else "packaged",
+                "skill_dispatcher_identity": self._skill_dispatcher_identity,
+                "startup_output_timeout_seconds": self._startup_output_timeout_seconds,
+                "stdout_idle_timeout_seconds": self._stdout_idle_timeout_seconds,
+            }
+
+        fallback_model = constructor_model
+        fallback_profile = self._codex_profile
+
+        if constructor_model is None:
+            runtime_model = self._resolved_fallback_model
+            runtime_profile = self._resolved_fallback_profile
+            if runtime_profile and not fallback_profile:
+                fallback_profile = runtime_profile
+            else:
+                fallback_model = self._normalize_model(runtime_model)
+
+        return {
+            "kind": "codex_cli_v1",
+            # The automatic Codex default has no model argument.  Bind its
+            # durable identity to the selected executable as well as its
+            # profile/config inputs, otherwise a different Codex installation
+            # could resume the same native thread under different defaults.
+            "cli_executable_path": self._cli_executable_identity(),
+            "cli_executable_content_sha256": self._cli_executable_content_identity(),
+            "cli_executable_version": self._cli_executable_version_identity_snapshot,
+            "runtime_profile": self._runtime_profile.strip()
+            if isinstance(self._runtime_profile, str) and self._runtime_profile.strip()
+            else None,
+            "codex_profile": self._codex_profile.strip()
+            if isinstance(self._codex_profile, str) and self._codex_profile.strip()
+            else None,
+            "fallback_model": fallback_model,
+            "fallback_profile": fallback_profile.strip()
+            if isinstance(fallback_profile, str) and fallback_profile.strip()
+            else None,
+            # A profile name is not a model observation. Current Codex profiles
+            # may contain only reasoning-effort settings and inherit their model
+            # from mutable global config/defaults. Only a concrete --model value
+            # can authorize a routing-disabled resume.
+            "effective_model_observed": fallback_model is not None,
+            "llm_backend": normalized_llm_backend,
+            "skills_dir": str(self._skills_dir) if self._skills_dir is not None else None,
+            "skill_dispatcher": "custom" if self._skill_dispatcher is not None else "packaged",
+            "skill_dispatcher_identity": self._skill_dispatcher_identity,
+            "skill_dispatch_registry_fingerprint": self._skill_dispatch_registry_fingerprint,
+            "builtin_mcp_handler_registry_fingerprint": (
+                self._builtin_mcp_handler_registry_fingerprint
+            ),
+            "startup_output_timeout_seconds": self._startup_output_timeout_seconds,
+            "stdout_idle_timeout_seconds": self._stdout_idle_timeout_seconds,
+            "profile_resolution_fingerprint": self._profile_resolution_fingerprint,
+            "codex_config_fingerprint": self._codex_config_fingerprint,
+            "resume_handle_selector": self.resume_handle_execution_identity_contract(
+                runtime_handle
+            ),
+        }
+
+    def resume_handle_execution_identity_contract(
+        self,
+        runtime_handle: RuntimeHandle | None,
+    ) -> dict[str, Any]:
+        """Return command-selection state admitted for a root Codex resume handle."""
+        if self._runtime_backend != "codex":
+            return {
+                "kind": self._runtime_handle_backend,
+                "selectors": {},
+            }
+
+        normalized_kind = (
+            (runtime_handle.kind if runtime_handle is not None else "agent_runtime")
+            .strip()
+            .lower()
+            .replace("-", "_")
+        ) or "agent_runtime"
+        metadata = runtime_handle.metadata if runtime_handle is not None else {}
+        selectors: dict[str, str] = {}
+        for key in (
+            *_RUNTIME_PROFILE_METADATA_KEYS,
+            *_RUNTIME_CODEX_PROFILE_METADATA_KEYS,
+            "llm_role",
+            "agent_runtime_role",
+            "session_role",
+        ):
+            if key not in metadata:
+                continue
+            value = metadata.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Invalid Codex resume selector metadata: {key}")
+            selectors[key] = value.strip()
+        return {
+            "backend": (
+                runtime_handle.backend
+                if runtime_handle is not None
+                else self._runtime_handle_backend
+            ),
+            "kind": normalized_kind,
+            "selectors": selectors,
+        }
+
+    def _runtime_profile_from_metadata(self, runtime_handle: RuntimeHandle | None) -> str | None:
+        """Return an explicit provider-neutral profile from runtime metadata."""
+        metadata = runtime_handle.metadata if runtime_handle is not None else {}
+        for key in _RUNTIME_PROFILE_METADATA_KEYS:
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _codex_profile_from_metadata(self, runtime_handle: RuntimeHandle | None) -> str | None:
+        """Return an explicit Codex-native profile from runtime metadata."""
+        metadata = runtime_handle.metadata if runtime_handle is not None else {}
+        for key in _RUNTIME_CODEX_PROFILE_METADATA_KEYS:
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _runtime_profile_role(self, runtime_handle: RuntimeHandle | None) -> str:
+        """Build the logical role key used for agent-runtime profile lookup."""
+        metadata = runtime_handle.metadata if runtime_handle is not None else {}
+        role = metadata.get("llm_role") or metadata.get("agent_runtime_role")
+        if isinstance(role, str) and role.strip():
+            return role.strip()
+
+        session_role = metadata.get("session_role")
+        if isinstance(session_role, str) and session_role.strip():
+            normalized_role = session_role.strip().lower().replace("-", "_")
+            return f"{_RUNTIME_PROFILE_ROLE_PREFIX}_{normalized_role}"
+
+        if runtime_handle is not None and runtime_handle.kind:
+            normalized_kind = runtime_handle.kind.strip().lower().replace("-", "_")
+            if normalized_kind == _RUNTIME_PROFILE_ROLE_PREFIX:
+                return _RUNTIME_PROFILE_ROLE_PREFIX
+            if normalized_kind.startswith(f"{_RUNTIME_PROFILE_ROLE_PREFIX}_"):
+                return normalized_kind
+            if normalized_kind:
+                return f"{_RUNTIME_PROFILE_ROLE_PREFIX}_{normalized_kind}"
+
+        return _RUNTIME_PROFILE_ROLE_PREFIX
+
+    def _resolve_runtime_codex_config_uncached(
+        self,
+        runtime_handle: RuntimeHandle | None,
+    ) -> tuple[str | None, str | None, str | None]:
+        """Resolve model/profile/effort settings directly from mutable config."""
+        native_profile = self._codex_profile_from_metadata(runtime_handle)
+        if native_profile:
+            return None, native_profile, None
+
+        profile_name = self._runtime_profile_from_metadata(runtime_handle)
+        role = None if profile_name else self._runtime_profile_role(runtime_handle)
+        resolved = resolve_completion_profile(
+            CompletionConfig(model="default", profile=profile_name, role=role),
+            backend="codex",
+        )
+        return resolved.config.model, resolved.backend_profile, resolved.config.reasoning_effort
+
+    def _frozen_fallback_routing(self) -> tuple[str | None, str | None, str | None]:
+        return (
+            self._resolved_fallback_model,
+            self._resolved_fallback_profile,
+            self._resolved_fallback_reasoning_effort,
+        )
+
+    def _resolve_runtime_codex_config(
+        self,
+        runtime_handle: RuntimeHandle | None,
+    ) -> tuple[str | None, str | None, str | None]:
+        """Return frozen defaults unless the handle selects an explicit role/profile."""
+        if runtime_handle is None:
+            return self._frozen_fallback_routing()
+
+        metadata = runtime_handle.metadata
+        has_explicit_selection = any(
+            isinstance(metadata.get(key), str) and bool(metadata[key].strip())
+            for key in (
+                *_RUNTIME_PROFILE_METADATA_KEYS,
+                *_RUNTIME_CODEX_PROFILE_METADATA_KEYS,
+                "llm_role",
+                "agent_runtime_role",
+                "session_role",
+            )
+        )
+        normalized_kind = (runtime_handle.kind or "").strip().lower().replace("-", "_")
+        if not has_explicit_selection and normalized_kind in {"", _RUNTIME_PROFILE_ROLE_PREFIX}:
+            return self._frozen_fallback_routing()
+        loadable = self._reconcile_profile_resolution_config(runtime_handle)
+        key = self._runtime_handle_fingerprint_key(runtime_handle)
+        # Native ``codex_profile`` needs no Ouroboros config; otherwise unloadable
+        # config serves the last valid routing, else the frozen role default.
+        if (
+            not loadable
+            and key is not None
+            and not self._codex_profile_from_metadata(runtime_handle)
+        ):
+            return self._runtime_handle_resolved_routing.get(key, self._frozen_fallback_routing())
+        routing = self._resolve_runtime_codex_config_uncached(runtime_handle)
+        if loadable and key is not None:
+            self._runtime_handle_resolved_routing[key] = routing
+        return routing
+
     def _build_runtime_handle(
         self,
         session_id: str | None,
         current_handle: RuntimeHandle | None = None,
+        *,
+        drift_epoch: int | None = None,
     ) -> RuntimeHandle | None:
-        """Build a backend-neutral runtime handle for a Codex thread."""
+        """Build a runtime handle stamped with ``drift_epoch`` (default: current)."""
         if not session_id:
             return None
 
@@ -196,7 +1560,7 @@ class CodexCliRuntime:
                 cwd=current_handle.cwd or self._cwd,
                 approval_mode=current_handle.approval_mode or self._permission_mode,
                 updated_at=datetime.now(UTC).isoformat(),
-                metadata=dict(current_handle.metadata),
+                metadata=self._drift.stamp(current_handle.metadata, epoch=drift_epoch),
             )
 
         # current_handle is guaranteed None here (early return above).
@@ -207,6 +1571,7 @@ class CodexCliRuntime:
             cwd=self._cwd,
             approval_mode=self._permission_mode,
             updated_at=datetime.now(UTC).isoformat(),
+            metadata=self._drift.stamp(epoch=drift_epoch),
         )
 
     def _compose_prompt(
@@ -215,28 +1580,38 @@ class CodexCliRuntime:
         system_prompt: str | None,
         tools: list[str] | None,
     ) -> str:
-        """Compose a single prompt for Codex CLI exec mode."""
+        """Compose a single prompt for Codex CLI exec mode.
+
+        System instructions and tooling guidance are wrapped in explicit
+        authority delimiters rather than ``## markdown headings``. Codex/GPT
+        models tend to read a ``## System Instructions`` heading as ordinary
+        document content; a fenced ``<system-directive>`` block with a one-line
+        binding preamble makes the governing intent unambiguous. The task text
+        itself is left untouched and unwrapped, so a bare prompt (no system
+        instructions, no tools) is returned exactly as before.
+        """
         parts: list[str] = []
 
         if system_prompt:
-            parts.append(f"## System Instructions\n{system_prompt}")
-
-        if tools:
-            tool_list = "\n".join(f"- {tool}" for tool in tools)
             parts.append(
-                "## Tooling Guidance\n"
-                "Prefer to solve the task using the following tool set when possible:\n"
-                f"{tool_list}"
+                "<system-directive>\n"
+                "These are binding instructions that govern this task. "
+                "Treat them as rules, not as reference material.\n\n"
+                f"{system_prompt}\n"
+                "</system-directive>"
             )
+
+        if tools is not None:
+            # Codex has its own shell and patch tools, not the Claude tool names.
+            codex = self._runtime_handle_backend in _CODEX_BACKENDS
+            parts.append(render_tooling_guidance(tools, claude_tool_names=not codex))
 
         parts.append(prompt)
         return "\n\n".join(part for part in parts if part.strip())
 
     def _truncate_log_value(self, value: str | None, *, limit: int) -> str | None:
         """Trim long string values before including them in warning logs."""
-        if value is None or len(value) <= limit:
-            return value
-        return f"{value[: limit - 3]}..."
+        return truncate_with_ellipsis(value, limit=limit)
 
     def _preview_dispatch_value(self, value: Any, *, limit: int = 160) -> Any:
         """Build a bounded preview of resolved MCP arguments for diagnostics."""
@@ -280,6 +1655,7 @@ class CodexCliRuntime:
                 for handler in get_ouroboros_tools(
                     runtime_backend=self._runtime_backend,
                     llm_backend=self._llm_backend,
+                    runtime_adapter=self,
                 )
             }
 
@@ -294,22 +1670,8 @@ class CodexCliRuntime:
         intercept: Resolved,
         current_handle: RuntimeHandle | None,
     ) -> dict[str, Any]:
-        """Build the MCP argument payload for an intercepted skill."""
-        if intercept.mcp_tool != "ouroboros_interview" or current_handle is None:
-            return dict(intercept.mcp_args)
-
-        session_id = current_handle.metadata.get(_INTERVIEW_SESSION_METADATA_KEY)
-        if not isinstance(session_id, str) or not session_id.strip():
-            return dict(intercept.mcp_args)
-
-        # Resume turn: drop initial_context so InterviewHandler branches on
-        # session_id instead of starting a new interview.
-        arguments: dict[str, Any] = dict(intercept.mcp_args)
-        arguments.pop("initial_context", None)
-        arguments["session_id"] = session_id.strip()
-        if intercept.first_argument is not None:
-            arguments["answer"] = intercept.first_argument
-        return arguments
+        """Build arguments through the shared interview transition contract."""
+        return InterviewSessionTransition(intercept, current_handle).tool_arguments()
 
     def _build_resume_handle(
         self,
@@ -317,33 +1679,13 @@ class CodexCliRuntime:
         intercept: Resolved,
         tool_result: Any,
     ) -> RuntimeHandle | None:
-        """Attach interview session metadata to the runtime handle."""
-        if intercept.mcp_tool != "ouroboros_interview":
-            return current_handle
-
-        session_id = tool_result.meta.get("session_id")
-        if not isinstance(session_id, str) or not session_id.strip():
-            if session_id is not None:
-                log.warning(
-                    "codex_cli_runtime.resume_handle.invalid_session_id",
-                    session_id_type=type(session_id).__name__,
-                    session_id_value=repr(session_id),
-                )
-            return current_handle
-
-        metadata = dict(current_handle.metadata) if current_handle is not None else {}
-        metadata[_INTERVIEW_SESSION_METADATA_KEY] = session_id.strip()
-        updated_at = datetime.now(UTC).isoformat()
-
-        if current_handle is not None:
-            return replace(current_handle, metadata=metadata, updated_at=updated_at)
-
-        return RuntimeHandle(
+        """Retain session-local interview state through the shared transition."""
+        return InterviewSessionTransition(intercept, current_handle).resume_handle(
+            tool_result.meta,
             backend=self.runtime_backend,
             cwd=self.working_directory,
             approval_mode=self.permission_mode,
-            updated_at=updated_at,
-            metadata=metadata,
+            log_namespace="codex_cli_runtime",
         )
 
     async def _dispatch_skill_intercept_locally(
@@ -459,12 +1801,125 @@ class CodexCliRuntime:
             error=self._invalid_skill_log_error(dispatch_result),
         )
 
+    @staticmethod
+    def _auto_dispatch_error_category(
+        error_type: str | None,
+        error_text: str,
+    ) -> str | None:
+        """Classify terminal auto-dispatch failures for operator diagnostics."""
+        normalized_error = error_text.lower()
+        transport_markers = (
+            "transport closed",
+            "connection closed",
+            "stdio closed",
+            "broken pipe",
+        )
+        unavailable_markers = (
+            "unavailable",
+            "not found",
+            "not registered",
+            "unknown tool",
+            "no such tool",
+        )
+
+        if any(marker in normalized_error for marker in transport_markers):
+            return "mcp_transport_closed"
+        if error_type == "MCPResourceNotFoundError":
+            return "mcp_registration_missing"
+        if error_type == "LookupError" and "no local handler registered" in normalized_error:
+            return "local_handler_missing"
+        if error_type in {"MCPClientError", "MCPToolError"} and any(
+            marker in normalized_error for marker in unavailable_markers
+        ):
+            return "mcp_registration_missing"
+        return None
+
+    @staticmethod
+    def _is_auto_recoverable_dispatch_unavailable(recoverable_error: AgentMessage) -> bool:
+        """Return whether a recoverable auto dispatch error means the tool is unavailable."""
+        error_type = str(recoverable_error.data.get("error_type") or "")
+        error_text = recoverable_error.content
+        if error_text.lower().startswith("auto pipeline failed:"):
+            return False
+        return CodexCliRuntime._auto_dispatch_error_category(error_type, error_text) is not None
+
+    def _build_auto_dispatch_unavailable_content(
+        self,
+        tool_name: str,
+        category: str | None,
+    ) -> str:
+        """Return the operator-facing auto dispatch failure message."""
+        if category == "mcp_transport_closed":
+            return (
+                "Cannot run ooo auto: MCP transport closed before "
+                f"`{tool_name}` completed. Run `ouroboros mcp doctor` to verify "
+                "the server, then reconnect or restart the Codex App MCP session; "
+                "this is a transport/session failure, not proof that the tool is "
+                "unregistered."
+            )
+        return (
+            "Cannot run ooo auto: required MCP tool "
+            f"`{tool_name}` is unavailable. "
+            "Run `ouroboros mcp doctor` / setup to register the MCP server."
+        )
+
+    @staticmethod
+    def _is_mcp_transport_closed_error(message: AgentMessage) -> bool:
+        """Return True for recoverable-looking MCP client transport closures."""
+        error_type = message.data.get("error_type")
+        if error_type != "MCPClientError":
+            return False
+        return (
+            CodexCliRuntime._auto_dispatch_error_category(error_type, message.content)
+            == "mcp_transport_closed"
+        )
+
+    @staticmethod
+    def _is_recoverable_mcp_error_type(message: AgentMessage) -> bool:
+        """Return True for MCP transport errors that should not be passed through."""
+        error_type = message.data.get("error_type")
+        if error_type in {"MCPConnectionError", "MCPTimeoutError"}:
+            return True
+        return CodexCliRuntime._is_mcp_transport_closed_error(message)
+
+    def _build_auto_dispatch_unavailable_message(
+        self,
+        intercept: Resolved,
+        current_handle: RuntimeHandle | None,
+        *,
+        dispatch_error_type: str | None = None,
+        dispatch_error: str | None = None,
+    ) -> AgentMessage:
+        """Build the fail-closed result for unavailable `ooo auto` dispatch."""
+        data: dict[str, Any] = {
+            "subtype": "error",
+            "error_type": "SkillDispatchUnavailable",
+            "skill_name": intercept.skill_name,
+            "tool_name": intercept.mcp_tool,
+            "command_prefix": intercept.command_prefix,
+        }
+        if dispatch_error_type:
+            data["dispatch_error_type"] = dispatch_error_type
+        if dispatch_error:
+            data["dispatch_error"] = dispatch_error
+        category = self._auto_dispatch_error_category(dispatch_error_type, dispatch_error or "")
+        if category:
+            data["dispatch_error_category"] = category
+
+        return AgentMessage(
+            type="result",
+            content=self._build_auto_dispatch_unavailable_content(intercept.mcp_tool, category),
+            data=data,
+            resume_handle=current_handle,
+        )
+
     async def _maybe_dispatch_skill_intercept(
         self,
         prompt: str,
         current_handle: RuntimeHandle | None,
     ) -> tuple[AgentMessage, ...] | None:
         """Attempt deterministic skill dispatch before invoking Codex."""
+        self._reconcile_skill_dispatch_registry()
         dispatch_result = resolve_skill_dispatch(
             ResolveRequest(
                 prompt=prompt,
@@ -483,24 +1938,55 @@ class CodexCliRuntime:
         try:
             dispatched_messages = await dispatcher(intercept, current_handle)
         except Exception as e:
+            failure_context = self._build_intercept_failure_context(intercept)
+            auto_handler_missing = (
+                intercept.skill_name == "auto"
+                and type(e) is LookupError
+                and "No local handler registered" in str(e)
+            )
+            if auto_handler_missing:
+                failure_context["fallback"] = "terminal_error"
             log.warning(
                 f"{self._log_namespace}.skill_intercept_dispatch_failed",
-                **self._build_intercept_failure_context(intercept),
+                **failure_context,
                 error_type=type(e).__name__,
                 error=str(e),
                 exc_info=True,
             )
+            if auto_handler_missing:
+                return (
+                    self._build_auto_dispatch_unavailable_message(
+                        intercept,
+                        current_handle,
+                        dispatch_error_type=type(e).__name__,
+                        dispatch_error=str(e),
+                    ),
+                )
             return None
 
         recoverable_error = self._extract_recoverable_dispatch_error(dispatched_messages)
         if recoverable_error is not None:
+            failure_context = self._build_intercept_failure_context(intercept)
+            if intercept.skill_name == "auto":
+                failure_context["fallback"] = "terminal_error"
             log.warning(
                 f"{self._log_namespace}.skill_intercept_dispatch_failed",
-                **self._build_intercept_failure_context(intercept),
+                **failure_context,
                 error_type=recoverable_error.data.get("error_type"),
                 error=recoverable_error.content,
                 recoverable=True,
             )
+            if intercept.skill_name == "auto":
+                if self._is_auto_recoverable_dispatch_unavailable(recoverable_error):
+                    return (
+                        self._build_auto_dispatch_unavailable_message(
+                            intercept,
+                            current_handle,
+                            dispatch_error_type=str(recoverable_error.data.get("error_type") or ""),
+                            dispatch_error=recoverable_error.content,
+                        ),
+                    )
+                return dispatched_messages
             return None
 
         return dispatched_messages
@@ -539,7 +2025,7 @@ class CodexCliRuntime:
             if metadata.get("is_retriable") is True or metadata.get("retriable") is True:
                 return final_message
 
-        if final_message.data.get("error_type") in {"MCPConnectionError", "MCPTimeoutError"}:
+        if self._is_recoverable_mcp_error_type(final_message):
             return final_message
 
         return None
@@ -550,9 +2036,36 @@ class CodexCliRuntime:
         *,
         resume_session_id: str | None = None,
         prompt: str | None = None,
+        runtime_handle: RuntimeHandle | None = None,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
     ) -> list[str]:
         """Build the CLI command args.  Prompt is fed via stdin separately."""
-        command = [self._cli_path, "exec"]
+        if runtime_handle is not None:
+            self._reconcile_profile_resolution_config(runtime_handle)
+        self._reconcile_codex_config_files(runtime_handle)
+        self._reconcile_cli_executable_identity()
+        command = [self._cli_path, "exec", *self._exec_session_flags]
+
+        normalized_model = self._normalize_model(model or self._model)
+        runtime_model: str | None = None
+        runtime_profile: str | None = None
+        runtime_effort: str | None = None
+        # Always resolve the role selection so an explicit model pin still
+        # inherits its selected reasoning effort. The pin below suppresses the
+        # role's model/profile, but must not silently fall back to Codex's
+        # unrelated global effort setting.
+        runtime_model, runtime_profile, runtime_effort = self._resolve_runtime_codex_config(
+            runtime_handle
+        )
+        resume_session_id = self._drift.retire_resume(resume_session_id, runtime_handle)
+
+        # Codex accepts one active --profile. The backend runtime profile is
+        # the worker-isolation boundary, so it owns that singular flag when
+        # configured; role/task profile resolution may still contribute a
+        # model fallback below, but not a second --profile.
+        if self._codex_profile:
+            command.extend(["--profile", self._codex_profile])
 
         command.extend(
             [
@@ -565,9 +2078,28 @@ class CodexCliRuntime:
             ]
         )
 
-        normalized_model = self._normalize_model(self._model)
+        # Effort-first investment dial (RFC #1405). ``codex exec`` honors a
+        # per-invocation config override, so the orchestrator's chosen level is
+        # ENFORCED (not advised) by overriding ``model_reasoning_effort``. Only
+        # a known-safe token is forwarded, so an unexpected value can never be
+        # injected into the ``key=value`` override.
+        effective_effort = reasoning_effort or runtime_effort
+        if effective_effort and effective_effort in _CODEX_REASONING_EFFORT_LEVELS:
+            command.extend(["-c", f"model_reasoning_effort={effective_effort}"])
+
+        # Per-call model-tier override (RFC #1405 sibling) wins over the
+        # constructor pin; ``model is None`` falls back to ``self._model`` so
+        # existing call sites are byte-identical. Only when neither yields a model
+        # do we consult the runtime profile below (unchanged fallback order).
         if normalized_model:
             command.extend(["--model", normalized_model])
+        else:
+            if runtime_profile and not self._codex_profile:
+                command.extend(["--profile", runtime_profile])
+            else:
+                normalized_runtime_model = self._normalize_model(runtime_model)
+                if normalized_runtime_model:
+                    command.extend(["--model", normalized_runtime_model])
 
         command.extend(self._build_permission_args())
         if resume_session_id:
@@ -597,26 +2129,14 @@ class CodexCliRuntime:
         current_handle: RuntimeHandle | None,
     ) -> str | None:
         """Resolve the backend-native session id used for CLI resume."""
-        if current_handle is None:
+        if current_handle is None or self._drift.handle_predates_drift(current_handle):
             return None
         return current_handle.native_session_id
 
     def _build_child_env(self) -> dict[str, str]:
-        """Build an isolated environment for child runtime processes.
-
-        Strips ``OUROBOROS_AGENT_RUNTIME`` and ``OUROBOROS_LLM_BACKEND`` so
-        that a child Codex process does not re-load the Ouroboros MCP server,
-        preventing the recursive startup loop described in #185. Also strips
-        parent Codex thread/session env so nested ``codex exec`` starts a fresh
-        subprocess instead of inheriting the current agent thread.
-        """
-        return build_codex_child_env(
-            max_depth=self._max_ouroboros_depth,
-            child_session_env_keys=self._child_session_env_keys,
-            depth_error_factory=lambda _depth, max_depth: RuntimeError(
-                f"Maximum Ouroboros nesting depth ({max_depth}) exceeded"
-            ),
-        )
+        """Return the proof-sealed child environment, or build a fresh one."""
+        attested = attested_codex_child_environment(self)
+        return attested or build_codex_runtime_child_environment(self)
 
     def _requires_process_stdin(self) -> bool:
         """Return True when the runtime needs a writable stdin pipe."""
@@ -684,128 +2204,36 @@ class CodexCliRuntime:
         Codex can emit JSONL events larger than the default asyncio stream limit.
         Reading fixed-size chunks avoids ``LimitOverrunError`` on oversized lines.
         """
-        if stream is None:
-            return
+        async for line in iter_runtime_stream_lines(
+            stream,
+            display_name=self._display_name,
+            chunk_size=chunk_size,
+            first_chunk_timeout_seconds=first_chunk_timeout_seconds,
+            chunk_timeout_seconds=chunk_timeout_seconds,
+            max_buffer_bytes=_MAX_LINE_BUFFER_BYTES,
+            logger=log,
+            log_namespace=self._log_namespace,
+        ):
+            yield line
 
-        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        buffer = ""
-        buffer_byte_estimate = 0
-        saw_chunk = False
-
-        while True:
-            timeout_seconds: float | None = None
-            if not saw_chunk:
-                timeout_seconds = first_chunk_timeout_seconds
-            elif chunk_timeout_seconds is not None:
-                timeout_seconds = chunk_timeout_seconds
-
-            try:
-                if timeout_seconds is None:
-                    chunk = await stream.read(chunk_size)
-                else:
-                    chunk = await asyncio.wait_for(
-                        stream.read(chunk_size),
-                        timeout=timeout_seconds,
-                    )
-            except TimeoutError as exc:
-                phase = "startup" if not saw_chunk else "idle"
-                raise TimeoutError(
-                    f"{self._display_name} produced no stdout during {phase} "
-                    f"window ({timeout_seconds:.0f}s)"
-                ) from exc
-            if not chunk:
-                break
-
-            saw_chunk = True
-            decoded = decoder.decode(chunk)
-            buffer += decoded
-            # Track byte size incrementally: worst-case 4 bytes per char (UTF-8).
-            buffer_byte_estimate += len(decoded) * 4
-            if buffer_byte_estimate > _MAX_LINE_BUFFER_BYTES:
-                log.error(
-                    f"{self._log_namespace}.line_buffer_overflow",
-                    buffer_size=len(buffer),
-                    limit=_MAX_LINE_BUFFER_BYTES,
-                )
-                raise ProviderError(f"JSONL line buffer exceeded {_MAX_LINE_BUFFER_BYTES} bytes")
-            while True:
-                newline_index = buffer.find("\n")
-                if newline_index < 0:
-                    break
-
-                line = buffer[:newline_index]
-                buffer = buffer[newline_index + 1 :]
-                # Recalculate estimate after draining consumed lines.
-                buffer_byte_estimate = len(buffer) * 4
-                yield line.rstrip("\r")
-
-        buffer += decoder.decode(b"", final=True)
-        if buffer:
-            yield buffer.rstrip("\r")
-
-    async def _terminate_process(self, process: Any) -> None:
-        """Best-effort subprocess shutdown used when task consumption is cancelled."""
-        if getattr(process, "returncode", None) is not None:
-            return
-
-        await self._close_process_stdin(process)
-
-        terminate = getattr(process, "terminate", None)
-        kill = getattr(process, "kill", None)
-
-        try:
-            if callable(terminate):
-                terminate()
-            elif callable(kill):
-                kill()
-            else:
-                return
-        except ProcessLookupError:
-            return
-        except Exception as exc:
-            log.warning(
-                f"{self._log_namespace}.process_terminate_failed",
-                error=str(exc),
-                error_type=type(exc).__name__,
-            )
-            return
-
-        try:
-            await asyncio.wait_for(
-                process.wait(),
-                timeout=self._process_shutdown_timeout_seconds,
-            )
-            return
-        except (TimeoutError, ProcessLookupError):
-            pass
-        except Exception as exc:
-            log.warning(
-                f"{self._log_namespace}.process_wait_failed",
-                error=str(exc),
-                error_type=type(exc).__name__,
-            )
-            return
-
-        if not callable(kill):
-            return
-
-        try:
-            kill()
-        except ProcessLookupError:
-            return
-        except Exception as exc:
-            log.warning(
-                f"{self._log_namespace}.process_kill_failed",
-                error=str(exc),
-                error_type=type(exc).__name__,
-            )
-            return
-
-        with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError, Exception):
-            await asyncio.wait_for(
-                process.wait(),
-                timeout=self._process_shutdown_timeout_seconds,
-            )
+    async def _terminate_process(
+        self,
+        process: Any,
+        *,
+        process_group_id: int | None = None,
+    ) -> bool:
+        """Shut down the subprocess and report whether its tree is confirmed gone."""
+        return await terminate_runtime_process(
+            process,
+            shutdown_timeout=self._process_shutdown_timeout_seconds,
+            logger=log,
+            log_namespace=self._log_namespace,
+            close_stdin=self._close_process_stdin,
+            terminate_process_group=self._use_process_group,
+            process_group_id=process_group_id,
+            workspace=self._cwd,
+            require_owned_tree=True,
+        )
 
     async def _close_process_stdin(self, process: Any) -> None:
         """Best-effort stdin shutdown for runtimes that keep a writable pipe open."""
@@ -828,6 +2256,43 @@ class CodexCliRuntime:
                 asyncio.CancelledError,
             ):
                 await wait_closed()
+
+    def _subprocess_launch_kwargs(self) -> dict[str, Any]:
+        """Return platform-specific subprocess options for owned runtime workers."""
+        if not self._use_process_group:
+            return {}
+        return {"start_new_session": True}
+
+    def _process_group_id(self, process: Any) -> int | None:
+        """Return the subprocess group id while the parent process is still observable."""
+        if not self._use_process_group:
+            return None
+
+        pid = getattr(process, "pid", None)
+        if not isinstance(pid, int):
+            return None
+
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            return os.getpgid(pid)
+        return None
+
+    async def _cleanup_completed_process_group(
+        self,
+        process: Any,
+        process_group_id: int | None,
+    ) -> None:
+        """Best-effort cleanup for companion shells after the main worker exits."""
+        if process_group_id is None:
+            return
+
+        await terminate_runtime_process(
+            process,
+            shutdown_timeout=self._completed_process_group_shutdown_timeout_seconds,
+            logger=log,
+            log_namespace=self._log_namespace,
+            terminate_process_group=True,
+            process_group_id=process_group_id,
+        )
 
     async def _observe_bound_runtime_handle(
         self,
@@ -872,11 +2337,17 @@ class CodexCliRuntime:
         process_returncode = getattr(process, "returncode", None)
         if process_returncode is not None:
             control_state["returncode"] = process_returncode
-            control_state["runtime_status"] = "completed" if process_returncode == 0 else "failed"
+            if control_state.get("runtime_status") != "termination_unconfirmed":
+                control_state["runtime_status"] = (
+                    "completed" if process_returncode == 0 else "failed"
+                )
             return False
 
         control_state["runtime_status"] = "terminating"
-        await self._terminate_process(process)
+        confirmed = await self._terminate_process(process)
+        if not confirmed:
+            control_state["runtime_status"] = "termination_unconfirmed"
+            return False
 
         process_returncode = getattr(process, "returncode", None)
         control_state["terminated"] = True
@@ -930,7 +2401,11 @@ class CodexCliRuntime:
                 metadata=metadata,
             )
 
-        if control_state.get("returncode") is None and control_state.get("terminated") is not True:
+        if (
+            control_state.get("returncode") is None
+            and control_state.get("terminated") is not True
+            and control_state.get("runtime_status") != "termination_unconfirmed"
+        ):
             control_state["runtime_status"] = effective_handle.lifecycle_state
 
         async def _observe(_handle: RuntimeHandle) -> dict[str, Any]:
@@ -948,12 +2423,7 @@ class CodexCliRuntime:
 
     def _parse_json_event(self, line: str) -> dict[str, Any] | None:
         """Parse a JSONL event line, returning None for non-JSON output."""
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            return None
-
-        return event if isinstance(event, dict) else None
+        return parse_json_event(line)
 
     def _extract_event_session_id(self, event: Mapping[str, Any]) -> str | None:
         """Extract a backend-native session identifier from a runtime event."""
@@ -969,6 +2439,15 @@ class CodexCliRuntime:
                 return value.strip()
 
         return None
+
+    def _update_last_content(self, last_content: str, message: AgentMessage) -> str:
+        """Return the fallback final content after a streamed message.
+
+        Codex-style events normally carry complete assistant messages, so the
+        latest content remains the fallback.  Delta-oriented runtimes can
+        override this hook to accumulate chunks.
+        """
+        return message.content if message.content else last_content
 
     def _extract_text(self, value: object) -> str:
         """Extract text recursively from a nested JSON-like structure."""
@@ -1037,8 +2516,8 @@ class CodexCliRuntime:
                 return candidate
         return {}
 
-    def _extract_path(self, item: dict[str, Any]) -> str:
-        """Extract a file path from a file change event."""
+    def _extract_paths(self, item: dict[str, Any]) -> tuple[str, ...]:
+        """Extract all file paths from a file change event."""
         candidates: list[object] = [
             item.get("path"),
             item.get("file_path"),
@@ -1052,13 +2531,74 @@ class CodexCliRuntime:
                         [
                             change.get("path"),
                             change.get("file_path"),
+                            change.get("target_file"),
                         ]
                     )
 
+        paths: list[str] = []
+        seen: set[str] = set()
         for candidate in candidates:
             if isinstance(candidate, str) and candidate.strip():
-                return candidate.strip()
-        return ""
+                path = candidate.strip()
+                if path not in seen:
+                    seen.add(path)
+                    paths.append(path)
+        return tuple(paths)
+
+    def _extract_path(self, item: dict[str, Any]) -> str:
+        """Extract the first file path from a file change event."""
+        paths = self._extract_paths(item)
+        return paths[0] if paths else ""
+
+    def _extract_command_metadata(self, item: dict[str, Any]) -> dict[str, Any]:
+        """Extract command result fields that can support verifier evidence."""
+        data: dict[str, Any] = {}
+        for source in self._iter_item_metadata_sources(item):
+            self._merge_command_metadata(data, source)
+        return data
+
+    @staticmethod
+    def _iter_item_metadata_sources(item: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return the item plus any nested containers that may carry results."""
+        sources = [item]
+        for container_key in _ITEM_METADATA_CONTAINER_KEYS:
+            nested = item.get(container_key)
+            if isinstance(nested, dict):
+                sources.append(nested)
+        return sources
+
+    def _merge_command_metadata(self, data: dict[str, Any], source: dict[str, Any]) -> None:
+        """Merge known command-result fields from one Codex event object."""
+        text_key_map = {
+            "output": "output",
+            "aggregated_output": "output",
+            "aggregatedOutput": "output",
+            "stdout": "stdout",
+            "stderr": "stderr",
+            "result_preview": "result_preview",
+            "resultPreview": "result_preview",
+            "text": "output",
+            "status": "status",
+        }
+        for key, target_key in text_key_map.items():
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                data.setdefault(target_key, value.strip())
+        for key in ("exit_code", "exitCode", "returncode", "return_code"):
+            value = source.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                stored = data.get("exit_code")
+                if stored is None:
+                    data["exit_code"] = value
+                elif stored == 0 and value != 0:
+                    # Conflicting aliases must persist one verdict-consistent
+                    # value: the failing code wins over a stale zero so the
+                    # journal never contradicts is_error (round three warning).
+                    data["exit_code"] = value
+        if source.get("success") is True:
+            data.setdefault("subtype", "success")
+        if source.get("ok") is True:
+            data.setdefault("subtype", "success")
 
     def _build_tool_message(
         self,
@@ -1078,20 +2618,743 @@ class CodexCliRuntime:
             resume_handle=handle,
         )
 
+    @staticmethod
+    def _item_lifecycle_id(item: dict[str, Any]) -> str | None:
+        """Return the correlation id of a Codex thread item, if present."""
+        item_id = item.get("id")
+        if isinstance(item_id, str) and item_id.strip():
+            return item_id.strip()
+        return None
+
+    @staticmethod
+    def _extract_cwd(item: dict[str, Any]) -> str:
+        """Extract a normalized working directory from a command item."""
+        candidates = [item.get("cwd"), item.get("working_directory"), item.get("workdir")]
+        nested = item.get("input")
+        if isinstance(nested, dict):
+            candidates.extend(
+                [nested.get("cwd"), nested.get("working_directory"), nested.get("workdir")]
+            )
+        for value in candidates:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _file_change_signature(self, item: dict[str, Any]) -> str:
+        """Fingerprint the complete stable change operation for each path.
+
+        Correlating on path alone (or path + a string kind) let an ``add``
+        start pair with a ``delete`` completion, and collapsed structured
+        kinds, diffs, and move destinations to identical signatures (rounds
+        nine & ten). Serializing the full normalized change captures the
+        mutation kind (any shape), patch content, and move destination.
+        """
+        # Include every field _extract_paths turns into a tool call (top-level
+        # path/file_path/target_file) plus the full normalized changes, so a
+        # differing top-level path is not masked by identical changes (round
+        # twelve, blocker 2).
+        changes = item.get("changes")
+        normalized_changes = (
+            [change for change in changes if isinstance(change, dict)]
+            if isinstance(changes, list)
+            else []
+        )
+        signature_payload = {
+            "paths": list(self._extract_paths(item)),
+            "changes": normalized_changes,
+            "kind": item.get("kind"),
+        }
+        return json.dumps(signature_payload, ensure_ascii=False, sort_keys=True, default=str)
+
+    @staticmethod
+    def _mcp_tool_name(item: dict[str, Any]) -> str:
+        """Resolve an MCP tool identity from native tool+server or legacy name."""
+        tool = next(
+            (
+                item[key].strip()
+                for key in ("tool", "toolName", "tool_name")
+                if isinstance(item.get(key), str) and item[key].strip()
+            ),
+            "",
+        )
+        if tool:
+            server = item.get("server")
+            if isinstance(server, str) and server.strip():
+                return f"{server.strip()}.{tool}"
+            return tool
+        name = item.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+        return "mcp_tool"
+
+    @staticmethod
+    def _extract_mcp_result_meta(item: dict[str, Any]) -> dict[str, Any]:
+        """Return a redacted MCP result ``_meta`` mapping for audit transfer."""
+        result = item.get("result")
+        if isinstance(result, dict):
+            meta = result.get("_meta")
+            if isinstance(meta, dict) and meta:
+                redacted = CodexCliRuntime._redact_sensitive(meta)
+                return redacted if isinstance(redacted, dict) else {}
+        return {}
+
+    @staticmethod
+    def _redact_sensitive(value: Any, _depth: int = 0) -> Any:
+        """Recursively redact secret-bearing keys before durable persistence.
+
+        Opaque MCP audit data is untrusted and may carry credentials
+        (``authorization``, ``api_key``, tokens); those must never reach the
+        journal (round fifteen, blocker 3). Depth is bounded to avoid
+        pathological nesting.
+        """
+        if _depth > 8:
+            return "[…]"
+        if isinstance(value, dict):
+            return {
+                key: (
+                    "[REDACTED]"
+                    if isinstance(key, str) and _SENSITIVE_META_KEY_RE.search(key)
+                    else CodexCliRuntime._redact_sensitive(item, _depth + 1)
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [CodexCliRuntime._redact_sensitive(item, _depth + 1) for item in value]
+        return value
+
+    @staticmethod
+    def _nested_error(item: dict[str, Any]) -> object:
+        """Return a nested ``result.error`` envelope when present."""
+        result = item.get("result")
+        return result.get("error") if isinstance(result, dict) else None
+
+    @staticmethod
+    def _extract_mcp_content_blocks(item: dict[str, Any]) -> list[dict[str, Any]]:
+        """Normalize supported MCP result blocks to the shared projection contract.
+
+        The shared projection reads flat ``text``/``data``/``mime_type``/``uri``
+        fields, so Codex-native blocks (camelCase ``mimeType``, nested
+        ``resource``) are flattened here and structured content is serialized
+        into a carrier field that survives projection (round eleven).
+        """
+        result = item.get("result")
+        if not isinstance(result, dict):
+            return []
+        blocks: list[dict[str, Any]] = []
+        content = result.get("content")
+        if isinstance(content, list):
+            for raw in content:
+                if not isinstance(raw, dict):
+                    continue
+                block: dict[str, Any] = {"type": raw.get("type")}
+                text = raw.get("text")
+                if isinstance(text, str):
+                    block["text"] = text
+                if raw.get("data") is not None:
+                    block["data"] = raw.get("data")
+                mime = raw.get("mime_type") or raw.get("mimeType")
+                if isinstance(mime, str):
+                    block["mime_type"] = mime
+                resource = raw.get("resource")
+                if isinstance(resource, dict):
+                    uri = resource.get("uri")
+                    if isinstance(uri, str):
+                        block["uri"] = uri
+                    res_text = resource.get("text")
+                    if isinstance(res_text, str) and "text" not in block:
+                        block["text"] = res_text
+                    blob = resource.get("blob")
+                    if blob is not None and block.get("data") is None:
+                        block["data"] = blob
+                    res_mime = resource.get("mime_type") or resource.get("mimeType")
+                    if isinstance(res_mime, str) and "mime_type" not in block:
+                        block["mime_type"] = res_mime
+                elif isinstance(raw.get("uri"), str):
+                    block["uri"] = raw["uri"]
+                blocks.append(block)
+        structured = result.get("structured_content")
+        if structured is None:
+            structured = result.get("structuredContent")
+        if isinstance(structured, (dict, list)) and structured:
+            # No structured payload field survives the flat projection, so ride
+            # the JSON in ``data`` (which the projection preserves) under a
+            # distinct block type.
+            blocks.append(
+                {
+                    "type": "structured",
+                    "data": json.dumps(structured, ensure_ascii=False, sort_keys=True),
+                }
+            )
+        return blocks
+
+    @staticmethod
+    def _extract_mcp_result_text(item: dict[str, Any]) -> str:
+        """Normalize MCP result/error envelopes into result text."""
+        for error_envelope in (item.get("error"), CodexCliRuntime._nested_error(item)):
+            if isinstance(error_envelope, dict):
+                message = error_envelope.get("message")
+                if isinstance(message, str) and message.strip():
+                    return message.strip()
+            if isinstance(error_envelope, str) and error_envelope.strip():
+                return error_envelope.strip()
+        result = item.get("result")
+        if isinstance(result, dict):
+            content = result.get("content")
+            if isinstance(content, list):
+                texts: list[str] = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if isinstance(block.get("text"), str):
+                        texts.append(block["text"].strip())
+                    nested = block.get("resource")
+                    if isinstance(nested, dict) and isinstance(nested.get("text"), str):
+                        texts.append(nested["text"].strip())
+                joined = "\n".join(text for text in texts if text)
+                if joined:
+                    return joined
+            structured = result.get("structured_content")
+            if structured is None:
+                structured = result.get("structuredContent")
+            if isinstance(structured, str) and structured.strip():
+                return structured.strip()
+            if isinstance(structured, (dict, list)) and structured:
+                return json.dumps(structured, ensure_ascii=False, sort_keys=True)
+        if isinstance(result, str) and result.strip():
+            return result.strip()
+        return ""
+
+    @staticmethod
+    def _extract_web_search_query(item: dict[str, Any]) -> str:
+        """Extract exactly the search query from a web_search thread item."""
+        query = item.get("query")
+        return query.strip() if isinstance(query, str) else ""
+
+    def _item_lifecycle_signature(self, item_type: str, item: dict[str, Any]) -> str:
+        """Build a best-effort identity, scoped by tool type.
+
+        The type prefix stops a reused id from correlating across different
+        tool types (e.g. a Bash ``cats`` start and a WebSearch ``cats``
+        completion), which would otherwise pair on the bare payload.
+        """
+        return f"{item_type}\x00{self._item_lifecycle_payload_signature(item_type, item)}"
+
+    def _item_lifecycle_payload_signature(self, item_type: str, item: dict[str, Any]) -> str:
+        if item_type == "command_execution":
+            cwd = self._extract_cwd(item)
+            command = self._extract_command(item)
+            return f"{command}\x00{cwd}" if cwd else command
+        if item_type == "mcp_tool_call":
+            tool_input = self._extract_tool_input(item)
+            arguments = json.dumps(tool_input, ensure_ascii=False, sort_keys=True, default=str)
+            return f"{self._mcp_tool_name(item)}\x00{arguments}"
+        if item_type == "file_change":
+            return self._file_change_signature(item)
+        if item_type == "web_search":
+            # The query is the only stable identity: volatile fields such as
+            # status must not change the signature between started/completed,
+            # or an id-less completion would synthesize a duplicate start.
+            return self._extract_web_search_query(item)
+        return self._extract_text(item)
+
+    def _item_tool_calls(
+        self, item_type: str, item: dict[str, Any], correlation_key: str | None = None
+    ) -> list[_CodexToolCall]:
+        """Normalize one Codex thread item into shared tool-call descriptors."""
+        item_id = self._item_lifecycle_id(item) if correlation_key is None else correlation_key
+
+        if item_type == "command_execution":
+            command = self._extract_command(item)
+            if not command:
+                return []
+            tool_input: dict[str, Any] = {"command": command}
+            cwd = self._extract_cwd(item)
+            if cwd:
+                tool_input["cwd"] = cwd
+            return [
+                _CodexToolCall(
+                    tool_name="Bash",
+                    tool_input=tool_input,
+                    start_content=f"Calling tool: Bash: {command}",
+                    tool_call_id=item_id,
+                )
+            ]
+
+        if item_type == "mcp_tool_call":
+            tool_name = self._mcp_tool_name(item)
+            return [
+                _CodexToolCall(
+                    tool_name=tool_name,
+                    tool_input=self._extract_tool_input(item),
+                    start_content=f"Calling tool: {tool_name}",
+                    tool_call_id=item_id,
+                )
+            ]
+
+        if item_type == "file_change":
+            # Per-path correlation ids ("{item_id}:{path}") let the deliver
+            # gate match each Edit start with its own completion when one
+            # Codex item mutates multiple files (#1690).
+            return [
+                _CodexToolCall(
+                    tool_name="Edit",
+                    tool_input={"file_path": file_path},
+                    start_content=f"Calling tool: Edit: {file_path}",
+                    tool_call_id=(f"{item_id}:{file_path}" if item_id is not None else None),
+                )
+                for file_path in self._extract_paths(item)
+            ]
+
+        if item_type == "web_search":
+            query = self._extract_web_search_query(item)
+            return [
+                _CodexToolCall(
+                    tool_name="WebSearch",
+                    tool_input={"query": query},
+                    start_content=f"Calling tool: WebSearch: {query}"
+                    if query
+                    else "Calling tool: WebSearch",
+                    tool_call_id=item_id,
+                )
+            ]
+
+        return []
+
+    def _remember_item_started(
+        self,
+        item_type: str,
+        item: dict[str, Any],
+        scope: _CodexItemCorrelationScope,
+    ) -> str:
+        """Record a projected tool start and return its correlation key.
+
+        Keyed items correlate by their real id; id-less items get a monotonic
+        scope-unique nonce, queued FIFO per signature so the matching
+        completion recovers the same nonce (review round twelve: synthetic ids
+        must be invocation-unique yet stable across a start/result pair).
+        """
+        item_id = self._item_lifecycle_id(item)
+        signature = self._item_lifecycle_signature(item_type, item)
+        if item_id is not None:
+            scope.started_item_signatures[item_id] = signature
+            return item_id
+        nonce = scope.allocate_nonce()
+        scope.unkeyed_started_nonces.setdefault((item_type, signature), []).append(nonce)
+        return nonce
+
+    def _consume_item_started(
+        self,
+        item_type: str,
+        item: dict[str, Any],
+        scope: _CodexItemCorrelationScope,
+    ) -> tuple[bool, str]:
+        """Return (has_started, correlation_key) for a completion.
+
+        A completed-only stream with no matching start allocates a fresh nonce
+        so its synthesized start/result pair is invocation-unique.
+        """
+        item_id = self._item_lifecycle_id(item)
+        signature = self._item_lifecycle_signature(item_type, item)
+        if item_id is not None:
+            # Pair only when a prior start shares BOTH the id and the stable
+            # tool-input signature (review round seven, blocker 2).
+            return (scope.started_item_signatures.get(item_id) == signature, item_id)
+        queue = scope.unkeyed_started_nonces.get((item_type, signature))
+        if queue:
+            nonce = queue.pop(0)
+            if not queue:
+                del scope.unkeyed_started_nonces[(item_type, signature)]
+            return (True, nonce)
+        return (False, scope.allocate_nonce())
+
+    def _resolve_item_completion_is_error(
+        self, item_type: str, item: dict[str, Any]
+    ) -> bool | None:
+        """Resolve tri-state completion status, failing closed on ambiguity.
+
+        Returns ``False`` (success) only on explicit machine-readable signals
+        (``exit_code == 0``, completed/success status, ``success``/``ok`` true),
+        ``True`` on explicit failure signals, and ``None`` when the item
+        carries no trustworthy verdict — an unknown or malformed completion
+        must never become success evidence (#1692 review blocker 1).
+        """
+        has_failure = False
+        has_success = False
+        has_malformed = False
+
+        # Verdict signals are resolved against a per-item-type authority
+        # contract. Failure takes precedence wherever it appears; a present
+        # but malformed verdict field poisons the success claim (fail closed);
+        # success is only claimed from a signal that is authoritative for this
+        # item type. Every metadata source is scanned directly so a nested
+        # failure is never shadowed by an outer success.
+        for source in self._iter_item_metadata_sources(item):
+            for exit_key in ("exit_code", "exitCode", "returncode", "return_code"):
+                if exit_key not in source:
+                    continue
+                exit_code = source.get(exit_key)
+                if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+                    has_malformed = True
+                elif exit_code == 0:
+                    # A validated zero exit is authoritative for commands.
+                    if item_type == "command_execution":
+                        has_success = True
+                else:
+                    has_failure = True
+
+            # Failure-only alternate wire keys: a nonzero code under these
+            # spellings marks failure without ever granting success, so
+            # widening them can only add fail-closed coverage, never forge a
+            # verdict (round fifteen preempt: a failure token must not be
+            # invisible just because it uses a non-canonical field name).
+            for fail_key in ("exit", "statusCode", "status_code", "errorCode", "error_code"):
+                if fail_key not in source:
+                    continue
+                code = source.get(fail_key)
+                if isinstance(code, int) and not isinstance(code, bool):
+                    if code != 0:
+                        has_failure = True
+                elif code in (None, "", 0, False):
+                    # Cleanly absent/zero: no failure signal.
+                    continue
+                else:
+                    # A present but non-integer failure-code alias
+                    # ("500", "E_FAIL", True, ...) is untrustworthy and must
+                    # not let another field promote success (round fifteen).
+                    has_malformed = True
+
+            for error_flag_key in ("isError", "is_error"):
+                if error_flag_key not in source:
+                    continue
+                error_flag = source.get(error_flag_key)
+                if not isinstance(error_flag, bool):
+                    has_malformed = True
+                elif error_flag is True:
+                    # A true error flag is a failure for any item type.
+                    has_failure = True
+                elif item_type == "mcp_tool_call":
+                    # isError is authoritative only for MCP calls.
+                    has_success = True
+
+            status = source.get("status")
+            if status is not None and not isinstance(status, str):
+                has_malformed = True
+            elif isinstance(status, str):
+                normalized_status = status.strip().lower()
+                if normalized_status in _ITEM_FAILURE_STATUSES:
+                    has_failure = True
+                elif normalized_status in _ITEM_SUCCESS_STATUSES:
+                    # Codex marks command_execution items "completed" even on
+                    # non-zero exits, so lifecycle status is authoritative for
+                    # success only for non-command item types (round four).
+                    if item_type != "command_execution":
+                        has_success = True
+
+            if "error" in source:
+                error_envelope = source.get("error")
+                # Any present, meaningfully non-empty error envelope is a
+                # failure — including malformed non-null shapes (e.g. an int
+                # or list). Only an explicitly empty/false envelope
+                # (None/{}/[]/""/0/False) is treated as "no error" (round
+                # eight, blocker 3).
+                if isinstance(error_envelope, str):
+                    if error_envelope.strip():
+                        has_failure = True
+                elif error_envelope:
+                    has_failure = True
+
+            for key in ("success", "ok"):
+                if key not in source:
+                    continue
+                flag = source.get(key)
+                if not isinstance(flag, bool):
+                    has_malformed = True
+                elif flag is True:
+                    # An explicit success/ok flag is authoritative for any type.
+                    has_success = True
+                else:
+                    has_failure = True
+
+        if has_failure:
+            return True
+        if has_malformed:
+            # A present but untrustworthy verdict field means the outcome is
+            # unknown — never claim success on ambiguous machine metadata.
+            return None
+        if has_success:
+            return False
+        return None
+
+    def _build_tool_start_message(
+        self,
+        call: _CodexToolCall,
+        handle: RuntimeHandle | None,
+    ) -> AgentMessage:
+        """Build the tool-start half of an item lifecycle pair."""
+        extra_data: dict[str, Any] = {"runtime_event_type": _TOOL_STARTED_RUNTIME_EVENT_TYPE}
+        handle = self._neutralize_terminal_handle_event_type(
+            handle, _TOOL_STARTED_RUNTIME_EVENT_TYPE
+        )
+        if call.tool_call_id is not None:
+            extra_data["tool_call_id"] = call.tool_call_id
+        return self._build_tool_message(
+            tool_name=call.tool_name,
+            tool_input=call.tool_input,
+            content=call.start_content,
+            handle=handle,
+            extra_data=extra_data,
+        )
+
+    def _build_tool_result_message(
+        self,
+        call: _CodexToolCall,
+        *,
+        metadata: dict[str, Any],
+        is_error: bool | None,
+        handle: RuntimeHandle | None,
+    ) -> AgentMessage:
+        """Build the tool-result half of an item lifecycle pair."""
+        result_text = next(
+            (
+                metadata[key]
+                for key in ("output", "stdout", "result_preview", "stderr")
+                if isinstance(metadata.get(key), str) and metadata[key].strip()
+            ),
+            "",
+        )
+
+        tool_result_meta: dict[str, Any] = {}
+        if call.tool_call_id is not None:
+            tool_result_meta["tool_call_id"] = call.tool_call_id
+        exit_code = metadata.get("exit_code")
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+            # exit_status is an authoritative success/failure key the deliver
+            # gate trusts, so it may only ride when the resolver produced a
+            # real verdict. On an unknown verdict (is_error is None) it is
+            # demoted to an audit-only key so a leaked exit 0 cannot forge
+            # success — is_error is the sole authoritative verdict channel
+            # (round fifteen preempt: mirror the round-five status demotion).
+            if is_error is not None:
+                tool_result_meta["exit_status"] = exit_code
+            else:
+                tool_result_meta["reported_exit_status"] = exit_code
+
+        result_meta = metadata.get("__mcp_result_meta__")
+        if isinstance(result_meta, dict) and result_meta:
+            # Namespace opaque MCP audit data so it can never populate the
+            # shared authority keys the deliver gate trusts (e.g. exit_status);
+            # it is preserved but isolated under "mcp_meta" (round fourteen).
+            tool_result_meta["mcp_meta"] = dict(result_meta)
+        content_blocks = metadata.get("__mcp_content_blocks__")
+        tool_result: dict[str, Any] = {
+            "content": list(content_blocks) if isinstance(content_blocks, list) else [],
+            "text_content": result_text,
+            "meta": tool_result_meta,
+        }
+        if is_error is not None:
+            tool_result["is_error"] = is_error
+
+        # The completion verdict is carried exclusively by the tri-state
+        # ``is_error`` — never forward a metadata-derived "success" subtype.
+        extra_data: dict[str, Any] = {
+            key: value
+            for key, value in metadata.items()
+            if key not in ("subtype", "__mcp_content_blocks__", "__mcp_result_meta__")
+        }
+        if is_error is None:
+            status = extra_data.get("status")
+            if isinstance(status, str) and status.strip().lower() in _ITEM_SUCCESS_STATUSES:
+                # An unknown verdict must not forward a bare success-implying
+                # status: downstream consumers would read it as authoritative
+                # success while the journal gate fails closed (round five).
+                reported = extra_data.pop("status")
+                extra_data["reported_status"] = reported
+                # Persist it inside the journaled result meta for auditability
+                # (round seven follow-up P2): runtime metadata serialization
+                # otherwise drops the top-level key.
+                tool_result_meta["reported_status"] = reported
+            # The in-memory verifier reads a top-level exit_code==0 as success,
+            # so an unknown verdict must not forward the raw exit code either;
+            # demote it to an audit-only key (round fifteen preempt).
+            for exit_key in ("exit_code", "exitCode", "returncode", "return_code"):
+                if exit_key in extra_data:
+                    extra_data[f"reported_{exit_key}"] = extra_data.pop(exit_key)
+        extra_data["subtype"] = "tool_result"
+        if call.tool_call_id is not None:
+            extra_data["tool_call_id"] = call.tool_call_id
+        if is_error is not None:
+            extra_data["is_error"] = is_error
+        extra_data["tool_result"] = tool_result
+        # Carry a neutral, non-terminal result event type so a completion
+        # never reads as success via runtime_event_type. Projection overrides
+        # the message value with the handle's own runtime_event_type when
+        # present, so the handle is neutralized too — otherwise a resumed
+        # handle's stale ``run.completed`` would leak onto the result and
+        # forge journal success (round fourteen, blocker 3).
+        extra_data["runtime_event_type"] = _TOOL_RESULT_RUNTIME_EVENT_TYPE
+
+        return self._build_tool_message(
+            tool_name=call.tool_name,
+            tool_input=call.tool_input,
+            content=result_text,
+            handle=self._neutralize_terminal_handle_event_type(handle),
+            extra_data=extra_data,
+        )
+
+    @staticmethod
+    def _neutralize_terminal_handle_event_type(
+        handle: RuntimeHandle | None,
+        neutral_event_type: str = _TOOL_RESULT_RUNTIME_EVENT_TYPE,
+    ) -> RuntimeHandle | None:
+        """Return a handle whose stale terminal runtime_event_type is cleared.
+
+        Projection lets a resume handle's ``runtime_event_type`` override the
+        message value, so a terminal ``run.completed``/``session.terminated``
+        would otherwise become the message's event type and forge success. The
+        replacement matches the message half — ``tool.started`` for starts and
+        ``tool.result`` for results — so a resumed start is not stamped with a
+        result event type (round fifteen follow-up).
+        """
+        if handle is None:
+            return None
+        stale = handle.metadata.get("runtime_event_type")
+        if not isinstance(stale, str) or not stale:
+            return handle
+        neutralized_metadata = dict(handle.metadata)
+        neutralized_metadata["runtime_event_type"] = neutral_event_type
+        return replace(handle, metadata=neutralized_metadata)
+
+    def _convert_tool_item_started(
+        self,
+        item_type: str,
+        item: dict[str, Any],
+        current_handle: RuntimeHandle | None,
+        scope: _CodexItemCorrelationScope,
+    ) -> list[AgentMessage]:
+        """Project ``item.started`` as correlated tool-start messages."""
+        if not self._item_tool_calls(item_type, item, self._item_lifecycle_id(item)):
+            return []
+        item_id = self._item_lifecycle_id(item)
+        if item_id is not None and (
+            scope.started_item_signatures.get(item_id)
+            == self._item_lifecycle_signature(item_type, item)
+        ):
+            # A replayed keyed start (same id and signature) must not emit a
+            # duplicate: exact correlation requires one matching start per id
+            # (review round six). Id-less starts keep per-invocation nonces so
+            # legitimate repeated invocations stay distinct.
+            return []
+        correlation_key = self._remember_item_started(item_type, item, scope)
+        calls = self._item_tool_calls(item_type, item, correlation_key)
+        return [self._build_tool_start_message(call, current_handle) for call in calls]
+
+    def _convert_tool_item_completed(
+        self,
+        item_type: str,
+        item: dict[str, Any],
+        current_handle: RuntimeHandle | None,
+        scope: _CodexItemCorrelationScope,
+    ) -> list[AgentMessage]:
+        """Project ``item.completed`` as correlated tool-result messages.
+
+        When no matching ``item.started`` was projected (completed-only legacy
+        streams), synthesize the start+result pair so the deliver gate keeps
+        both invocation and completion evidence — but never duplicate a start
+        that already happened (#1692 review blocker 2).
+        """
+        if not self._item_tool_calls(item_type, item, self._item_lifecycle_id(item)):
+            return []
+        metadata = self._extract_command_metadata(item)
+        if item_type == "mcp_tool_call":
+            if not any(
+                isinstance(metadata.get(key), str) and metadata[key].strip()
+                for key in ("output", "stdout", "result_preview", "stderr")
+            ):
+                normalized = self._extract_mcp_result_text(item)
+                if normalized:
+                    metadata["output"] = normalized
+            content_blocks = self._extract_mcp_content_blocks(item)
+            if content_blocks:
+                metadata["__mcp_content_blocks__"] = content_blocks
+            result_meta = self._extract_mcp_result_meta(item)
+            if result_meta:
+                metadata["__mcp_result_meta__"] = result_meta
+        is_error = self._resolve_item_completion_is_error(item_type, item)
+        item_id = self._item_lifecycle_id(item)
+        if item_id is not None:
+            # Dedup on the id plus the COMPLETE completion envelope so only
+            # a genuinely identical replay is dropped. Cherry-picked fields
+            # let distinct evidence (a changed web_search action, non-text MCP
+            # content, nested metadata, or a secondary exit alias) collapse to
+            # one fingerprint and be silently suppressed; serializing the whole
+            # item captures every evidence-bearing field (rounds seven-nine).
+            envelope_fingerprint = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+            # Store a fixed-size digest, not the raw envelope: completion
+            # output can be multi-megabyte and would otherwise accumulate in
+            # the scope until the stream ends (round fifteen, blocker 4).
+            envelope_digest = hashlib.sha256(envelope_fingerprint.encode("utf-8")).hexdigest()
+            dedup_key = f"{item_id}\x00{envelope_digest}"
+            if dedup_key in scope.completed_item_keys:
+                return []
+            scope.completed_item_keys.add(dedup_key)
+        has_started, correlation_key = self._consume_item_started(item_type, item, scope)
+        if not has_started and item_id is not None:
+            # A completed-only keyed item synthesizes its start here; record it
+            # so a later or replayed keyed item.started for the same id/signature
+            # is suppressed rather than emitting a duplicate start (round
+            # fourteen follow-up).
+            scope.started_item_signatures[item_id] = self._item_lifecycle_signature(item_type, item)
+        calls = self._item_tool_calls(item_type, item, correlation_key)
+        if not calls:
+            return []
+
+        messages: list[AgentMessage] = []
+        for call in calls:
+            if not has_started:
+                messages.append(self._build_tool_start_message(call, current_handle))
+            messages.append(
+                self._build_tool_result_message(
+                    call,
+                    metadata=metadata,
+                    is_error=is_error,
+                    handle=current_handle,
+                )
+            )
+        return messages
+
     def _convert_event(
         self,
         event: dict[str, Any],
         current_handle: RuntimeHandle | None,
+        *,
+        item_scope: _CodexItemCorrelationScope | None = None,
     ) -> list[AgentMessage]:
-        """Convert a Codex JSON event into normalized AgentMessage values."""
+        """Convert a Codex JSON event into normalized AgentMessage values.
+
+        ``item_scope`` isolates start/result correlation per streamed process;
+        the streaming loop passes a fresh scope per invocation. Direct callers
+        fall back to a per-instance scope, which is cleared on a
+        ``thread.started`` event only when the thread identity changes, so an
+        exact same-thread header replay does not orphan in-flight starts.
+        """
         event_type = event.get("type")
         if not isinstance(event_type, str):
             return []
 
+        scope = item_scope if item_scope is not None else self._default_item_scope
+
         if event_type == "thread.started":
             thread_id = event.get("thread_id")
+            # Clearing correlation on an exact same-thread header replay would
+            # orphan in-flight starts; only reset when the identity changes.
+            new_thread = thread_id if isinstance(thread_id, str) else None
+            if new_thread != scope.current_thread_id:
+                scope.clear()
+                scope.current_thread_id = new_thread
             if isinstance(thread_id, str):
-                handle = self._build_runtime_handle(thread_id, current_handle)
+                handle = self._build_runtime_handle(
+                    thread_id, current_handle, drift_epoch=scope.admitted_drift_epoch
+                )
                 return [
                     AgentMessage(
                         type="system",
@@ -1102,6 +3365,15 @@ class CodexCliRuntime:
                 ]
             return []
 
+        if event_type == "item.started":
+            item = event.get("item")
+            if not isinstance(item, dict):
+                return []
+            item_type = item.get("type")
+            if not isinstance(item_type, str) or item_type not in _TOOL_LIFECYCLE_ITEM_TYPES:
+                return []
+            return self._convert_tool_item_started(item_type, item, current_handle, scope)
+
         if event_type == "item.completed":
             item = event.get("item")
             if not isinstance(item, dict):
@@ -1110,6 +3382,9 @@ class CodexCliRuntime:
             item_type = item.get("type")
             if not isinstance(item_type, str):
                 return []
+
+            if item_type in _TOOL_LIFECYCLE_ITEM_TYPES:
+                return self._convert_tool_item_completed(item_type, item, current_handle, scope)
 
             if item_type == "agent_message":
                 content = self._extract_text(item)
@@ -1129,57 +3404,6 @@ class CodexCliRuntime:
                         content=content,
                         data={"thinking": content},
                         resume_handle=current_handle,
-                    )
-                ]
-
-            if item_type == "command_execution":
-                command = self._extract_command(item)
-                if not command:
-                    return []
-                return [
-                    self._build_tool_message(
-                        tool_name="Bash",
-                        tool_input={"command": command},
-                        content=f"Calling tool: Bash: {command}",
-                        handle=current_handle,
-                    )
-                ]
-
-            if item_type == "mcp_tool_call":
-                tool_name = item.get("name") if isinstance(item.get("name"), str) else "mcp_tool"
-                tool_input = self._extract_tool_input(item)
-                return [
-                    self._build_tool_message(
-                        tool_name=tool_name,
-                        tool_input=tool_input,
-                        content=f"Calling tool: {tool_name}",
-                        handle=current_handle,
-                    )
-                ]
-
-            if item_type == "file_change":
-                file_path = self._extract_path(item)
-                if not file_path:
-                    return []
-                return [
-                    self._build_tool_message(
-                        tool_name="Edit",
-                        tool_input={"file_path": file_path},
-                        content=f"Calling tool: Edit: {file_path}",
-                        handle=current_handle,
-                    )
-                ]
-
-            if item_type == "web_search":
-                query = self._extract_text(item)
-                return [
-                    self._build_tool_message(
-                        tool_name="WebSearch",
-                        tool_input={"query": query},
-                        content=f"Calling tool: WebSearch: {query}"
-                        if query
-                        else "Calling tool: WebSearch",
-                        handle=current_handle,
                     )
                 ]
 
@@ -1218,17 +3442,65 @@ class CodexCliRuntime:
                 f"{self._log_namespace}.turn_failed",
                 error=error_msg,
             )
+            error_data: dict[str, Any] = {"subtype": "error", "error_type": "TurnFailed"}
+            error_data.update(
+                self._codex_model_failure_data(
+                    returncode=1,
+                    message=error_msg,
+                    stderr_lines=[],
+                )
+            )
+            guidance = error_data.get("model_guidance")
+            if isinstance(guidance, str) and guidance and guidance not in error_msg:
+                error_msg = f"{error_msg}\n\n{guidance}"
             return [
                 AgentMessage(
                     type="result",
                     content=error_msg,
-                    data={"subtype": "error", "error_type": "TurnFailed"},
+                    data=error_data,
                     resume_handle=current_handle,
                 )
             ]
 
         if event_type == "turn.completed":
-            return []  # benign lifecycle event; no action needed
+            # Codex's ``turn.completed`` carries a ``usage`` object (input_tokens
+            # / cached_input_tokens / output_tokens). Surface it as a non-final
+            # system message so a later executor can attribute per-AC token spend.
+            # With empty content and subtype "turn.completed" this projects to a
+            # benign, non-terminal system message (see runtime_message_projection:
+            # the completed-status branch keys on runtime_event_type, not on this
+            # subtype). Without usage it stays a dropped lifecycle event.
+            raw_usage = event.get("usage")
+            usage = _normalized_usage(raw_usage)
+            if usage is None:
+                # Preserve malformed telemetry as an explicit veto instead of
+                # erasing it. A later valid usage message in the same leaf must
+                # not be harvested on its own after an earlier corrupt counter
+                # was silently dropped, which would undercount spend.
+                has_usage_payload = "usage" in event
+                recognized_counter_present = isinstance(raw_usage, Mapping) and any(
+                    key in raw_usage for key in _USAGE_TOKEN_KEYS
+                )
+                if has_usage_payload and (
+                    not isinstance(raw_usage, Mapping) or recognized_counter_present
+                ):
+                    return [
+                        AgentMessage(
+                            type="system",
+                            content="",
+                            data={"subtype": "turn.completed", "usage_invalid": True},
+                            resume_handle=current_handle,
+                        )
+                    ]
+                return []
+            return [
+                AgentMessage(
+                    type="system",
+                    content="",
+                    data={"subtype": "turn.completed", "usage": usage},
+                    resume_handle=current_handle,
+                )
+            ]
 
         if event_type in _TOP_LEVEL_EVENT_MESSAGE_TYPES:
             content = self._extract_text(event)
@@ -1270,6 +3542,43 @@ class CodexCliRuntime:
         del attempted_resume_session_id, current_handle, returncode, final_message, stderr_lines
         return None
 
+    def _codex_model_failure_data(
+        self,
+        *,
+        returncode: int,
+        message: str,
+        stderr_lines: list[str],
+    ) -> dict[str, object]:
+        """Reuse Codex model diagnostics for Execute-stage runtime failures.
+
+        Other runtimes inherit this process loop, so scope the App/CLI version
+        probe to actual Codex executions only.
+        """
+        if self._runtime_backend != "codex":
+            return {}
+        from ouroboros.providers.codex_cli_adapter import CodexCliLLMAdapter
+
+        details = CodexCliLLMAdapter._codex_failure_details(
+            returncode=returncode,
+            session_id=None,
+            stderr="\n".join(stderr_lines),
+            stdout_errors=[],
+            message=message,
+            cli_path=self._cli_path,
+        )
+        return {
+            key: details[key]
+            for key in (
+                "failure_category",
+                "http_status",
+                "model_guidance",
+                "codex_app_version",
+                "codex_cli_version",
+                "codex_app_cli_versions_match",
+            )
+            if key in details
+        }
+
     async def execute_task(
         self,
         prompt: str,
@@ -1277,14 +3586,27 @@ class CodexCliRuntime:
         system_prompt: str | None = None,
         resume_handle: RuntimeHandle | None = None,
         resume_session_id: str | None = None,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
     ) -> AsyncIterator[AgentMessage]:
         """Execute a task via Codex CLI and stream normalized messages."""
+        cwd_failure = worker_cwd_failure_message(
+            self._cwd,
+            runtime_backend=self._runtime_backend,
+            resume_handle=resume_handle,
+        )
+        if cwd_failure is not None:
+            yield cwd_failure
+            return
+
         async for msg in self._execute_task_impl(
             prompt=prompt,
             tools=tools,
             system_prompt=system_prompt,
             resume_handle=resume_handle,
             resume_session_id=resume_session_id,
+            reasoning_effort=reasoning_effort,
+            model=model,
             _resume_depth=0,
         ):
             yield msg
@@ -1296,9 +3618,14 @@ class CodexCliRuntime:
         system_prompt: str | None = None,
         resume_handle: RuntimeHandle | None = None,
         resume_session_id: str | None = None,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
         _resume_depth: int = 0,
     ) -> AsyncIterator[AgentMessage]:
         """Internal implementation with resume-depth tracking."""
+        # Per-stream correlation scope: parallel or sequential ACs sharing
+        # this adapter must never see another stream's item lifecycle state.
+        stream_item_scope = _CodexItemCorrelationScope()
         # Note: CODEX_SANDBOX_NETWORK_DISABLED=1 does NOT necessarily mean
         # child codex exec will fail.  Codex may apply different seatbelt
         # profiles to MCP server children vs shell commands.  Log at debug
@@ -1315,7 +3642,10 @@ class CodexCliRuntime:
                 ),
             )
 
-        current_handle = resume_handle or self._build_runtime_handle(resume_session_id)
+        # Bare session id: admission history unknown (see DRIFT_EPOCH_UNKNOWN).
+        current_handle = resume_handle or self._build_runtime_handle(
+            resume_session_id, drift_epoch=DRIFT_EPOCH_UNKNOWN
+        )
         intercepted_messages = await self._maybe_dispatch_skill_intercept(prompt, current_handle)
         if intercepted_messages is not None:
             for message in intercepted_messages:
@@ -1331,11 +3661,31 @@ class CodexCliRuntime:
         composed_prompt = self._compose_prompt(prompt, system_prompt, tools)
         attempted_resume_session_id = self._resolve_resume_session_id(current_handle)
         try:
-            command = self._build_command(
-                output_last_message_path=str(output_path),
-                resume_session_id=attempted_resume_session_id,
-                prompt=composed_prompt,
-            )
+            build_kwargs: dict[str, Any] = {
+                "output_last_message_path": str(output_path),
+                "resume_session_id": attempted_resume_session_id,
+                "prompt": composed_prompt,
+                "runtime_handle": current_handle,
+            }
+            # Only hand the effort knob to a runtime whose ``_build_command``
+            # declares it. Codex (native) accepts it; advised CLI subclasses that
+            # share this base but expose no effort flag (e.g. Goose) do not override
+            # the signature, so forwarding ``None`` would raise an unexpected-kwarg
+            # TypeError. The orchestrator only sets a non-None level for runtimes
+            # that enforce it, so a None level is correctly dropped here.
+            if reasoning_effort is not None:
+                build_kwargs["reasoning_effort"] = reasoning_effort
+            # Same guard as reasoning_effort: only advised CLI subclasses override
+            # ``_build_command`` and may not accept a ``model`` kwarg, so a None
+            # override (the orchestrator's default for runtimes that do not enforce
+            # it) is dropped here rather than forwarded. Codex-native enforces it.
+            if model is not None:
+                build_kwargs["model"] = model
+            command = self._build_command(**build_kwargs)
+            stream_item_scope.admitted_drift_epoch = self._drift.epoch
+            # A resume retired inside the build was never attempted; do not
+            # report an early failure as a resume-bootstrap failure.
+            attempted_resume_session_id = self._resolve_resume_session_id(current_handle)
         except Exception as e:
             yield AgentMessage(
                 type="result",
@@ -1343,12 +3693,24 @@ class CodexCliRuntime:
                 data={
                     "subtype": "error",
                     "error_type": type(e).__name__,
-                    **self._build_resume_retry_metadata(attempted_resume_session_id),
+                    **safe_retry_metadata(
+                        e, self._build_resume_retry_metadata(attempted_resume_session_id)
+                    ),
                 },
                 resume_handle=current_handle,
             )
             output_path.unlink(missing_ok=True)
             return
+
+        # This is deliberately separate from the durable execution identity:
+        # a configured/default model can make a command replay-safe without
+        # proving which model an automatic Codex runtime selected.  User-facing
+        # telemetry starts as ``automatic + unreported`` and is upgraded only
+        # by a stream event that explicitly names the model.
+        model_observation: dict[str, str | None] | None = (
+            self._initial_model_observation(command) if self._runtime_backend == "codex" else None
+        )
+        last_reported_model: str | None = None
 
         log.info(
             f"{self._log_namespace}.task_started",
@@ -1364,6 +3726,7 @@ class CodexCliRuntime:
         process: Any | None = None
         process_finished = False
         process_terminated = False
+        process_group_id: int | None = None
         control_state: dict[str, Any] | None = None
         stderr_task: asyncio.Task[list[str]] | None = None
 
@@ -1375,6 +3738,7 @@ class CodexCliRuntime:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=self._build_child_env(),
+                **self._subprocess_launch_kwargs(),
             )
         except FileNotFoundError as e:
             yield AgentMessage(
@@ -1402,6 +3766,8 @@ class CodexCliRuntime:
             )
             output_path.unlink(missing_ok=True)
             return
+
+        process_group_id = self._process_group_id(process)
 
         # Feed prompt via stdin to avoid OS ARG_MAX limits (~262KB on macOS).
         # Runtimes that accept prompt as a CLI arg (e.g. opencode) skip this.
@@ -1457,6 +3823,7 @@ class CodexCliRuntime:
                         current_handle = self._build_runtime_handle(
                             event_session_id,
                             current_handle,
+                            drift_epoch=stream_item_scope.admitted_drift_epoch,
                         )
                         current_handle = self._bind_runtime_handle_controls(
                             current_handle,
@@ -1476,6 +3843,28 @@ class CodexCliRuntime:
                         session_rebound=session_rebound,
                     )
 
+                    if model_observation is not None:
+                        reported_model = self._runtime_reported_model(event)
+                        if reported_model is not None:
+                            observed_model, observation_source = reported_model
+                            model_observation = self._observed_model_observation(
+                                model_observation,
+                                model=observed_model,
+                                source=observation_source,
+                            )
+                            if observed_model != last_reported_model:
+                                last_reported_model = observed_model
+                                yield AgentMessage(
+                                    type="system",
+                                    content=f"Codex selected model: {observed_model}",
+                                    data={
+                                        "subtype": "model.observed",
+                                        "runtime_event_type": "model.observed",
+                                        "model_observation": dict(model_observation),
+                                    },
+                                    resume_handle=current_handle,
+                                )
+
                     extra_messages = await self._handle_runtime_event(
                         event,
                         current_handle,
@@ -1490,11 +3879,20 @@ class CodexCliRuntime:
                                 control_state=control_state,
                             )
                             message = replace(message, resume_handle=current_handle)
-                        if message.content:
-                            last_content = message.content
+                        last_content = self._update_last_content(last_content, message)
+                        if message.is_final and model_observation is not None:
+                            message = replace(
+                                message,
+                                data={
+                                    **message.data,
+                                    "model_observation": dict(model_observation),
+                                },
+                            )
                         yield message
 
-                    for message in self._convert_event(event, current_handle):
+                    for message in self._convert_event(
+                        event, current_handle, item_scope=stream_item_scope
+                    ):
                         if message.resume_handle is not None:
                             current_handle = message.resume_handle
                             current_handle = self._bind_runtime_handle_controls(
@@ -1503,15 +3901,25 @@ class CodexCliRuntime:
                                 control_state=control_state,
                             )
                             message = replace(message, resume_handle=current_handle)
-                        if message.content:
-                            last_content = message.content
+                        last_content = self._update_last_content(last_content, message)
                         if message.is_final:
                             yielded_final = True
+                            if model_observation is not None:
+                                message = replace(
+                                    message,
+                                    data={
+                                        **message.data,
+                                        "model_observation": dict(model_observation),
+                                    },
+                                )
                         yield message
 
         except TimeoutError as e:
+            termination_confirmed = False
             if process is not None and control_state is not None:
-                await self._terminate_bound_runtime_handle(process, control_state)
+                termination_confirmed = await self._terminate_bound_runtime_handle(
+                    process, control_state
+                )
                 current_handle = self._bind_runtime_handle_controls(
                     current_handle,
                     process=process,
@@ -1523,10 +3931,14 @@ class CodexCliRuntime:
                 stderr_lines = await stderr_task
             final_message = "\n".join(stderr_lines).strip()
             if not final_message:
-                final_message = f"{self._display_name} became unresponsive and was terminated: {e}"
+                cleanup = (
+                    "was terminated" if termination_confirmed else "termination was not confirmed"
+                )
+                final_message = f"{self._display_name} became unresponsive; {cleanup}: {e}"
             data = {
                 "subtype": "error",
                 "error_type": type(e).__name__,
+                "termination_confirmed": termination_confirmed,
             }
             data.update(self._build_resume_retry_metadata(attempted_resume_session_id))
             yield AgentMessage(
@@ -1539,22 +3951,27 @@ class CodexCliRuntime:
         except asyncio.CancelledError:
             if process is not None:
                 log.warning(f"{self._log_namespace}.task_cancelled", cwd=self._cwd)
-                await self._terminate_process(process)
+                confirmed = await self._terminate_process(
+                    process, process_group_id=process_group_id
+                )
                 process_terminated = True
                 if control_state is not None:
-                    control_state["terminated"] = True
+                    control_state["terminated"] = confirmed
                     control_state["returncode"] = getattr(process, "returncode", None)
-                    control_state["runtime_status"] = "terminated"
+                    control_state["runtime_status"] = (
+                        "terminated" if confirmed else "termination_unconfirmed"
+                    )
             raise
         else:
             # Normal completion path — stdout stream finished without timeout.
             returncode = await process.wait()
             process_finished = True
             control_state["returncode"] = returncode
-            if control_state.get("terminated") is True and returncode < 0:
-                control_state["runtime_status"] = "terminated"
-            else:
-                control_state["runtime_status"] = "completed" if returncode == 0 else "failed"
+            if control_state.get("runtime_status") != "termination_unconfirmed":
+                if control_state.get("terminated") is True and returncode < 0:
+                    control_state["runtime_status"] = "terminated"
+                else:
+                    control_state["runtime_status"] = "completed" if returncode == 0 else "failed"
             current_handle = self._bind_runtime_handle_controls(
                 current_handle,
                 process=process,
@@ -1609,6 +4026,8 @@ class CodexCliRuntime:
                     tools=tools,
                     system_prompt=system_prompt,
                     resume_handle=recovery_handle,
+                    reasoning_effort=reasoning_effort,
+                    model=model,
                     _resume_depth=_resume_depth + 1,
                 ):
                     yield message
@@ -1618,10 +4037,21 @@ class CodexCliRuntime:
                 "subtype": "success" if returncode == 0 else "error",
                 "returncode": returncode,
             }
+            if model_observation is not None:
+                result_data["model_observation"] = dict(model_observation)
             if current_handle is not None and current_handle.native_session_id:
                 result_data["session_id"] = current_handle.native_session_id
             if returncode != 0:
                 result_data["error_type"] = self._runtime_error_type
+                model_failure_data = self._codex_model_failure_data(
+                    returncode=returncode,
+                    message="\n".join((final_message, *stderr_lines)),
+                    stderr_lines=stderr_lines,
+                )
+                result_data.update(model_failure_data)
+                guidance = model_failure_data.get("model_guidance")
+                if isinstance(guidance, str) and guidance and guidance not in final_message:
+                    final_message = f"{final_message}\n\n{guidance}"
                 if attempted_resume_session_id and not saw_runtime_event:
                     result_data.update(
                         self._build_resume_retry_metadata(attempted_resume_session_id)
@@ -1640,7 +4070,16 @@ class CodexCliRuntime:
                     and not process_terminated
                     and getattr(process, "returncode", None) is None
                 ):
-                    await self._terminate_process(process)
+                    confirmed = await self._terminate_process(
+                        process, process_group_id=process_group_id
+                    )
+                    if control_state is not None:
+                        control_state["terminated"] = confirmed
+                        control_state["runtime_status"] = (
+                            "terminated" if confirmed else "termination_unconfirmed"
+                        )
+                elif process_finished:
+                    await self._cleanup_completed_process_group(process, process_group_id)
                 await self._close_process_stdin(process)
             if stderr_task is not None and not stderr_task.done():
                 stderr_task.cancel()
